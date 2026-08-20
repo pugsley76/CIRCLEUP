@@ -41,17 +41,6 @@ Versions follow [Semantic Versioning](https://semver.org/).
   rather than aborting so the indexer keeps serving data in ambiguous situations
 - `indexer/package.json` — added `migrate:check`, `replay`, and `replay:dry-run`
   scripts; added `src/db/replay.test.ts` to the `test` script
-
-### Added
-- Homepage hero: secondary "Browse N open circles" call-to-action that jumps to the
-  circles list, shown only when there are circles to browse
-- Homepage hero: hint line stating the Freighter wallet and 2–20 member
-  prerequisites before the visitor opens the create form
-- Homepage hero: explicit messages for the empty and indexer-unavailable cases in
-  place of a call-to-action that would lead nowhere
-- Keyboard focus rings on both homepage hero call-to-action buttons
-
-### Changed
 - Homepage hero copy rewritten around what the visitor does and gets
 - Homepage circles fetch is memoized per render, so the hero count, the heading
   count and the list can no longer disagree
@@ -59,6 +48,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ### Fixed
 - Homepage returned a 500 after a 60-second hang when the indexer refused the
   connection, so the "indexer is unreachable" banner never reached the user
+- `app/src/app/create/page.tsx` — restored to a thin server-component wrapper
+  delegating to `CreateClient`; a bad merge had replaced it with all the
+  client-side hook logic, causing 55 TypeScript errors at build time
+- `app/src/components/WalletButton.tsx` — removed dead code block referencing
+  `result`, `setConnectState`, and `setErrorMsg` left behind after a state-machine
+  refactor; tightened `(err as any)` cast to `(err as Error)`
+- `indexer/src/db/migrate.ts` — partial-state summary now lists both the pending
+  file names and the missing-on-disk file names; previously only the missing names
+  were shown, leaving operators without enough information to act
 
 ---
 

@@ -268,29 +268,28 @@ if (require.main === module) {
   const statusOnly = process.argv.includes("--status");
   const checkOnly = process.argv.includes("--check");
 
-  let op: Promise<void>;
-
-  if (checkOnly) {
-    op = checkMigrationHealth().then((health) => {
+  async function run(): Promise<number> {
+    if (checkOnly) {
+      const health = await checkMigrationHealth();
       console.log(`[migrate] Health state: ${health.state}`);
       console.log(`[migrate] ${health.summary}`);
       logStatus(health.status);
-      // Exit non-zero for any unhealthy state so CI scripts can gate on this.
-      if (!health.canStartSafely) {
-        process.exitCode = 1;
-      }
-    });
-  } else if (statusOnly) {
-    op = getMigrationStatus().then(logStatus);
-  } else {
-    op = runMigrations().then(() => {});
+      // Return 1 for any unhealthy state so CI scripts can gate on this.
+      return health.canStartSafely ? 0 : 1;
+    }
+
+    if (statusOnly) {
+      const status = await getMigrationStatus();
+      logStatus(status);
+      return 0;
+    }
+
+    await runMigrations();
+    return 0;
   }
 
-  op
-    .then(() => {
-      if (process.exitCode !== 1) process.exit(0);
-      else process.exit(1);
-    })
+  run()
+    .then((code) => process.exit(code))
     .catch((err) => {
       console.error("[migrate] Error:", err);
       process.exit(1);

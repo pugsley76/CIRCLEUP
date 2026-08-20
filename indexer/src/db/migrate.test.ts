@@ -107,10 +107,24 @@ test("checkMigrationHealth: partial requires BOTH pending and missingOnDisk", ()
 });
 
 test("checkMigrationHealth: canStartSafely is only true for the clean state", () => {
-  const states = ["clean", "pending", "drifted", "partial", "uninitialized"] as const;
-  for (const state of states) {
-    const canStartSafely = state === "clean";
-    assert.equal(canStartSafely, state === "clean", `canStartSafely mismatch for state=${state}`);
+  // canStartSafely = (state === "clean"). We verify by deriving the state for
+  // each input combination and asserting the expected safe/unsafe outcome.
+  // deriveHealthState is the same logic extracted from checkMigrationHealth().
+
+  // Only the state produced by (0 pending, 0 missing, schema exists) → clean → safe.
+  assert.equal(deriveHealthState(0, 0, true), "clean");
+  assert.equal(deriveHealthState(0, 0, true) === "clean", true, "clean state must be safe");
+
+  // Every other reachable state must be unsafe.
+  const unsafeInputs: Array<[number, number, boolean]> = [
+    [1, 0, true],  // pending
+    [0, 1, true],  // drifted
+    [1, 1, true],  // partial
+    [0, 0, false], // uninitialized
+  ];
+  for (const [pending, missing, exists] of unsafeInputs) {
+    const state = deriveHealthState(pending, missing, exists);
+    assert.notEqual(state, "clean", `state=${state} must not be safe`);
   }
 });
 
