@@ -9,6 +9,40 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `indexer/src/db/migrate.ts` — `checkMigrationHealth()` function that classifies
+  the database schema state as one of five well-defined states: `clean`, `pending`,
+  `drifted`, `partial`, or `uninitialized`; exported `SchemaHealthState` type and
+  `MigrationHealth` interface for structured decisions at call sites
+- `indexer/src/db/migrate.ts` — `--check` CLI flag: exits non-zero when schema is
+  not clean so CI pipelines can gate deploys on schema health
+- `indexer/src/db/replay.ts` — `prepareReplay()`: transactional re-index from a
+  given ledger N; wipes derived tables, clears ingested-events dedup keys for the
+  replay range, and resets the indexer cursor — all in one atomic transaction
+- `indexer/src/db/replay.ts` — `replayPreflight()`: non-destructive pre-check
+  that reports estimated event count, current cursor, and warnings without touching
+  the database
+- `indexer/src/db/replay.ts` — CLI entry point (`npm run replay -- --from=<N>`)
+  with `--partial` (keep rows from earlier ledgers) and `--dry-run` flags
+- `indexer/src/db/migrate.test.ts` — deterministic unit tests for all five
+  `SchemaHealthState` transitions, the decision matrix, summary string content,
+  `currentVersion` derivation, idempotence guard, transaction rollback safety,
+  and `42P01` handling; integration tests (gated on `DATABASE_URL`) for live
+  idempotence, drifted-state detection, and ghost-entry flagging
+- `indexer/src/db/replay.test.ts` — unit tests for input validation, cursor math,
+  `fullWipe` forcing, SQL range selection, table wipe strategies, transaction
+  commit/rollback paths, and preflight warnings; integration tests for full and
+  partial replay semantics and preflight non-mutation guarantee
+- `indexer` boot sequence now logs a prominent `SCHEMA WARNING` for `drifted` or
+  `partial` states after migrations run, surfacing drift before the poller starts
+
+### Changed
+- `indexer/src/index.ts` — imports `checkMigrationHealth` and runs a post-migration
+  health check on every boot; non-clean states emit a `SCHEMA WARNING` log line
+  rather than aborting so the indexer keeps serving data in ambiguous situations
+- `indexer/package.json` — added `migrate:check`, `replay`, and `replay:dry-run`
+  scripts; added `src/db/replay.test.ts` to the `test` script
+
+### Added
 - Homepage hero: secondary "Browse N open circles" call-to-action that jumps to the
   circles list, shown only when there are circles to browse
 - Homepage hero: hint line stating the Freighter wallet and 2–20 member

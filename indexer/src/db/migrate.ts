@@ -24,6 +24,43 @@ export interface MigrationStatus {
   currentVersion: string | null;
 }
 
+// ─── Schema health ─────────────────────────────────────────────────────────
+
+/**
+ * Classification of the database's schema state relative to the migration
+ * files on disk.  Returned by `checkMigrationHealth()` so callers can make
+ * structured decisions (block boot, warn, proceed) without parsing strings.
+ *
+ * States:
+ *   clean      — schema_migrations matches disk perfectly; nothing pending.
+ *   pending    — migrations exist on disk that have not been applied yet; DB
+ *                is behind but not corrupt.
+ *   drifted    — one or more filenames recorded as applied in
+ *                schema_migrations have no corresponding file on disk; this
+ *                usually means a migration was renamed or deleted after it ran.
+ *   partial    — both pending migrations AND missingOnDisk entries exist at the
+ *                same time; the DB is neither fully up-to-date nor clean.
+ *   uninitialized — schema_migrations table itself doesn't exist yet; no base
+ *                   schema has been applied.
+ */
+export type SchemaHealthState =
+  | "clean"
+  | "pending"
+  | "drifted"
+  | "partial"
+  | "uninitialized";
+
+export interface MigrationHealth {
+  state: SchemaHealthState;
+  status: MigrationStatus;
+  // Human-readable summary of the health state, suitable for logs and the
+  // /health endpoint.
+  summary: string;
+  // true when the indexer can start safely without running migrations first.
+  // Only true for the "clean" state.
+  canStartSafely: boolean;
+}
+
 /**
  * Reads applied-migration state from the DB and compares it against the
  * migration files on disk. Requires schema_migrations to already exist
@@ -59,6 +96,88 @@ export async function getMigrationStatus(): Promise<MigrationStatus> {
   };
 }
 
+/**
+ * Inspects the database state and classifies it as one of the well-defined
+ * SchemaHealthState values.  Does not mutate the DB — safe to call at any
+ * time, including from the /health endpoint.
+ *
+ * Decision matrix:
+ *   schema_migrations missing             → uninitialized
+ *   pending > 0 AND missingOnDisk > 0     → partial
+ *   missingOnDisk > 0                     → drifted
+ *   pending > 0                           → pending
+ *   (else)                                → clean
+ */
+export async function checkMigrationHealth(): Promise<MigrationHealth> {
+  // Check whether the base schema (schema_migrations table) even exists yet.
+  let schemaExists = true;
+  try {
+    await pool.query("SELECT 1 FROM schema_migrations LIMIT 1");
+  } catch (err) {
+    if ((err as { code?: string }).code === "42P01") {
+      schemaExists = false;
+    } else {
+      throw err;
+    }
+  }
+
+  if (!schemaExists) {
+    const filesOnDisk = migrationFilesOnDisk();
+    const status: MigrationStatus = {
+      applied: [],
+      pending: filesOnDisk,
+      missingOnDisk: [],
+      currentVersion: null,
+    };
+    return {
+      state: "uninitialized",
+      status,
+      summary:
+        "Schema has not been initialized. Run `npm run migrate:dev` to apply the base schema and all pending migrations.",
+      canStartSafely: false,
+    };
+  }
+
+  const status = await getMigrationStatus();
+  const { pending, missingOnDisk } = status;
+
+  let state: SchemaHealthState;
+  let summary: string;
+
+  if (pending.length > 0 && missingOnDisk.length > 0) {
+    state = "partial";
+    summary =
+      `Schema is in a partial state: ${pending.length} migration(s) pending on disk ` +
+      `AND ${missingOnDisk.length} migration(s) recorded as applied but missing from disk ` +
+      `(${missingOnDisk.join(", ")}). ` +
+      `Investigate before running migrations — the missing files may indicate a renamed or deleted migration.`;
+  } else if (missingOnDisk.length > 0) {
+    state = "drifted";
+    summary =
+      `Schema has drifted: ${missingOnDisk.length} migration(s) recorded as applied in ` +
+      `schema_migrations but no longer present on disk: ${missingOnDisk.join(", ")}. ` +
+      `This usually means a migration file was renamed or deleted after it ran.`;
+  } else if (pending.length > 0) {
+    state = "pending";
+    summary =
+      `Schema is behind: ${pending.length} migration(s) pending — ` +
+      `${pending.join(", ")}. Run \`npm run migrate:dev\` to apply them.`;
+  } else {
+    state = "clean";
+    summary =
+      status.currentVersion != null
+        ? `Schema is up to date at version ${status.currentVersion}.`
+        : "Schema is up to date (no additive migrations have been applied yet).";
+  }
+
+  return {
+    state,
+    status,
+    summary,
+    canStartSafely: state === "clean",
+  };
+}
+
 function logStatus(status: MigrationStatus) {
   console.log(
     `[migrate] Schema version: ${status.currentVersion ?? "(none applied)"} ` +
@@ -77,6 +196,11 @@ function logStatus(status: MigrationStatus) {
  * followed by any additive .sql migration files in src/db/migrations/, ordered
  * by filename.  Each migration is wrapped in a transaction so a partial failure
  * leaves the DB in the last-good state.
+ *
+ * Drift is detected and logged before applying any migrations so operators
+ * can see the health state in the same log run that applies fixes.  Drifted
+ * or partial states do NOT abort the run — pending migrations are still
+ * applied — but they produce a prominent warning so operators notice.
  */
 export async function runMigrations(): Promise<MigrationStatus> {
   const client = await pool.connect();
@@ -86,6 +210,17 @@ export async function runMigrations(): Promise<MigrationStatus> {
     const schemaSql = fs.readFileSync(schemaPath, "utf-8");
     await client.query(schemaSql);
     console.log("[migrate] Base schema applied");
+
+    // ── Health check before applying additive migrations ─────────────────────
+    // We run this after the base schema so schema_migrations is guaranteed to
+    // exist for the health query.  The check is read-only; its output informs
+    // operators of any drift detected before we mutate the schema further.
+    const health = await checkMigrationHealth();
+    if (health.state === "drifted" || health.state === "partial") {
+      console.warn(`[migrate] WARNING — ${health.summary}`);
+    } else if (health.state === "pending") {
+      console.log(`[migrate] ${health.summary}`);
+    }
 
     // ── Additive migrations ──────────────────────────────────────────────────
     const files = migrationFilesOnDisk();
@@ -127,12 +262,34 @@ export async function runMigrations(): Promise<MigrationStatus> {
   return status;
 }
 
-// Run directly: npx ts-node src/db/migrate.ts [--status]
+// Run directly: npx ts-node src/db/migrate.ts [--status] [--check]
 if (require.main === module) {
   const statusOnly = process.argv.includes("--status");
+  const checkOnly = process.argv.includes("--check");
 
-  (statusOnly ? getMigrationStatus().then(logStatus) : runMigrations().then(() => {}))
-    .then(() => process.exit(0))
+  let op: Promise<void>;
+
+  if (checkOnly) {
+    op = checkMigrationHealth().then((health) => {
+      console.log(`[migrate] Health state: ${health.state}`);
+      console.log(`[migrate] ${health.summary}`);
+      logStatus(health.status);
+      // Exit non-zero for any unhealthy state so CI scripts can gate on this.
+      if (!health.canStartSafely) {
+        process.exitCode = 1;
+      }
+    });
+  } else if (statusOnly) {
+    op = getMigrationStatus().then(logStatus);
+  } else {
+    op = runMigrations().then(() => {});
+  }
+
+  op
+    .then(() => {
+      if (process.exitCode !== 1) process.exit(0);
+      else process.exit(1);
+    })
     .catch((err) => {
       console.error("[migrate] Error:", err);
       process.exit(1);

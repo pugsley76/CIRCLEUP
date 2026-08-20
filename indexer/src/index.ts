@@ -8,7 +8,7 @@ dotenv.config();
 // deploy fails on boot instead of partway through migrations or polling.
 import { PORT } from "./config";
 import { connectWithRetry, pool } from "./db/pool";
-import { runMigrations } from "./db/migrate";
+import { runMigrations, checkMigrationHealth } from "./db/migrate";
 import { startIndexer, stopIndexer } from "./indexer";
 import { createApp } from "./api";
 import type { Server } from "http";
@@ -59,8 +59,32 @@ async function main() {
   // for the DB container to still be starting up at this point.
   await connectWithRetry();
 
-  // Apply DB schema
+  // Apply DB schema and all pending additive migrations.
   await runMigrations();
+
+  // Post-migration health check.  runMigrations() applies every pending
+  // migration, so the only non-clean states that can appear here are:
+  //   drifted — a migration was applied in this environment but the file has
+  //             since been deleted or renamed.  The indexer can still start
+  //             (the tables exist), but the discrepancy should be investigated.
+  //   partial — pending files AND missing-on-disk entries exist simultaneously.
+  //             This is unusual and warrants immediate attention.
+  //
+  // Neither state aborts the process — the indexer is conservative and keeps
+  // serving data rather than going down hard in ambiguous situations.  The
+  // warning is prominent enough for ops tooling (log alerts, /health endpoint)
+  // to surface it.
+  const health = await checkMigrationHealth();
+  if (health.state === "drifted" || health.state === "partial") {
+    console.warn(
+      `[circleup-indexer] SCHEMA WARNING (${health.state.toUpperCase()}): ${health.summary}`,
+    );
+    console.warn(
+      "[circleup-indexer] The indexer will continue, but investigate the schema drift before the next deploy.",
+    );
+  } else {
+    console.log(`[circleup-indexer] Schema health: ${health.summary}`);
+  }
 
   // Start REST API
   const app = createApp();
