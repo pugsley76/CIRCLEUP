@@ -127,12 +127,13 @@ test("partial replay scopes the ingested_events DELETE to ledger >= fromLedger",
 test("the six derived tables are partitioned correctly between ledger-scoped and full-wipe", () => {
   // Ledger-scoped: rows are deleted WHERE ledger >= fromLedger.
   const ledgerScoped = ["contributions", "payouts", "defaults"];
-  // Full wipe: these tables have no single lifecycle-covering ledger column;
-  // they are always TRUNCATEd so they are rebuilt from scratch.
-  const fullWipe = ["circle_members", "reputation", "circles"];
+  // Preserved in partial replay: these tables have no single lifecycle-covering
+  // ledger column so they are left intact; deleting them would orphan the
+  // contribution/payout/default rows with ledger < fromLedger.
+  const preserved = ["circle_members", "reputation", "circles"];
 
   // Together they must cover all six derived tables — no table left out.
-  const all = [...ledgerScoped, ...fullWipe].sort();
+  const all = [...ledgerScoped, ...preserved].sort();
   assert.deepEqual(
     all,
     ["circle_members", "circles", "contributions", "defaults", "payouts", "reputation"],
@@ -140,8 +141,8 @@ test("the six derived tables are partitioned correctly between ledger-scoped and
   );
 
   // No overlap.
-  const overlap = ledgerScoped.filter((t) => fullWipe.includes(t));
-  assert.deepEqual(overlap, [], "a table cannot appear in both wipe strategies");
+  const overlap = ledgerScoped.filter((t) => preserved.includes(t));
+  assert.deepEqual(overlap, [], "a table cannot appear in both strategies");
 });
 
 // ── Idempotence ───────────────────────────────────────────────────────────────

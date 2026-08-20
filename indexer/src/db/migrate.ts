@@ -65,13 +65,21 @@ export interface MigrationHealth {
  * Reads applied-migration state from the DB and compares it against the
  * migration files on disk. Requires schema_migrations to already exist
  * (see schema.sql), so callers should run the base schema first.
+ *
+ * Accepts an optional existing PoolClient to reuse an open connection rather
+ * than acquiring a new one from the pool.
  */
-export async function getMigrationStatus(): Promise<MigrationStatus> {
+export async function getMigrationStatus(
+  existingClient?: import("pg").PoolClient,
+): Promise<MigrationStatus> {
   const filesOnDisk = migrationFilesOnDisk();
 
   let appliedSet: Set<string>;
   try {
-    const { rows } = await pool.query<{ filename: string }>(
+    const queryFn = existingClient
+      ? (text: string) => existingClient.query<{ filename: string }>(text)
+      : (text: string) => pool.query<{ filename: string }>(text);
+    const { rows } = await queryFn(
       "SELECT filename FROM schema_migrations ORDER BY filename",
     );
     appliedSet = new Set(rows.map((r) => r.filename));
@@ -101,6 +109,10 @@ export async function getMigrationStatus(): Promise<MigrationStatus> {
  * SchemaHealthState values.  Does not mutate the DB — safe to call at any
  * time, including from the /health endpoint.
  *
+ * Accepts an optional existing PoolClient so callers that already hold a
+ * connection (e.g. runMigrations) can avoid acquiring a second one from the
+ * pool and prevent potential pool exhaustion under low max-connection configs.
+ *
  * Decision matrix:
  *   schema_migrations missing             → uninitialized
  *   pending > 0 AND missingOnDisk > 0     → partial
@@ -108,11 +120,17 @@ export async function getMigrationStatus(): Promise<MigrationStatus> {
  *   pending > 0                           → pending
  *   (else)                                → clean
  */
-export async function checkMigrationHealth(): Promise<MigrationHealth> {
+export async function checkMigrationHealth(
+  existingClient?: import("pg").PoolClient,
+): Promise<MigrationHealth> {
+  const query = existingClient
+    ? (text: string) => existingClient.query(text)
+    : (text: string) => pool.query(text);
+
   // Check whether the base schema (schema_migrations table) even exists yet.
   let schemaExists = true;
   try {
-    await pool.query("SELECT 1 FROM schema_migrations LIMIT 1");
+    await query("SELECT 1 FROM schema_migrations LIMIT 1");
   } catch (err) {
     if ((err as { code?: string }).code === "42P01") {
       schemaExists = false;
@@ -138,7 +156,7 @@ export async function checkMigrationHealth(): Promise<MigrationHealth> {
     };
   }
 
-  const status = await getMigrationStatus();
+  const status = await getMigrationStatus(existingClient);
   const { pending, missingOnDisk } = status;
 
   let state: SchemaHealthState;
@@ -214,9 +232,9 @@ export async function runMigrations(): Promise<MigrationStatus> {
 
     // ── Health check before applying additive migrations ─────────────────────
     // We run this after the base schema so schema_migrations is guaranteed to
-    // exist for the health query.  The check is read-only; its output informs
-    // operators of any drift detected before we mutate the schema further.
-    const health = await checkMigrationHealth();
+    // exist for the health query.  Pass the existing client so we reuse the
+    // open connection rather than acquiring a second one from the pool.
+    const health = await checkMigrationHealth(client);
     if (health.state === "drifted" || health.state === "partial") {
       console.warn(`[migrate] WARNING — ${health.summary}`);
     } else if (health.state === "pending") {
@@ -258,6 +276,7 @@ export async function runMigrations(): Promise<MigrationStatus> {
     client.release();
   }
 
+  // Client is released above — use pool directly for the final status read.
   const status = await getMigrationStatus();
   logStatus(status);
   return status;

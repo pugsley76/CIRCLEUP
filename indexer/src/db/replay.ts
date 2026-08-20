@@ -77,24 +77,24 @@ type DerivedTable = (typeof DERIVED_TABLES)[number];
 // ─── Core implementation ──────────────────────────────────────────────────────
 
 /**
- * Wipe all derived tables (TRUNCATE CASCADE) so a full re-index starts clean.
- * TRUNCATE is not row-counted; we report counts as 0 and log the operation.
+ * Wipe all derived tables so a full re-index starts clean.
+ * Uses DELETE instead of TRUNCATE so the operation is fully transactional —
+ * if the wrapping transaction rolls back, all rows are restored.
+ * TRUNCATE with RESTART IDENTITY is intentionally avoided: sequence resets
+ * are not transactional in Postgres and would not roll back on failure.
  */
 async function wipeAllDerivedTables(
   client: PoolClient,
   log: (msg: string) => void,
 ): Promise<Partial<Record<DerivedTable, number>>> {
-  // TRUNCATE ... RESTART IDENTITY CASCADE removes rows from all dependent
-  // tables in one statement.  We truncate them individually in dependency
-  // order so FK constraints don't fire inside the transaction.
+  const counts: Partial<Record<DerivedTable, number>> = {};
+  // Delete in FK-safe dependency order: child tables before parent tables.
   for (const table of DERIVED_TABLES) {
-    await client.query(`TRUNCATE TABLE ${table} RESTART IDENTITY CASCADE`);
-    log(`[replay] Truncated table: ${table}`);
+    const res = await client.query(`DELETE FROM ${table}`);
+    counts[table] = res.rowCount ?? 0;
+    log(`[replay] Deleted ${counts[table]} rows from ${table}`);
   }
-  // Return zero counts — TRUNCATE gives no row count.
-  return Object.fromEntries(DERIVED_TABLES.map((t) => [t, 0])) as Partial<
-    Record<DerivedTable, number>
-  >;
+  return counts;
 }
 
 /**
@@ -102,9 +102,11 @@ async function wipeAllDerivedTables(
  * table.  Rows in earlier ledgers are kept so the app can still serve
  * historical data while the replay catches up.
  *
- * Not every table has a `ledger` column; for those (circle_members,
- * reputation, circles) we fall back to wiping fully, since membership and
- * circle state are rebuilt deterministically from events anyway.
+ * Tables without a `ledger` column (circle_members, reputation, circles) are
+ * left intact for a partial replay.  Their state will be rebuilt incrementally
+ * as the poller re-processes events from fromLedger onward.  Deleting them
+ * while contribution/payout/default rows with ledger < fromLedger still
+ * reference circles(address) would break FK integrity on the preserved rows.
  */
 async function wipeFromLedger(
   client: PoolClient,
@@ -114,6 +116,7 @@ async function wipeFromLedger(
   const counts: Partial<Record<DerivedTable, number>> = {};
 
   // Tables with a `ledger` column — delete rows at or beyond fromLedger.
+  // Delete child tables before parent to respect FK constraints.
   const ledgerTables: DerivedTable[] = [
     "contributions",
     "payouts",
@@ -128,15 +131,15 @@ async function wipeFromLedger(
     log(`[replay] Deleted ${counts[table]} rows from ${table} (ledger >= ${fromLedger})`);
   }
 
-  // circle_members, reputation, and circles don't have a reliable single
-  // `ledger` column covering the full row lifecycle — they are built up
-  // incrementally across many events.  Wipe them fully; they will be
-  // reconstructed by the poller.
-  const fullWipeTables: DerivedTable[] = ["circle_members", "reputation", "circles"];
-  for (const table of fullWipeTables) {
-    await client.query(`TRUNCATE TABLE ${table} RESTART IDENTITY CASCADE`);
-    counts[table] = 0;
-    log(`[replay] Truncated table: ${table} (no ledger column — full wipe)`);
+  // circle_members, reputation, and circles have no single `ledger` column
+  // covering their full lifecycle.  For a partial replay we leave them in
+  // place — deleting them would orphan the contribution/payout/default rows
+  // with ledger < fromLedger that we intentionally preserved above.
+  // The poller will upsert/update these rows as it re-processes events.
+  const preservedTables: DerivedTable[] = ["circle_members", "reputation", "circles"];
+  for (const table of preservedTables) {
+    counts[table] = 0; // no rows removed
+    log(`[replay] Preserved table: ${table} (no ledger column — kept for partial replay)`);
   }
 
   return counts;
