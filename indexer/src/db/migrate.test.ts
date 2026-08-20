@@ -60,6 +60,7 @@ function buildHealthSummary(
     case "partial":
       return (
         `Schema is in a partial state: ${pending.length} migration(s) pending on disk ` +
+        `(${pending.join(", ")}) ` +
         `AND ${missingOnDisk.length} migration(s) recorded as applied but missing from disk ` +
         `(${missingOnDisk.join(", ")}). ` +
         `Investigate before running migrations — the missing files may indicate a renamed or deleted migration.`

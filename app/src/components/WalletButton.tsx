@@ -46,25 +46,10 @@ export function WalletButton() {
       } else {
         setState({
           status: "error",
-          message: (err as any)?.message || "Failed to connect wallet.",
+          message: (err as Error)?.message || "Failed to connect wallet.",
         });
       }
     }
-
-    if (result.reason === "rejected") {
-      setConnectState("rejected");
-      // Auto-reset after 3 s so the button is usable again
-      setTimeout(() => setConnectState("idle"), 3000);
-      return;
-    }
-
-    // Unexpected error
-    setErrorMsg(result.message ?? "An unexpected error occurred.");
-    setConnectState("error");
-    setTimeout(() => {
-      setConnectState("idle");
-      setErrorMsg("");
-    }, 5000);
   }
 
   // ── Connected ─────────────────────────────────────────────────────────────
