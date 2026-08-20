@@ -30,7 +30,7 @@
 import { pool, withTransaction } from "./pool";
 import type { PoolClient } from "pg";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface ReplayOptions {
   /** Ledger to restart indexing from. 0 means re-index from the very beginning. */
@@ -75,15 +75,6 @@ const DERIVED_TABLES = [
 type DerivedTable = (typeof DERIVED_TABLES)[number];
 
 // ─── Core implementation ──────────────────────────────────────────────────────
-
-async function queryClient<T = Record<string, unknown>>(
-  client: PoolClient,
-  text: string,
-  params?: unknown[],
-): Promise<T[]> {
-  const res = await client.query(text, params);
-  return res.rows as T[];
-}
 
 /**
  * Wipe all derived tables (TRUNCATE CASCADE) so a full re-index starts clean.
@@ -209,8 +200,7 @@ export async function prepareReplay(opts: ReplayOptions): Promise<ReplayResult> 
     // at exactly fromLedger.  For a genesis replay (fromLedger = 0), set to 0
     // which the poller treats as "start from START_LEDGER config value".
     const newCursor = fromLedger === 0 ? 0 : fromLedger - 1;
-    await queryClient(
-      client,
+    await client.query(
       "UPDATE indexer_state SET last_ledger = $1, updated_at = NOW() WHERE id = 1",
       [newCursor],
     );

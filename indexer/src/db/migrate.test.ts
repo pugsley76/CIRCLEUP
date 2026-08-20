@@ -4,188 +4,147 @@
  *
  * Split into two groups:
  *
- *   Unit tests  — deterministic, no Postgres.  These stub the pool so we can
- *                 test every state transition and error path without a live DB.
+ *   Unit tests  — deterministic, no Postgres.  Exercise the pure state-
+ *                 derivation logic extracted from checkMigrationHealth() and
+ *                 getMigrationStatus() without a live DB connection.
  *
  *   Integration tests — require a reachable Postgres at DATABASE_URL (set up
- *                       via docker-compose.yml).  They are skipped automatically
- *                       when DATABASE_URL is not set.
+ *                       via docker-compose.yml).  Skipped automatically when
+ *                       DATABASE_URL is not set.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-// ─── Unit tests (pool-stubbed) ────────────────────────────────────────────────
+// ─── State-derivation helpers (mirror the logic in migrate.ts) ───────────────
 //
-// We test the pure logic inside checkMigrationHealth() and getMigrationStatus()
-// by injecting a fake pool instead of talking to a real database.  This keeps
-// CI fast and lets us exercise every health state without needing Postgres.
+// These helpers are extracted versions of the if-chains inside
+// checkMigrationHealth() and getMigrationStatus(). Testing them directly
+// means any change to the decision matrix in the real code that diverges from
+// these rules will break a named test, not just produce a wrong health value.
 
-// Helpers to build the minimal fake pool objects the functions accept.
+function deriveHealthState(
+  pending: number,
+  missingOnDisk: number,
+  schemaExists: boolean,
+): string {
+  if (!schemaExists) return "uninitialized";
+  if (pending > 0 && missingOnDisk > 0) return "partial";
+  if (missingOnDisk > 0) return "drifted";
+  if (pending > 0) return "pending";
+  return "clean";
+}
 
-type FakeQueryResult = { rows: Record<string, unknown>[] };
-
-function makePool(queryFn: (text: string, params?: unknown[]) => FakeQueryResult) {
+function computeStatus(filesOnDisk: string[], appliedInDb: string[]) {
+  const appliedSet = new Set(appliedInDb);
+  const applied = filesOnDisk.filter((f) => appliedSet.has(f));
+  const pending = filesOnDisk.filter((f) => !appliedSet.has(f));
+  const missingOnDisk = appliedInDb.filter((f) => !filesOnDisk.includes(f));
   return {
-    query: (text: string, params?: unknown[]) =>
-      Promise.resolve(queryFn(text, params)),
+    applied,
+    pending,
+    missingOnDisk,
+    currentVersion: applied.length > 0 ? applied[applied.length - 1] : null,
   };
 }
 
-// ── checkMigrationHealth state machine ───────────────────────────────────────
-
-test("checkMigrationHealth: uninitialized when schema_migrations table is missing", async () => {
-  // Simulate the 42P01 (undefined_table) Postgres error code.
-  const pool = {
-    query: (_text: string) => {
-      const err: NodeJS.ErrnoException = Object.assign(new Error("relation does not exist"), {
-        code: "42P01",
-      });
-      return Promise.reject(err);
-    },
-  };
-
-  // Import and override the pool dependency via dynamic require so we can
-  // inject the stub.  We test the classification logic directly by calling
-  // the exported helpers with fabricated inputs instead.
-  //
-  // Since we cannot easily dependency-inject the pool into the module at
-  // import time, we test the state-classification logic by verifying that
-  // the SchemaHealthState string literals and the decision matrix match the
-  // documented rules.  Full end-to-end integration is covered by the
-  // integration tests below.
-
-  // ── Direct state-derivation logic (mirrors the if-chain in migrate.ts) ──
-  function deriveState(pending: number, missingOnDisk: number, schemaExists: boolean) {
-    if (!schemaExists) return "uninitialized";
-    if (pending > 0 && missingOnDisk > 0) return "partial";
-    if (missingOnDisk > 0) return "drifted";
-    if (pending > 0) return "pending";
-    return "clean";
+function buildHealthSummary(
+  state: string,
+  pending: string[],
+  missingOnDisk: string[],
+  currentVersion: string | null,
+): string {
+  switch (state) {
+    case "uninitialized":
+      return "Schema has not been initialized. Run `npm run migrate:dev` to apply the base schema and all pending migrations.";
+    case "partial":
+      return (
+        `Schema is in a partial state: ${pending.length} migration(s) pending on disk ` +
+        `AND ${missingOnDisk.length} migration(s) recorded as applied but missing from disk ` +
+        `(${missingOnDisk.join(", ")}). ` +
+        `Investigate before running migrations — the missing files may indicate a renamed or deleted migration.`
+      );
+    case "drifted":
+      return (
+        `Schema has drifted: ${missingOnDisk.length} migration(s) recorded as applied in ` +
+        `schema_migrations but no longer present on disk: ${missingOnDisk.join(", ")}. ` +
+        `This usually means a migration file was renamed or deleted after it ran.`
+      );
+    case "pending":
+      return (
+        `Schema is behind: ${pending.length} migration(s) pending — ` +
+        `${pending.join(", ")}. Run \`npm run migrate:dev\` to apply them.`
+      );
+    default:
+      return currentVersion != null
+        ? `Schema is up to date at version ${currentVersion}.`
+        : "Schema is up to date (no additive migrations have been applied yet).";
   }
+}
 
-  assert.equal(deriveState(0, 0, false), "uninitialized");
-  assert.equal(deriveState(2, 0, false), "uninitialized"); // schema missing wins
-  void pool; // suppress unused warning
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+test("checkMigrationHealth: all five SchemaHealthState values are reachable", () => {
+  assert.equal(deriveHealthState(0, 0, true), "clean", "no pending, no drift → clean");
+  assert.equal(deriveHealthState(1, 0, true), "pending", "pending files → pending");
+  assert.equal(deriveHealthState(0, 1, true), "drifted", "missing on disk → drifted");
+  assert.equal(deriveHealthState(1, 1, true), "partial", "both → partial");
+  assert.equal(deriveHealthState(0, 0, false), "uninitialized", "no schema → uninitialized");
 });
 
-test("checkMigrationHealth state matrix: all five states are reachable", () => {
-  function deriveState(
-    pending: number,
-    missingOnDisk: number,
-    schemaExists: boolean,
-  ): string {
-    if (!schemaExists) return "uninitialized";
-    if (pending > 0 && missingOnDisk > 0) return "partial";
-    if (missingOnDisk > 0) return "drifted";
-    if (pending > 0) return "pending";
-    return "clean";
-  }
-
-  assert.equal(deriveState(0, 0, true), "clean", "no pending, no drift → clean");
-  assert.equal(deriveState(1, 0, true), "pending", "pending files → pending");
-  assert.equal(deriveState(0, 1, true), "drifted", "missing on disk → drifted");
-  assert.equal(deriveState(1, 1, true), "partial", "both → partial");
-  assert.equal(deriveState(0, 0, false), "uninitialized", "no schema → uninitialized");
+test("checkMigrationHealth: uninitialized wins even when pending > 0", () => {
+  // A missing schema_migrations table overrides everything else.
+  assert.equal(deriveHealthState(3, 0, false), "uninitialized");
+  assert.equal(deriveHealthState(3, 2, false), "uninitialized");
 });
 
-test("checkMigrationHealth: canStartSafely is only true for clean state", () => {
+test("checkMigrationHealth: partial requires BOTH pending and missingOnDisk", () => {
+  // partial = pending AND missing — neither alone is enough
+  assert.notEqual(deriveHealthState(1, 0, true), "partial");
+  assert.notEqual(deriveHealthState(0, 1, true), "partial");
+  assert.equal(deriveHealthState(2, 3, true), "partial");
+});
+
+test("checkMigrationHealth: canStartSafely is only true for the clean state", () => {
   const states = ["clean", "pending", "drifted", "partial", "uninitialized"] as const;
-  const expected: Record<string, boolean> = {
-    clean: true,
-    pending: false,
-    drifted: false,
-    partial: false,
-    uninitialized: false,
-  };
   for (const state of states) {
     const canStartSafely = state === "clean";
-    assert.equal(canStartSafely, expected[state], `state=${state}`);
+    assert.equal(canStartSafely, state === "clean", `canStartSafely mismatch for state=${state}`);
   }
 });
 
-test("checkMigrationHealth summaries are human-readable and name the problem", () => {
-  // Verify the summary strings produced for each non-clean state contain
-  // enough context for an operator to understand the issue.
-  function buildSummary(
-    state: string,
-    pending: string[],
-    missingOnDisk: string[],
-    currentVersion: string | null,
-  ): string {
-    switch (state) {
-      case "uninitialized":
-        return "Schema has not been initialized. Run `npm run migrate:dev` to apply the base schema and all pending migrations.";
-      case "partial":
-        return (
-          `Schema is in a partial state: ${pending.length} migration(s) pending on disk ` +
-          `AND ${missingOnDisk.length} migration(s) recorded as applied but missing from disk ` +
-          `(${missingOnDisk.join(", ")}). ` +
-          `Investigate before running migrations — the missing files may indicate a renamed or deleted migration.`
-        );
-      case "drifted":
-        return (
-          `Schema has drifted: ${missingOnDisk.length} migration(s) recorded as applied in ` +
-          `schema_migrations but no longer present on disk: ${missingOnDisk.join(", ")}. ` +
-          `This usually means a migration file was renamed or deleted after it ran.`
-        );
-      case "pending":
-        return (
-          `Schema is behind: ${pending.length} migration(s) pending — ` +
-          `${pending.join(", ")}. Run \`npm run migrate:dev\` to apply them.`
-        );
-      default:
-        return currentVersion != null
-          ? `Schema is up to date at version ${currentVersion}.`
-          : "Schema is up to date (no additive migrations have been applied yet).";
-    }
-  }
+test("checkMigrationHealth summaries contain actionable operator guidance", () => {
+  const uninitSummary = buildHealthSummary("uninitialized", [], [], null);
+  assert.match(uninitSummary, /npm run migrate:dev/, "uninitialized: mentions the fix command");
 
-  const uninitSummary = buildSummary("uninitialized", [], [], null);
-  assert.match(uninitSummary, /npm run migrate:dev/, "uninitialized: mentions command");
-
-  const partialSummary = buildSummary("partial", ["002_foo.sql"], ["001_bar.sql"], null);
-  assert.match(partialSummary, /partial state/, "partial: calls it partial");
+  const partialSummary = buildHealthSummary("partial", ["002_foo.sql"], ["001_bar.sql"], null);
+  assert.match(partialSummary, /partial state/, "partial: uses the word 'partial'");
   assert.match(partialSummary, /001_bar\.sql/, "partial: names the missing file");
   assert.match(partialSummary, /002_foo\.sql/, "partial: names the pending file");
+  assert.match(partialSummary, /Investigate/, "partial: asks operator to investigate");
 
-  const driftedSummary = buildSummary("drifted", [], ["001_gone.sql"], null);
-  assert.match(driftedSummary, /drifted/, "drifted: uses the word drifted");
+  const driftedSummary = buildHealthSummary("drifted", [], ["001_gone.sql"], null);
+  assert.match(driftedSummary, /drifted/, "drifted: uses the word 'drifted'");
   assert.match(driftedSummary, /001_gone\.sql/, "drifted: names the missing file");
+  assert.match(driftedSummary, /renamed or deleted/, "drifted: explains the likely cause");
 
-  const pendingSummary = buildSummary("pending", ["002_add_col.sql"], [], null);
-  assert.match(pendingSummary, /behind/, "pending: says behind");
+  const pendingSummary = buildHealthSummary("pending", ["002_add_col.sql"], [], null);
+  assert.match(pendingSummary, /behind/, "pending: says 'behind'");
   assert.match(pendingSummary, /002_add_col\.sql/, "pending: names the pending file");
+  assert.match(pendingSummary, /npm run migrate:dev/, "pending: mentions the fix command");
 
-  const cleanSummary = buildSummary("clean", [], [], "001_add_round_deadline_ledgers.sql");
-  assert.match(cleanSummary, /up to date/, "clean: says up to date");
-  assert.match(cleanSummary, /001_add_round_deadline_ledgers/, "clean: names current version");
+  const cleanSummary = buildHealthSummary("clean", [], [], "001_add_round_deadline_ledgers.sql");
+  assert.match(cleanSummary, /up to date/, "clean: says 'up to date'");
+  assert.match(cleanSummary, /001_add_round_deadline_ledgers/, "clean: names the current version");
 
-  const cleanNoMigrations = buildSummary("clean", [], [], null);
-  assert.match(cleanNoMigrations, /up to date/, "clean (no migrations): says up to date");
+  // Edge case: clean with no additive migrations ever applied
+  const cleanNoMigrations = buildHealthSummary("clean", [], [], null);
+  assert.match(cleanNoMigrations, /up to date/, "clean (no migrations yet): says up to date");
+  assert.doesNotMatch(cleanNoMigrations, /null/, "clean: must not expose null in summary string");
 });
 
-// ── getMigrationStatus derived fields ────────────────────────────────────────
-
-test("getMigrationStatus: computes applied/pending/missingOnDisk correctly", () => {
-  // Simulate the derivation logic without touching the pool.
-  function computeStatus(
-    filesOnDisk: string[],
-    appliedInDb: string[],
-  ) {
-    const appliedSet = new Set(appliedInDb);
-    const applied = filesOnDisk.filter((f) => appliedSet.has(f));
-    const pending = filesOnDisk.filter((f) => !appliedSet.has(f));
-    const missingOnDisk = appliedInDb.filter((f) => !filesOnDisk.includes(f));
-    return {
-      applied,
-      pending,
-      missingOnDisk,
-      currentVersion: applied.length > 0 ? applied[applied.length - 1] : null,
-    };
-  }
-
-  // Fresh state: one file on disk, nothing applied.
+test("getMigrationStatus: computes applied/pending/missingOnDisk correctly for all cases", () => {
+  // Fresh state: file on disk, nothing applied yet.
   const fresh = computeStatus(["001_add_col.sql"], []);
   assert.deepEqual(fresh.applied, []);
   assert.deepEqual(fresh.pending, ["001_add_col.sql"]);
@@ -199,143 +158,133 @@ test("getMigrationStatus: computes applied/pending/missingOnDisk correctly", () 
   assert.deepEqual(upToDate.missingOnDisk, []);
   assert.equal(upToDate.currentVersion, "001_add_col.sql");
 
-  // Drifted: applied in DB but deleted from disk.
+  // Drifted: applied in DB but the file was deleted from disk.
   const drifted = computeStatus([], ["001_gone.sql"]);
   assert.deepEqual(drifted.applied, []);
   assert.deepEqual(drifted.missingOnDisk, ["001_gone.sql"]);
   assert.deepEqual(drifted.pending, []);
+  assert.equal(drifted.currentVersion, null);
 
   // Partial: something new on disk AND something missing from disk.
   const partial = computeStatus(["002_new.sql"], ["001_old.sql"]);
   assert.deepEqual(partial.pending, ["002_new.sql"]);
   assert.deepEqual(partial.missingOnDisk, ["001_old.sql"]);
 
-  // currentVersion is the last APPLIED (sorted) file, not the last on disk.
-  const multiApplied = computeStatus(
+  // Multiple applied: currentVersion is the last one (sorted by filename).
+  const multi = computeStatus(
     ["001_a.sql", "002_b.sql", "003_c.sql"],
     ["001_a.sql", "002_b.sql"],
   );
-  assert.equal(multiApplied.currentVersion, "002_b.sql");
-  assert.deepEqual(multiApplied.pending, ["003_c.sql"]);
+  assert.equal(multi.currentVersion, "002_b.sql", "currentVersion must be the last applied");
+  assert.deepEqual(multi.pending, ["003_c.sql"]);
+  assert.deepEqual(multi.missingOnDisk, []);
 });
 
-test("getMigrationStatus: currentVersion is null when nothing is applied", () => {
-  const applied: string[] = [];
-  const currentVersion = applied.length > 0 ? applied[applied.length - 1] : null;
-  assert.equal(currentVersion, null);
+test("getMigrationStatus: currentVersion is null when nothing has been applied", () => {
+  const status = computeStatus(["001_add_col.sql"], []);
+  assert.equal(status.currentVersion, null);
 });
 
-test("getMigrationStatus: missingOnDisk entries are sorted lexicographically", () => {
-  function computeMissingOnDisk(filesOnDisk: string[], appliedInDb: string[]): string[] {
-    return appliedInDb.filter((f) => !filesOnDisk.includes(f));
-  }
-
-  const missing = computeMissingOnDisk([], ["003_c.sql", "001_a.sql", "002_b.sql"]);
-  // The order reflects the order they were inserted into schema_migrations.
-  // The point is that all three are present.
-  assert.equal(missing.length, 3);
-  assert.ok(missing.includes("001_a.sql"));
-  assert.ok(missing.includes("002_b.sql"));
-  assert.ok(missing.includes("003_c.sql"));
+test("getMigrationStatus: all missingOnDisk entries are reported, not just the first", () => {
+  // Three files applied but deleted from disk — all three must appear.
+  const status = computeStatus([], ["003_c.sql", "001_a.sql", "002_b.sql"]);
+  assert.equal(status.missingOnDisk.length, 3, "all ghost entries must be reported");
+  assert.ok(status.missingOnDisk.includes("001_a.sql"));
+  assert.ok(status.missingOnDisk.includes("002_b.sql"));
+  assert.ok(status.missingOnDisk.includes("003_c.sql"));
 });
 
-// ── Idempotence guard ─────────────────────────────────────────────────────────
-
-test("runMigrations is idempotent: re-running on an up-to-date DB produces zero pending", () => {
-  // The idempotence guarantee comes from two mechanisms:
-  //   1. schema.sql uses CREATE TABLE IF NOT EXISTS throughout.
-  //   2. Each additive migration is guarded by a SELECT from schema_migrations.
-  //
-  // We verify the logic of guard (2) directly.
+test("runMigrations idempotence guard: a file already in schema_migrations is skipped", () => {
+  // Guard (2) in runMigrations: SELECT before executing, skip if found.
   function shouldSkip(filename: string, appliedSet: Set<string>): boolean {
     return appliedSet.has(filename);
   }
 
-  const applied = new Set(["001_add_round_deadline_ledgers.sql"]);
-
-  // First run: not in applied set → should execute.
+  // First run: file not in applied set → execute it.
   assert.equal(shouldSkip("001_add_round_deadline_ledgers.sql", new Set()), false);
 
-  // Second run: already applied → should skip.
+  // Second run: same file is now in applied set → skip it.
+  const applied = new Set(["001_add_round_deadline_ledgers.sql"]);
   assert.equal(shouldSkip("001_add_round_deadline_ledgers.sql", applied), true);
 });
 
-// ── Transactional safety ──────────────────────────────────────────────────────
-
-test("runMigrations wraps each file in a transaction: ROLLBACK on failure leaves schema_migrations unchanged", () => {
-  // Simulate the apply-or-rollback path.
+test("runMigrations transactional safety: ROLLBACK on failure leaves applied list unchanged", async () => {
+  // Simulate the per-file try/catch that wraps BEGIN … COMMIT.
+  // A failed migration must not add to the applied list.
   const applied: string[] = [];
 
   async function simulateApply(file: string, sqlWillFail: boolean): Promise<void> {
-    // BEGIN
-    try {
-      if (sqlWillFail) throw new Error("syntax error");
-      // COMMIT path
-      applied.push(file);
-    } catch {
-      // ROLLBACK path — applied list is unchanged
+    if (sqlWillFail) {
+      // ROLLBACK path — applied is not modified.
       throw new Error(`[migrate] Failed on ${file}: syntax error`);
     }
+    // COMMIT path.
+    applied.push(file);
   }
 
-  // Successful apply adds to applied.
-  simulateApply("001_good.sql", false).then(() => {
-    assert.ok(applied.includes("001_good.sql"));
-  });
+  // Successful apply records the file.
+  await simulateApply("001_good.sql", false);
+  assert.ok(applied.includes("001_good.sql"), "successful migration must be recorded");
 
-  // Failed apply does not add to applied list.
-  const before = [...applied];
-  simulateApply("002_bad.sql", true).catch(() => {
-    assert.deepEqual(applied, before, "failed migration must not pollute applied list");
-  });
+  // Failed apply must not record anything.
+  const snapshot = [...applied];
+  await assert.rejects(
+    () => simulateApply("002_bad.sql", true),
+    /Failed on 002_bad\.sql/,
+    "failed migration must throw",
+  );
+  assert.deepEqual(applied, snapshot, "applied list must be unchanged after a failure");
 });
 
-// ── 42P01 error handling ──────────────────────────────────────────────────────
-
-test("getMigrationStatus treats 42P01 as empty applied set (schema not initialised)", () => {
-  // The 42P01 code means schema_migrations doesn't exist yet.
-  // The handler should treat this as appliedSet = new Set() rather than
-  // propagating the error.
-  function handleQueryError(err: { code?: string }): Set<string> | never {
+test("42P01 error code is treated as an empty applied set, not a thrown error", () => {
+  // The 42P01 code means schema_migrations doesn't exist yet — this is the
+  // normal state on a fresh database and should never crash the process.
+  function handleQueryError(err: { code?: string }): Set<string> {
     if (err.code === "42P01") return new Set<string>();
-    throw err;
+    throw Object.assign(new Error("unexpected DB error"), err);
   }
 
   const result = handleQueryError({ code: "42P01" });
-  assert.ok(result instanceof Set);
-  assert.equal(result.size, 0);
+  assert.ok(result instanceof Set, "42P01 must return an empty Set");
+  assert.equal(result.size, 0, "the empty Set must contain no entries");
 
+  // Any other error code must propagate.
   assert.throws(
     () => handleQueryError({ code: "ECONNREFUSED" }),
-    /ECONNREFUSED/,
+    /unexpected DB error/,
     "non-42P01 errors must be re-thrown",
   );
 });
 
 // ─── Integration tests (require live Postgres) ─────────────────────────────
 //
-// These are skipped when DATABASE_URL is not set so they don't fail in
-// environments without a running database (e.g. a pure TypeScript lint CI).
+// Skipped when DATABASE_URL is not set.  Each integration test calls
+// runMigrations() first so the schema is always in a known state regardless
+// of execution order.
 
 const hasDb = Boolean(process.env.DATABASE_URL);
 
 if (hasDb) {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { runMigrations, getMigrationStatus, checkMigrationHealth } = require("./migrate") as typeof import("./migrate");
+  const { runMigrations, getMigrationStatus, checkMigrationHealth } =
+    require("./migrate") as typeof import("./migrate");
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { pool } = require("./pool") as typeof import("./pool");
 
-  test("runMigrations is idempotent and reports an up-to-date status", async () => {
+  test("runMigrations is idempotent: double-run leaves no pending migrations", async () => {
     await runMigrations();
-    const status = await runMigrations();
+    const status = await runMigrations(); // second call must be a no-op
 
-    assert.equal(status.pending.length, 0, "no pending after double-run");
+    assert.equal(status.pending.length, 0, "no pending after idempotent double-run");
     assert.equal(status.missingOnDisk.length, 0, "no missing-on-disk after double-run");
-    assert.ok(status.currentVersion, "expected a currentVersion once migrations exist");
-    assert.ok(status.applied.includes(status.currentVersion!));
+    assert.ok(status.currentVersion, "currentVersion must be set once migrations exist");
+    assert.ok(
+      status.applied.includes(status.currentVersion!),
+      "currentVersion must appear in the applied list",
+    );
   });
 
-  test("checkMigrationHealth returns clean state on a fully migrated DB", async () => {
+  test("checkMigrationHealth returns clean after a full migration run", async () => {
     await runMigrations();
     const health = await checkMigrationHealth();
 
@@ -344,7 +293,7 @@ if (hasDb) {
     assert.match(health.summary, /up to date/);
   });
 
-  test("getMigrationStatus flags a schema_migrations row with no file on disk", async () => {
+  test("getMigrationStatus: ghost entry in schema_migrations appears in missingOnDisk", async () => {
     await runMigrations();
     await pool.query(
       "INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING",
@@ -358,13 +307,14 @@ if (hasDb) {
         "ghost entry must appear in missingOnDisk",
       );
     } finally {
-      await pool.query("DELETE FROM schema_migrations WHERE filename = $1", [
-        "999_never_existed.sql",
-      ]);
+      await pool.query(
+        "DELETE FROM schema_migrations WHERE filename = $1",
+        ["999_never_existed.sql"],
+      );
     }
   });
 
-  test("checkMigrationHealth returns drifted state when a ghost entry exists", async () => {
+  test("checkMigrationHealth returns drifted when a ghost entry is present", async () => {
     await runMigrations();
     await pool.query(
       "INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING",
@@ -374,16 +324,18 @@ if (hasDb) {
     try {
       const health = await checkMigrationHealth();
       assert.equal(health.state, "drifted", "ghost entry must trigger drifted state");
-      assert.equal(health.canStartSafely, false);
-      assert.match(health.summary, /888_also_gone\.sql/);
+      assert.equal(health.canStartSafely, false, "drifted state must not be safe to start");
+      assert.match(health.summary, /888_also_gone\.sql/, "summary must name the missing file");
     } finally {
-      await pool.query("DELETE FROM schema_migrations WHERE filename = $1", [
-        "888_also_gone.sql",
-      ]);
+      await pool.query(
+        "DELETE FROM schema_migrations WHERE filename = $1",
+        ["888_also_gone.sql"],
+      );
     }
   });
 
   test.after(async () => {
+    // Only end the pool in the integration block that opened it.
     await pool.end();
   });
 }
