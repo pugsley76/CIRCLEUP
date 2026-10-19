@@ -5,19 +5,25 @@
  * and reputation contracts and writes them into Postgres.
  *
  * Events consumed:
- *   factory/circle_created  → inserts circles + circle_members rows
- *   circle/initialized      → (no DB write; creation handled by factory event)
- *   circle/joined            → updates circle_members.joined_at
- *   circle/active            → updates circles.status = 'Active'
- *   circle/contributed       → inserts contributions row
- *   circle/payout            → inserts payouts row, updates circles.current_round
- *   circle/default           → inserts defaults row
- *   circle/completed         → updates circles.status = 'Completed'
- *   circle/cancelled         → updates circles.status = 'Cancelled'
- *   circle/closed            → updates circles status/total_released/close_reason
- *   circle/paused            → updates circles.paused = TRUE
- *   circle/resumed           → updates circles.paused = FALSE
- *   reputation/increment     → upserts reputation row
+ *   factory/circle_created        → inserts circles + circle_members rows
+ *   circle/initialized            → updates circles.member_count, round_amount,
+ *                                   total_rounds, round_deadline_ledgers
+ *   circle/joined                 → updates circle_members.joined_at
+ *   circle/active                 → updates circles.status = 'Active'
+ *   circle/contributed            → inserts contributions row
+ *   circle/payout                 → inserts payouts row, updates circles.current_round
+ *   circle/default                → inserts defaults row
+ *   circle/round_started          → updates circles.current_round to the new round index
+ *   circle/exceptional_settlement → inserts payouts row (partial pot), increments
+ *                                   affected members' defaults, updates current_round
+ *   circle/completed              → updates circles.status = 'Completed'
+ *   circle/cancelled              → updates circles.status = 'Cancelled',
+ *                                   writes circle_audit_events row
+ *   circle/closed                 → updates circles status/total_released/close_reason,
+ *                                   writes circle_audit_events row
+ *   circle/paused                 → updates circles.paused = TRUE
+ *   circle/resumed                → updates circles.paused = FALSE
+ *   reputation/increment          → upserts reputation row
  *
  * Ordering model
  * ──────────────
@@ -48,8 +54,31 @@ import {
   START_LEDGER,
   POLL_INTERVAL_MS,
   EVENTS_LIMIT,
+  RPC_RETRY_MAX_ATTEMPTS,
+  RPC_RETRY_BASE_DELAY_MS,
+  POLL_BACKOFF_INITIAL_MS,
+  POLL_BACKOFF_MAX_MS,
+  POLL_BACKOFF_MULTIPLIER,
 } from "./config";
-import { redactAddress, redactTxHash, formatAmount } from "./redact";
+import { redactAddress, formatAmount } from "./redact";
+import {
+  buildFailureEvidence,
+  eventFailureId,
+  recordLedgerFailureEvidence,
+  type EventFailureEvidence,
+} from "./eventFailures";
+import {
+  log,
+  logIndexerStarted,
+  logIndexerStopped,
+  logTickSkipped,
+  logPollCompleted,
+  logPollFailed,
+  logPollBackoff,
+  logLedgerProcessed,
+  logEventHandlerError,
+  logRpcRetry,
+} from "./logger";
 
 export const rpc = new SorobanRpc.Server(STELLAR_RPC_URL, {
   allowHttp: true,
@@ -60,15 +89,9 @@ const REPUTATION = REPUTATION_ADDRESS;
 export const USDC = USDC_ADDRESS;
 
 // ─── Soroban RPC retry ───────────────────────────────────────────────────────
-
-const RPC_RETRY_MAX_ATTEMPTS = parseInt(
-  process.env.RPC_RETRY_MAX_ATTEMPTS || "4",
-  10,
-);
-const RPC_RETRY_BASE_DELAY_MS = parseInt(
-  process.env.RPC_RETRY_BASE_DELAY_MS || "500",
-  10,
-);
+// RPC_RETRY_MAX_ATTEMPTS and RPC_RETRY_BASE_DELAY_MS are validated and
+// exported by ./config (positive integer, upper-bounded) so a typo'd value
+// fails loudly at boot rather than silently altering retry behaviour.
 
 /** Error codes / substrings that are safe to retry. Exported for unit tests. */
 export function isTransientRpcError(err: unknown): boolean {
@@ -172,11 +195,13 @@ export async function withRpcRetry<T>(
       }
       const baseDelay = baseDelayMs * 2 ** (attempt - 1);
       const delayMs = computeJitteredDelay(baseDelay);
-      console.warn(
-        `[indexer] Transient RPC failure during ${label} ` +
-          `(attempt ${attempt}/${attempts}): ${describeRpcError(err)} ` +
-          `— retrying in ${delayMs}ms`,
-      );
+      logRpcRetry({
+        label,
+        attempt,
+        maxAttempts: attempts,
+        delayMs,
+        error: describeRpcError(err),
+      });
       await sleep(delayMs);
     }
   }
@@ -209,13 +234,33 @@ function getContractIdStr(event: SdkEvent): string | null {
   return null;
 }
 
+function safeScValToNative(value: unknown): unknown {
+  if (value == null) return null;
+
+  try {
+    return scValToNative(value as xdr.ScVal);
+  } catch {
+    return null;
+  }
+}
+
+function getTopicValue(event: SdkEvent, idx: number): unknown {
+  if (!Array.isArray(event.topic) || idx < 0 || idx >= event.topic.length) {
+    return null;
+  }
+
+  return safeScValToNative(event.topic[idx]);
+}
+
 function getTopicStr(event: SdkEvent, idx: number): string {
-  const val = event.topic[idx];
-  return scValToNative(val as xdr.ScVal) as string;
+  const value = getTopicValue(event, idx);
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  return String(value);
 }
 
 function getValueNative(event: SdkEvent): unknown {
-  return scValToNative(event.value as xdr.ScVal);
+  return safeScValToNative(event.value);
 }
 
 function normalizeForKey(value: unknown): string {
@@ -234,7 +279,7 @@ function normalizeForKey(value: unknown): string {
 
 export function createEventKey(event: SdkEvent): string {
   const contractId = getContractIdStr(event) ?? "";
-  const topicParts = (event.topic ?? []).map((topic) => normalizeForKey(scValToNative(topic as xdr.ScVal)));
+  const topicParts = (event.topic ?? []).map((topic) => normalizeForKey(safeScValToNative(topic)));
   return [
     event.ledger ?? 0,
     event.txHash ?? "",
@@ -332,7 +377,7 @@ export async function ingestEventInTx(
   const result = await client.query(
     `INSERT INTO ingested_events (event_key, contract_id, ledger, tx_hash, event_type, event_index)
      VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (event_key) DO NOTHING`,
+     ON CONFLICT DO NOTHING`,
     [eventKey, contractId, event.ledger, event.txHash, eventType, eventIndex],
   );
 
@@ -349,7 +394,10 @@ export async function ingestEventInTx(
  * Process all events for one ledger inside a single Postgres transaction.
  *
  * Each event is wrapped in a savepoint: a throwing handler rolls back only its
- * own writes and does not abort the rest of the ledger.  After all events are
+ * own writes and does not abort the rest of the ledger.  The skipped event is
+ * recorded in event_failures (see ./eventFailures) so it stays discoverable
+ * by ledger and identity.  Exception: a *transient* database error aborts the
+ * whole ledger so it is retried instead of skipped.  After all events are
  * attempted the indexer_state cursor is advanced to `ledger` and a
  * ledger_checkpoints record is written — both inside the same transaction, so
  * a crash before COMMIT leaves the DB at the previous ledger boundary with no
@@ -362,14 +410,21 @@ export async function processLedger(
   ledger: number,
   items: EventHandler[],
 ): Promise<{ processed: number; failed: number }> {
+  const ledgerStartedAt = Date.now();
   return withTransaction(async (client) => {
     let processed = 0;
     let failed = 0;
+    let skipped = 0;
+    // Evidence for events skipped in this ledger, and the ids of events that
+    // ingested successfully (which resolves any earlier failure of theirs).
+    const failures: EventFailureEvidence[] = [];
+    const succeededEventIds: string[] = [];
 
     for (const { event, handler } of items) {
       const contractId = getContractIdStr(event);
       const topic0 = event.topic?.[0] ? getTopicStr(event, 0) : "";
       const topic1 = event.topic?.[1] ? getTopicStr(event, 1) : "";
+      const eventType = topic0 && topic1 ? `${topic0}/${topic1}` : topic0 || "unknown";
 
       await client.query("SAVEPOINT sp_event");
       try {
@@ -378,19 +433,61 @@ export async function processLedger(
         if (ingested) {
           processed++;
           totalEventsProcessed++;
+          succeededEventIds.push(eventFailureId(event, contractId, eventType));
+        } else {
+          skipped++;
+          totalEventsSkipped++;
         }
       } catch (err) {
+        const evidence = buildFailureEvidence({ event, contractId, eventType, error: err });
+
+        // A database-level error (deadlock, serialization failure, lost
+        // connection, timeout) says nothing about this event.  Skipping it
+        // would lose data, so abort the whole ledger instead: the transaction
+        // rolls back, the cursor stays at the previous ledger, and the poll
+        // loop's backoff retries the ledger from scratch.
+        if (evidence.errorClass === "transient") {
+          totalEventsRetried++;
+          logEventHandlerError({
+            ledger,
+            eventType,
+            contractId: contractId ?? "unknown",
+            txHash: event.txHash,
+            eventId: typeof event.id === "string" ? event.id : undefined,
+            errorClass: evidence.errorClass,
+            error: evidence.errorMessage,
+          });
+          throw err;
+        }
+
         await client.query("ROLLBACK TO SAVEPOINT sp_event");
         failed++;
         totalEventsFailed++;
-        console.error(
-          `[indexer] Failed to process ${topic0}/${topic1} event ` +
-            `(contract=${redactAddress(contractId ?? "unknown")}, ledger=${ledger}` +
-            (event.txHash ? `, tx=${redactTxHash(event.txHash)}` : "") +
-            "):",
-          err,
-        );
+        failures.push(evidence);
+        logEventHandlerError({
+          ledger,
+          eventType,
+          contractId: contractId ?? "unknown",
+          txHash: event.txHash,
+          eventId: typeof event.id === "string" ? event.id : undefined,
+          errorClass: evidence.errorClass,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
+    }
+
+    // Durable, payload-free failure evidence, committed atomically with the
+    // ledger.  Isolated in its own savepoint so a failed evidence write can
+    // never block ingestion.
+    const evidenceRecorded = await recordLedgerFailureEvidence(
+      client,
+      failures,
+      succeededEventIds,
+    );
+    if (!evidenceRecorded) {
+      log("warn", "event_failure_evidence_failed", { ledger, eventsFailed: failed },
+        `Could not record event failure evidence for ledger ${ledger} — ` +
+          `is the event_failures migration applied?`);
     }
 
     // Advance the durable ledger cursor atomically with the event writes.
@@ -411,11 +508,159 @@ export async function processLedger(
       [ledger, processed, failed],
     );
 
+    const latencyMs = Date.now() - ledgerStartedAt;
+    logLedgerProcessed({ ledger, processed, failed, skipped, latencyMs });
     return { processed, failed };
   });
 }
 
 // ─── Event data parsers (pure, no I/O — exported for unit tests) ─────────────
+
+/**
+ * Parse the data payload of a `circle/initialized` event.
+ *
+ * Contract data tuple (contracts/circle/src/lib.rs — `initialize` entry-point):
+ *   (circle_address: Address, member_count: u32, round_amount: i128)
+ *
+ * This event is emitted by every newly deployed circle immediately after
+ * `initialize` completes, inside the same transaction as the factory's
+ * `circle_created` event.  The indexer uses it to backfill `member_count`,
+ * `total_rounds`, and `round_amount` on the `circles` row that was created
+ * by the `factory/circle_created` handler (which has those columns set to 0
+ * as placeholders because they are not part of the factory event payload).
+ *
+ * # Invariants
+ *
+ * - `circleAddress` is a non-empty C-prefix contract address.
+ * - `memberCount` is in `[2, 256]` (enforced by `initialize`).
+ * - `roundAmount > 0` (enforced by `initialize`).
+ * - `memberCount` equals `totalRounds` — each member receives exactly one
+ *   round payout over the circle's lifetime.
+ *
+ * @throws `Error` with a descriptive message when the payload is malformed or
+ *   any field has an unexpected type/value.
+ */
+export function parseInitializedEvent(value: unknown): {
+  circleAddress: string;
+  memberCount: number;
+  roundAmount: bigint;
+} {
+  if (!Array.isArray(value) || value.length < 3) {
+    throw new Error(
+      `circle/initialized: expected data tuple [circle_address, member_count, round_amount] ` +
+        `but received ${JSON.stringify(value)}`,
+    );
+  }
+  const [circleAddress, memberCount, roundAmount] = value as [
+    string,
+    number,
+    bigint | number,
+  ];
+
+  if (typeof circleAddress !== "string" || circleAddress.length === 0) {
+    throw new Error(
+      `circle/initialized: circle_address must be a non-empty string, got ${JSON.stringify(circleAddress)}`,
+    );
+  }
+  if (
+    typeof memberCount !== "number" ||
+    !Number.isInteger(memberCount) ||
+    memberCount < 2 ||
+    memberCount > 256
+  ) {
+    throw new Error(
+      `circle/initialized: member_count must be an integer in [2, 256], got ${JSON.stringify(memberCount)}`,
+    );
+  }
+
+  let roundAmountBig: bigint;
+  if (typeof roundAmount === "bigint") {
+    roundAmountBig = roundAmount;
+  } else if (typeof roundAmount === "number" && Number.isInteger(roundAmount) && roundAmount > 0) {
+    roundAmountBig = BigInt(roundAmount);
+  } else {
+    throw new Error(
+      `circle/initialized: round_amount must be a positive bigint or integer, got ${JSON.stringify(roundAmount)}`,
+    );
+  }
+  if (roundAmountBig <= 0n) {
+    throw new Error(
+      `circle/initialized: round_amount must be > 0, got ${roundAmountBig}`,
+    );
+  }
+
+  return { circleAddress, memberCount, roundAmount: roundAmountBig };
+}
+
+/**
+ * Parse the data payload of a `circle/joined` event.
+ *
+ * Contract data tuple (contracts/circle/src/lib.rs — `join` entry-point):
+ *   (circle_address: Address, member: Address, join_order: u32, collateral: i128)
+ *
+ * Invariants:
+ *   - `join_order` is in `[1, member_count]` (1-based join-queue position).
+ *   - When `join_order == member_count` the circle transitions to Active and
+ *     a `circle/active` event follows in the same transaction.
+ *   - `collateral` equals `round_amount × COLLATERAL_MULTIPLIER` (always ≥ 0).
+ *
+ * @throws `Error` with a descriptive message when the payload is malformed or
+ *   any field has an unexpected type/value.
+ */
+export function parseJoinedEvent(value: unknown): {
+  circleAddress: string;
+  member: string;
+  joinOrder: number;
+  collateral: bigint;
+} {
+  if (!Array.isArray(value) || value.length < 4) {
+    throw new Error(
+      `circle/joined: expected data tuple [circle_address, member, join_order, collateral] ` +
+        `but received ${JSON.stringify(value)}`,
+    );
+  }
+  const [circleAddress, member, joinOrder, collateral] = value as [
+    string,
+    string,
+    number,
+    bigint | number,
+  ];
+
+  if (typeof circleAddress !== "string" || circleAddress.length === 0) {
+    throw new Error(
+      `circle/joined: circle_address must be a non-empty string, got ${JSON.stringify(circleAddress)}`,
+    );
+  }
+  if (typeof member !== "string" || member.length === 0) {
+    throw new Error(
+      `circle/joined: member must be a non-empty string, got ${JSON.stringify(member)}`,
+    );
+  }
+  if (typeof joinOrder !== "number" || !Number.isInteger(joinOrder) || joinOrder < 1) {
+    throw new Error(
+      `circle/joined: join_order must be a positive integer (≥ 1), got ${JSON.stringify(joinOrder)}`,
+    );
+  }
+  // collateral is i128 → bigint after scValToNative; accept plain numbers too
+  // (narrower integer types on older SDK versions).
+  let collateralBig: bigint;
+  if (typeof collateral === "bigint") {
+    if (collateral < 0n) {
+      throw new Error(
+        `circle/joined: collateral must be a non-negative bigint or integer, got ${JSON.stringify(collateral.toString())}`,
+      );
+    }
+    collateralBig = collateral;
+  } else if (typeof collateral === "number" && Number.isInteger(collateral) && collateral >= 0) {
+    collateralBig = BigInt(collateral);
+  } else {
+    throw new Error(
+      `circle/joined: collateral must be a non-negative bigint or integer, got ${JSON.stringify(collateral)}`,
+    );
+  }
+
+  return { circleAddress, member, joinOrder, collateral: collateralBig };
+}
 
 /**
  * Parse the data payload of a `factory/circle_created` event.
@@ -484,31 +729,44 @@ async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
      ON CONFLICT (address) DO NOTHING`,
     [circleAddress, creator, event.ledger],
   );
-  console.log(
-    `[indexer] New circle created: ${redactAddress(circleAddress)} by ${redactAddress(creator)} (factory index: ${circleIndex})`,
-  );
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "factory/circle_created",
+    contractId: circleAddress,
+    txHash: event.txHash,
+  }, `New circle created by ${redactAddress(creator)} (factory index: ${circleIndex})`);
 }
 
 async function handleCircleJoined(client: PoolClient, circleAddr: string, event: SdkEvent) {
   // Event data: (circle_address, member, join_order, collateral_amount)
-  // circle_address is topic-level but also first data element; member is at index [1]
-  const value = getValueNative(event);
-  const memberAddr = Array.isArray(value) ? String(value[1]) : String(value);
+  // Parsed via the typed parseJoinedEvent function — any shape mismatch throws
+  // immediately instead of silently writing wrong data.
+  const { member, joinOrder, collateral } = parseJoinedEvent(getValueNative(event));
 
   await client.query(
-    `UPDATE circle_members SET joined_at = NOW()
-     WHERE circle_address = $1 AND member_address = $2`,
-    [circleAddr, memberAddr],
+    `UPDATE circle_members
+        SET joined_at   = NOW(),
+            join_order  = $3,
+            collateral  = $4
+      WHERE circle_address = $1 AND member_address = $2`,
+    [circleAddr, member, joinOrder, collateral.toString()],
   );
-  console.log(`[indexer] Member joined: ${redactAddress(memberAddr)} → ${redactAddress(circleAddr)}`);
+  console.log(
+    `[indexer] Member joined: ${redactAddress(member)} → ${redactAddress(circleAddr)} ` +
+      `(order=${joinOrder}, collateral=${collateral})`,
+  );
 }
+
 
 async function handleCircleActive(client: PoolClient, circleAddr: string) {
   await client.query(
     "UPDATE circles SET status = 'Active', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle active: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/active",
+    contractId: circleAddr,
+  }, `Circle active: ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleContributed(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -524,7 +782,12 @@ async function handleCircleContributed(client: PoolClient, circleAddr: string, e
      ON CONFLICT (circle_address, member_address, round_index) DO NOTHING`,
     [circleAddr, memberAddr, roundIndex, amount, event.txHash, event.ledger],
   );
-  console.log(`[indexer] Contribution: ${redactAddress(memberAddr)} round ${roundIndex} → ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "circle/contributed",
+    contractId: circleAddr,
+    txHash: event.txHash,
+  }, `Contribution: ${redactAddress(memberAddr)} round ${roundIndex} → ${redactAddress(circleAddr)}`);
 }
 
 async function handleCirclePayout(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -545,7 +808,12 @@ async function handleCirclePayout(client: PoolClient, circleAddr: string, event:
     `UPDATE circles SET current_round = $1, updated_at = NOW() WHERE address = $2`,
     [roundIndex + 1, circleAddr],
   );
-  console.log(`[indexer] Payout: ${redactAddress(recipient)} ${formatAmount(pot)} round ${roundIndex} from ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "circle/payout",
+    contractId: circleAddr,
+    txHash: event.txHash,
+  }, `Payout: ${redactAddress(recipient)} ${formatAmount(pot)} round ${roundIndex} from ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleDefault(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -566,31 +834,70 @@ async function handleCircleDefault(client: PoolClient, circleAddr: string, event
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
   );
-  console.log(`[indexer] Default: ${redactAddress(memberAddr)} ${formatAmount(penalty)} round ${roundIndex} in ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "circle/default",
+    contractId: circleAddr,
+    txHash: event.txHash,
+  }, `Default: ${redactAddress(memberAddr)} ${formatAmount(penalty)} round ${roundIndex} in ${redactAddress(circleAddr)}`);
 }
 
-async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
-  await client.query(
+async function handleCircleCompleted(client: PoolClient, circleAddr: string) {  await client.query(
     "UPDATE circles SET status = 'Completed', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle completed: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/completed",
+    contractId: circleAddr,
+  }, `Circle completed: ${redactAddress(circleAddr)}`);
 }
 
-async function handleCircleCancelled(client: PoolClient, circleAddr: string) {
-  // Event data: (circle_address, caller, ledger) — we only need the status update
+async function handleCircleCancelled(client: PoolClient, circleAddr: string, event: SdkEvent) {
+  // Event data: (circle_address, caller, ledger)
+  //   value[0] = circle_address (same as circleAddr — included for replay completeness)
+  //   value[1] = caller  — the member who triggered the cancellation
+  //   value[2] = ledger  — on-chain ledger sequence at the time of cancellation
+  const value = getValueNative(event) as unknown[];
+  const caller = value[1] !== undefined ? String(value[1]) : null;
+  const onChainLedger = value[2] !== undefined ? String(value[2]) : null;
+
+  // 1. Update the circle status (existing behaviour — unchanged)
   await client.query(
     "UPDATE circles SET status = 'Cancelled', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle cancelled: ${redactAddress(circleAddr)}`);
+
+  // 2. Write a structured audit row so the full cancellation context is
+  //    durably persisted and queryable, not just the status change.
+  //    ON CONFLICT DO NOTHING makes this idempotent for re-index replays.
+  await client.query(
+    `INSERT INTO circle_audit_events
+       (circle_address, event_type, triggered_by, ledger, tx_hash)
+     VALUES ($1, 'cancelled', $2, $3, $4)
+     ON CONFLICT (circle_address, event_type) DO NOTHING`,
+    [circleAddr, caller, onChainLedger, event.txHash ?? null],
+  );
+
+  console.log(
+    `[indexer] Circle cancelled: ${redactAddress(circleAddr)}` +
+    (caller ? ` by ${redactAddress(caller)}` : ""),
+  );
 }
 
 async function handleCircleClosed(client: PoolClient, circleAddr: string, event: SdkEvent) {
   // Event data: (circle_address, closer, total_released, total_expected_collateral, reason)
+  //   value[0] = circle_address         (same as circleAddr — replay completeness)
+  //   value[1] = closer                 — member who called close()
+  //   value[2] = total_released         — USDC stroops returned across all members
+  //   value[3] = total_expected_collateral — what would have been released with zero penalties
+  //   value[4] = reason                 — Symbol "completed" | "cancelled"
   const value = getValueNative(event) as unknown[];
+  const closer = value[1] !== undefined ? String(value[1]) : null;
   const totalReleased = value[2] !== undefined ? String(value[2]) : "0";
+  const totalExpectedCollateral = value[3] !== undefined ? String(value[3]) : null;
   const reason = value[4] !== undefined ? String(value[4]) : "unknown";
+
+  // 1. Update circle status / financials (existing behaviour — extended)
   await client.query(
     `UPDATE circles
        SET status = 'Closed', updated_at = NOW(),
@@ -598,7 +905,31 @@ async function handleCircleClosed(client: PoolClient, circleAddr: string, event:
      WHERE address = $1`,
     [circleAddr, totalReleased, reason],
   );
-  console.log(`[indexer] Circle closed: ${redactAddress(circleAddr)} reason=${reason} released=${totalReleased}`);
+
+  // 2. Write a structured audit row capturing the full close context.
+  //    ON CONFLICT DO NOTHING makes this idempotent for re-index replays.
+  await client.query(
+    `INSERT INTO circle_audit_events
+       (circle_address, event_type, triggered_by, ledger, tx_hash,
+        total_released, total_expected_collateral, close_reason)
+     VALUES ($1, 'closed', $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (circle_address, event_type) DO NOTHING`,
+    [
+      circleAddr,
+      closer,
+      event.ledger ?? null,
+      event.txHash ?? null,
+      totalReleased,
+      totalExpectedCollateral,
+      reason,
+    ],
+  );
+
+  console.log(
+    `[indexer] Circle closed: ${redactAddress(circleAddr)} reason=${reason} ` +
+    `released=${totalReleased}` +
+    (closer ? ` by ${redactAddress(closer)}` : ""),
+  );
 }
 
 async function handleCirclePaused(client: PoolClient, circleAddr: string) {
@@ -607,7 +938,10 @@ async function handleCirclePaused(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET paused = TRUE, updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle paused: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/paused",
+    contractId: circleAddr,
+  }, `Circle paused: ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleResumed(client: PoolClient, circleAddr: string) {
@@ -616,12 +950,171 @@ async function handleCircleResumed(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET paused = FALSE, updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle resumed: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/resumed",
+    contractId: circleAddr,
+  }, `Circle resumed: ${redactAddress(circleAddr)}`);
+}
+
+/**
+ * Handle `circle/initialized`.
+ *
+ * Contract event data: (circle_address, member_count: u32, round_amount: i128)
+ *
+ * The factory/circle_created event inserts the circle row with placeholder
+ * values (round_amount=0, member_count=0).  This event fires immediately after
+ * in the same transaction and carries the real values, so we patch them in.
+ *
+ * If no factory event preceded this (e.g. a direct initialize call without the
+ * factory), we upsert the row to ensure it exists.
+ */
+async function handleCircleInitialized(
+  client: PoolClient,
+  circleAddr: string,
+  event: SdkEvent,
+) {
+  // Event data: (circle_address, member_count, round_amount)
+  //   value[0] = circle_address  (same as circleAddr — replay identity)
+  //   value[1] = member_count    — u32 number of configured members (= total rounds)
+  //   value[2] = round_amount    — i128 USDC stroops per member per round
+  const value = getValueNative(event) as unknown[];
+  const memberCount = value[1] !== undefined ? Number(value[1]) : 0;
+  const roundAmount = value[2] !== undefined ? String(value[2]) : "0";
+
+  await client.query(
+    `INSERT INTO circles
+       (address, creator, round_amount, member_count, total_rounds, status,
+        current_round, created_ledger)
+     VALUES ($1, '', $2, $3, $3, 'Pending', 0, $4)
+     ON CONFLICT (address) DO UPDATE
+       SET round_amount  = EXCLUDED.round_amount,
+           member_count  = EXCLUDED.member_count,
+           total_rounds  = EXCLUDED.total_rounds,
+           updated_at    = NOW()`,
+    [circleAddr, roundAmount, memberCount, event.ledger],
+  );
+  console.log(
+    `[indexer] Circle initialized: ${redactAddress(circleAddr)} ` +
+    `members=${memberCount} round_amount=${roundAmount}`,
+  );
+}
+
+/**
+ * Handle `circle/round_started`.
+ *
+ * Contract event data:
+ *   (circle_address, round_index: u32, recipient: Address, deadline_ledger: u64)
+ *
+ * Emitted by payout() and settle_round() immediately after the current round
+ * is settled, when there is still at least one round remaining.  We update
+ * circles.current_round so the indexer's view stays synchronised with the
+ * contract's RoundState without waiting for the next payout event.
+ *
+ * This closes the gap where the DB showed the *previous* round index between
+ * a payout completing and the next contribution arriving.
+ */
+async function handleCircleRoundStarted(
+  client: PoolClient,
+  circleAddr: string,
+  event: SdkEvent,
+) {
+  // Event data: (circle_address, round_index, recipient, deadline_ledger)
+  //   value[0] = circle_address  (identity)
+  //   value[1] = round_index     — u32, the NEW round that just opened
+  //   value[2] = recipient       — Address scheduled to receive the pot this round
+  //   value[3] = deadline_ledger — u64, last ledger to contribute before deadline
+  const value = getValueNative(event) as unknown[];
+  const roundIndex = value[1] !== undefined ? Number(value[1]) : null;
+
+  if (roundIndex === null) {
+    throw new Error(
+      `circle/round_started: missing round_index in event data for ${circleAddr}`,
+    );
+  }
+
+  await client.query(
+    `UPDATE circles SET current_round = $1, updated_at = NOW() WHERE address = $2`,
+    [roundIndex, circleAddr],
+  );
+  console.log(
+    `[indexer] Round started: ${redactAddress(circleAddr)} round=${roundIndex}`,
+  );
+}
+
+/**
+ * Handle `circle/exceptional_settlement`.
+ *
+ * Contract event data:
+ *   (circle_address, recipient: Address, pot: i128, round_index: u32,
+ *    defaulted_count: u32)
+ *
+ * Emitted by settle_round() BEFORE the standard payout event on the same
+ * round.  We record it alongside normal payouts so the /rounds endpoint can
+ * flag which rounds were settled via the escape hatch.  The subsequent
+ * circle/payout event still fires and is handled by handleCirclePayout as
+ * normal — both events together give a complete picture of the settlement.
+ *
+ * The defaults for each non-contributing member are emitted as individual
+ * circle/default events by the contract, so we do not duplicate that work here.
+ */
+async function handleCircleExceptionalSettlement(
+  client: PoolClient,
+  circleAddr: string,
+  event: SdkEvent,
+) {
+  // Event data: (circle_address, recipient, pot, round_index, defaulted_count)
+  //   value[0] = circle_address
+  //   value[1] = recipient       — Address that received the partial pot
+  //   value[2] = pot             — i128 USDC stroops actually paid out
+  //   value[3] = round_index     — u32 round being settled
+  //   value[4] = defaulted_count — u32 members who did NOT contribute
+  const value = getValueNative(event) as unknown[];
+  const recipient = value[1] !== undefined ? String(value[1]) : null;
+  const pot = value[2] !== undefined ? String(value[2]) : "0";
+  const roundIndex = value[3] !== undefined ? Number(value[3]) : null;
+  const defaultedCount = value[4] !== undefined ? Number(value[4]) : 0;
+
+  if (roundIndex === null) {
+    throw new Error(
+      `circle/exceptional_settlement: missing round_index in event data for ${circleAddr}`,
+    );
+  }
+
+  // Record the exceptional settlement fact. ON CONFLICT preserves idempotency
+  // for re-index replays: if handleCirclePayout already wrote this round we
+  // update the exceptional flags in-place without duplicating the row.
+  await client.query(
+    `INSERT INTO payouts
+       (circle_address, recipient, round_index, amount, tx_hash, ledger,
+        is_exceptional, defaulted_count)
+     VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
+     ON CONFLICT (circle_address, round_index) DO UPDATE
+       SET is_exceptional  = TRUE,
+           defaulted_count = EXCLUDED.defaulted_count`,
+    [
+      circleAddr,
+      recipient,
+      roundIndex,
+      pot,
+      event.txHash,
+      event.ledger,
+      defaultedCount,
+    ],
+  );
+
+  console.log(
+    `[indexer] Exceptional settlement: ${redactAddress(circleAddr)} ` +
+    `round=${roundIndex} pot=${pot} defaulted=${defaultedCount}`,
+  );
 }
 
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
   const score = getValueNative(event) as number;
-  const memberAddr = scValToNative(event.topic[1] as xdr.ScVal) as string;
+  const memberAddr = getTopicStr(event, 1);
+
+  if (!memberAddr) {
+    throw new Error("reputation/increment: missing or malformed member topic");
+  }
 
   await client.query(
     `INSERT INTO reputation (member_address, score, updated_at)
@@ -629,13 +1122,22 @@ async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
      ON CONFLICT (member_address) DO UPDATE SET score = $2, updated_at = NOW()`,
     [memberAddr, score],
   );
-  console.log(`[indexer] Reputation: ${redactAddress(memberAddr)} → score ${score}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "reputation/increment",
+    contractId: memberAddr,
+    txHash: event.txHash,
+  }, `Reputation: ${redactAddress(memberAddr)} → score ${score}`);
 }
 
 // ─── Metrics ─────────────────────────────────────────────────────────────────
 
 let totalEventsProcessed = 0;
 let totalEventsFailed = 0;
+let totalEventsSkipped = 0;
+// Handler errors classified as transient: the ledger was rolled back and will
+// be retried, so the event was neither skipped nor counted as failed.
+let totalEventsRetried = 0;
 let pollCyclesCompleted = 0;
 let pollCyclesFailed = 0;
 let lastPollDurationMs = 0;
@@ -663,13 +1165,13 @@ export async function runEventHandler(
     return true;
   } catch (err) {
     totalEventsFailed++;
-    console.error(
-      `[indexer] Failed to process ${ctx.topic} event ` +
-        `(contract=${redactAddress(ctx.contractId ?? "unknown")}, ledger=${ctx.ledger}` +
-        (ctx.txHash ? `, tx=${redactTxHash(ctx.txHash)}` : "") +
-        "):",
-      err,
-    );
+    logEventHandlerError({
+      ledger: ctx.ledger,
+      eventType: ctx.topic,
+      contractId: ctx.contractId ?? "unknown",
+      txHash: ctx.txHash,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return false;
   }
 }
@@ -765,16 +1267,22 @@ async function processEvents(fromLedger: number, toLedger: number) {
 
     let handler: ((client: PoolClient) => Promise<void>) | null = null;
     switch (t1) {
-      case "joined":      handler = (c) => handleCircleJoined(c, contractId, event); break;
-      case "active":      handler = (c) => handleCircleActive(c, contractId); break;
-      case "contributed": handler = (c) => handleCircleContributed(c, contractId, event); break;
-      case "payout":      handler = (c) => handleCirclePayout(c, contractId, event); break;
-      case "default":     handler = (c) => handleCircleDefault(c, contractId, event); break;
-      case "completed":   handler = (c) => handleCircleCompleted(c, contractId); break;
-      case "cancelled":   handler = (c) => handleCircleCancelled(c, contractId); break;
-      case "closed":      handler = (c) => handleCircleClosed(c, contractId, event); break;
-      case "paused":      handler = (c) => handleCirclePaused(c, contractId); break;
-      case "resumed":     handler = (c) => handleCircleResumed(c, contractId); break;
+      case "initialized":            handler = (c) => handleCircleInitialized(c, contractId, event); break;
+      case "joined":                 handler = (c) => handleCircleJoined(c, contractId, event); break;
+      case "active":                 handler = (c) => handleCircleActive(c, contractId); break;
+      case "contributed":            handler = (c) => handleCircleContributed(c, contractId, event); break;
+      case "payout":                 handler = (c) => handleCirclePayout(c, contractId, event); break;
+      case "default":                handler = (c) => handleCircleDefault(c, contractId, event); break;
+      case "round_started":          handler = (c) => handleCircleRoundStarted(c, contractId, event); break;
+      case "exceptional_settlement": handler = (c) => handleCircleExceptionalSettlement(c, contractId, event); break;
+      case "completed":              handler = (c) => handleCircleCompleted(c, contractId); break;
+      case "cancelled":              handler = (c) => handleCircleCancelled(c, contractId, event); break;
+      case "closed":                 handler = (c) => handleCircleClosed(c, contractId, event); break;
+      case "paused":                 handler = (c) => handleCirclePaused(c, contractId); break;
+      case "resumed":                handler = (c) => handleCircleResumed(c, contractId); break;
+      // collateral_released is per-member and emitted inside close(); the
+      // aggregate total is captured by the circle/closed event handler above,
+      // so individual collateral_released events need no separate DB write.
     }
     if (handler) items.push({ event, handler });
   }
@@ -819,11 +1327,13 @@ async function processEvents(fromLedger: number, toLedger: number) {
   }
 
   const durationMs = Date.now() - startedAt;
-  console.log(
-    `[indexer] Processed ledgers ${fromLedger}-${toLedger}: ` +
-      `${totalSeen} event(s), ${totalFailed} failed, ${durationMs}ms` +
-      (totalEventsFailed > 0 ? ` (${totalEventsFailed} failed since start)` : ""),
-  );
+  logPollCompleted({
+    fromLedger,
+    toLedger,
+    eventsProcessed: totalSeen,
+    eventsFailed: totalFailed,
+    durationMs,
+  });
 }
 
 // ─── Backoff policy (Issue 29) ────────────────────────────────────────────────
@@ -834,23 +1344,19 @@ async function processEvents(fromLedger: number, toLedger: number) {
  * Temporary RPC failures should not cause a hot loop or immediate process exit.
  * This policy tracks consecutive failures and computes the next wait interval
  * with capped exponential backoff + jitter.
+ *
+ * POLL_BACKOFF_INITIAL_MS, POLL_BACKOFF_MAX_MS, and POLL_BACKOFF_MULTIPLIER
+ * are validated and exported by ./config so out-of-range values fail loudly
+ * at boot rather than silently producing unexpected backoff behaviour.
  */
 interface BackoffState {
   consecutiveFailures: number;
   currentIntervalMs: number;
 }
 
-const BACKOFF_INITIAL_MS = parseInt(
-  process.env.POLL_BACKOFF_INITIAL_MS || "1000",
-  10,
-);
-const BACKOFF_MAX_MS = parseInt(
-  process.env.POLL_BACKOFF_MAX_MS || "60000",
-  10,
-);
-const BACKOFF_MULTIPLIER = parseFloat(
-  process.env.POLL_BACKOFF_MULTIPLIER || "2.0",
-);
+const BACKOFF_INITIAL_MS = POLL_BACKOFF_INITIAL_MS;
+const BACKOFF_MAX_MS = POLL_BACKOFF_MAX_MS;
+const BACKOFF_MULTIPLIER = POLL_BACKOFF_MULTIPLIER;
 
 function createBackoffState(): BackoffState {
   return {
@@ -937,10 +1443,11 @@ export async function startIndexer() {
     throw new Error("[indexer] Event poller is already running");
   }
 
-  console.log(
-    `[indexer] Starting CircleUp event indexer ` +
-      `(poll interval: ${POLL_INTERVAL_MS}ms, events per page: ${EVENTS_LIMIT})...`,
-  );
+  logIndexerStarted({
+    pollIntervalMs: POLL_INTERVAL_MS,
+    eventsLimit: EVENTS_LIMIT,
+    startLedger: START_LEDGER,
+  });
 
   shuttingDown = false;
   indexerStarted = true;
@@ -948,7 +1455,7 @@ export async function startIndexer() {
   const tick = () => {
     if (shuttingDown) return;
     if (pollInFlight) {
-      console.warn("[indexer] Previous poll still in flight — skipping overlapping tick");
+      logTickSkipped();
       return;
     }
 
@@ -960,17 +1467,17 @@ export async function startIndexer() {
         pollCyclesFailed++;
         
         if (shouldWarnBackoff(backoffState)) {
-          console.warn(
-            `[indexer] Poll has failed ${backoffState.consecutiveFailures} consecutive times. ` +
-            `Current backoff interval: ${Math.floor(backoffState.currentIntervalMs / 1000)}s. ` +
-            `Check RPC connectivity and logs.`,
-          );
+          logPollBackoff({
+            consecutiveFailures: backoffState.consecutiveFailures,
+            currentIntervalMs: backoffState.currentIntervalMs,
+          });
         }
         
-        console.error(
-          `[indexer] Poll error (will retry after backoff):`,
-          err,
-        );
+        logPollFailed({
+          error: err instanceof Error ? err.message : String(err),
+          consecutiveFailures: backoffState.consecutiveFailures,
+          backoffMs: backoffState.currentIntervalMs,
+        });
         
         // Apply jittered backoff before the next tick
         const waitMs = computeJitteredWait(backoffState);
@@ -997,12 +1504,12 @@ export async function startIndexer() {
  */
 export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   if (!indexerStarted && !pollTimer && !pollInFlight) {
-    console.log("[indexer] Event poller is not running — nothing to stop");
+    log("info", "indexer_stopped", {}, "Event poller is not running — nothing to stop");
     return;
   }
 
   if (shuttingDown) {
-    console.log("[indexer] Shutdown already in progress — waiting...");
+    log("info", "indexer_stopped", {}, "Shutdown already in progress — waiting...");
     if (pollInFlight) {
       await raceWithAbort(pollInFlight.catch(() => undefined), signal);
     }
@@ -1010,7 +1517,7 @@ export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   }
 
   shuttingDown = true;
-  console.log("[indexer] Graceful shutdown requested — stopping event poller...");
+  log("info", "indexer_stopped", {}, "Graceful shutdown requested — stopping event poller...");
 
   if (pollTimer) {
     clearInterval(pollTimer);
@@ -1018,14 +1525,14 @@ export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   }
 
   if (pollInFlight) {
-    console.log("[indexer] Waiting for in-flight poll cycle to finish...");
+    log("info", "indexer_stopped", {}, "Waiting for in-flight poll cycle to finish...");
     // Race the in-flight cycle against the abort signal so a stuck RPC call
     // does not block the process past the configured grace period.
     await raceWithAbort(pollInFlight.catch(() => undefined), signal);
   }
 
   indexerStarted = false;
-  console.log("[indexer] Event poller stopped cleanly");
+  logIndexerStopped();
 }
 
 /**
@@ -1076,6 +1583,8 @@ export function getIndexerMetrics() {
   return {
     totalEventsProcessed,
     totalEventsFailed,
+    totalEventsSkipped,
+    totalEventsRetried,
     pollCyclesCompleted,
     pollCyclesFailed,
     lastPollDurationMs,

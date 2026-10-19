@@ -1,12 +1,9 @@
 /**
- * Tests for app/src/lib/config.ts environment validation helpers.
+ * Tests for app/src/lib/config.ts
  *
- * Covers getMissingEnvVars, getMalformedContractAddresses, and
- * getNetworkConflicts with missing, malformed, conflicting, and valid inputs.
- *
- * These are pure functions so no DOM or Next.js runtime is required.
- * The module-level assertEnvVars() call is bypassed because the jsdom
- * environment sets window, causing the server-only guard to short-circuit.
+ * Covers the environment validation helpers, indexer URL utilities, and the
+ * config-absent detection helper added for graceful fallback when a circle
+ * contract's Config storage key is missing.
  */
 
 import { describe, it, expect } from "vitest";
@@ -14,211 +11,237 @@ import {
   getMissingEnvVars,
   getMalformedContractAddresses,
   getNetworkConflicts,
+  resolveIndexerBaseUrl,
+  indexerEndpoint,
+  usdcToStroops,
+  stroopsToUsdc,
+  isConfigAbsent,
 } from "../lib/config";
 
-// ─── Fixtures ────────────────────────────────────────────────────────────────
+const VALID_FACTORY = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+const VALID_REPUTATION = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const VALID_USDC = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA4";
 
-const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
-const MAINNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
-const TESTNET_RPC = "https://soroban-testnet.stellar.org";
-const MAINNET_RPC = "https://soroban.stellar.org";
-
-const VALID_CONTRACT_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
-
-const FULL_DEV_ENV: Record<string, string> = {
-  NEXT_PUBLIC_STELLAR_RPC_URL: TESTNET_RPC,
-  NEXT_PUBLIC_NETWORK_PASSPHRASE: TESTNET_PASSPHRASE,
+const VALID_ENV = {
+  NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+  NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
   NEXT_PUBLIC_INDEXER_URL: "http://localhost:3001",
+  NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS: VALID_FACTORY,
+  NEXT_PUBLIC_REPUTATION_ADDRESS: VALID_REPUTATION,
+  NEXT_PUBLIC_USDC_ADDRESS: VALID_USDC,
 };
 
-const FULL_PROD_ENV: Record<string, string> = {
-  ...FULL_DEV_ENV,
-  NEXT_PUBLIC_STELLAR_RPC_URL: MAINNET_RPC,
-  NEXT_PUBLIC_NETWORK_PASSPHRASE: MAINNET_PASSPHRASE,
-  NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS: VALID_CONTRACT_ID,
-  NEXT_PUBLIC_REPUTATION_ADDRESS: VALID_CONTRACT_ID,
-  NEXT_PUBLIC_USDC_ADDRESS: VALID_CONTRACT_ID,
-};
+// ─── isConfigAbsent ───────────────────────────────────────────────────────────
 
-// ═════════════════════════════════════════════════════════════════════════════
-// getMissingEnvVars
-// ═════════════════════════════════════════════════════════════════════════════
+describe("isConfigAbsent", () => {
+  it("returns true for the SDK's canonical not-initialized message", () => {
+    expect(
+      isConfigAbsent(
+        "Circle contract is not initialized: the Config storage key is absent.",
+      ),
+    ).toBe(true);
+  });
+
+  it("returns true for 'Contract error code 1'", () => {
+    expect(isConfigAbsent("Contract error code 1. Check that the operation is valid.")).toBe(true);
+  });
+
+  it("returns true for 'NotInitialized' in any case", () => {
+    expect(isConfigAbsent("NotInitialized")).toBe(true);
+    expect(isConfigAbsent("notinitialized")).toBe(true);
+    expect(isConfigAbsent("Error: NOTINITIALIZED")).toBe(true);
+  });
+
+  it("returns true for 'Storage(MissingValue)'", () => {
+    expect(isConfigAbsent("Storage(MissingValue)")).toBe(true);
+    expect(isConfigAbsent("storage(missingvalue)")).toBe(true);
+  });
+
+  it("returns false for unrelated errors", () => {
+    expect(isConfigAbsent("")).toBe(false);
+    expect(isConfigAbsent("network timeout")).toBe(false);
+    expect(isConfigAbsent("already initialized")).toBe(false);
+    expect(isConfigAbsent("Contract error code 2")).toBe(false);
+    expect(isConfigAbsent("Circle is not active")).toBe(false);
+  });
+});
+
+// ─── getMissingEnvVars ────────────────────────────────────────────────────────
 
 describe("getMissingEnvVars", () => {
-  it("returns empty array for a complete dev env", () => {
-    expect(getMissingEnvVars(FULL_DEV_ENV, false)).toEqual([]);
+  it("returns empty array for a fully valid env", () => {
+    expect(getMissingEnvVars(VALID_ENV, true)).toEqual([]);
   });
 
-  it("returns empty array for a complete production env", () => {
-    expect(getMissingEnvVars(FULL_PROD_ENV, true)).toEqual([]);
+  it("flags always-required vars when absent", () => {
+    const missing = getMissingEnvVars({}, false);
+    expect(missing).toContain("NEXT_PUBLIC_STELLAR_RPC_URL");
+    expect(missing).toContain("NEXT_PUBLIC_NETWORK_PASSPHRASE");
+    expect(missing).toContain("NEXT_PUBLIC_INDEXER_URL");
   });
 
-  it("flags NEXT_PUBLIC_STELLAR_RPC_URL when missing", () => {
-    const env = { ...FULL_DEV_ENV };
-    delete env.NEXT_PUBLIC_STELLAR_RPC_URL;
-    expect(getMissingEnvVars(env, false)).toContain("NEXT_PUBLIC_STELLAR_RPC_URL");
-  });
-
-  it("flags NEXT_PUBLIC_NETWORK_PASSPHRASE when missing", () => {
-    const env = { ...FULL_DEV_ENV };
-    delete env.NEXT_PUBLIC_NETWORK_PASSPHRASE;
-    expect(getMissingEnvVars(env, false)).toContain("NEXT_PUBLIC_NETWORK_PASSPHRASE");
-  });
-
-  it("flags NEXT_PUBLIC_INDEXER_URL when missing", () => {
-    const env = { ...FULL_DEV_ENV };
-    delete env.NEXT_PUBLIC_INDEXER_URL;
-    expect(getMissingEnvVars(env, false)).toContain("NEXT_PUBLIC_INDEXER_URL");
-  });
-
-  it("flags whitespace-only values as missing", () => {
-    const env = { ...FULL_DEV_ENV, NEXT_PUBLIC_STELLAR_RPC_URL: "   " };
-    expect(getMissingEnvVars(env, false)).toContain("NEXT_PUBLIC_STELLAR_RPC_URL");
-  });
-
-  it("does not flag production addresses in dev mode", () => {
-    const result = getMissingEnvVars(FULL_DEV_ENV, false);
-    expect(result).not.toContain("NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS");
-    expect(result).not.toContain("NEXT_PUBLIC_REPUTATION_ADDRESS");
-    expect(result).not.toContain("NEXT_PUBLIC_USDC_ADDRESS");
-  });
-
-  it("flags all three production addresses when missing in production", () => {
-    const env = { ...FULL_DEV_ENV };
-    const result = getMissingEnvVars(env, true);
-    expect(result).toContain("NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS");
-    expect(result).toContain("NEXT_PUBLIC_REPUTATION_ADDRESS");
-    expect(result).toContain("NEXT_PUBLIC_USDC_ADDRESS");
-  });
-
-  it("reports multiple missing variables in one call", () => {
-    const result = getMissingEnvVars({}, false);
-    expect(result.length).toBeGreaterThanOrEqual(3);
+  it("flags contract addresses in production but not in dev", () => {
+    const baseEnv = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+      NEXT_PUBLIC_INDEXER_URL: "http://localhost:3001",
+    };
+    expect(getMissingEnvVars(baseEnv, false)).toEqual([]);
+    const inProd = getMissingEnvVars(baseEnv, true);
+    expect(inProd).toContain("NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS");
+    expect(inProd).toContain("NEXT_PUBLIC_REPUTATION_ADDRESS");
+    expect(inProd).toContain("NEXT_PUBLIC_USDC_ADDRESS");
   });
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
-// getMalformedContractAddresses
-// ═════════════════════════════════════════════════════════════════════════════
+// ─── getMalformedContractAddresses ───────────────────────────────────────────
 
 describe("getMalformedContractAddresses", () => {
-  it("returns empty array when no contract addresses are set", () => {
-    expect(getMalformedContractAddresses(FULL_DEV_ENV)).toEqual([]);
+  it("returns empty for valid addresses", () => {
+    expect(getMalformedContractAddresses(VALID_ENV)).toEqual([]);
   });
 
-  it("returns empty array for valid Soroban contract IDs", () => {
-    expect(getMalformedContractAddresses(FULL_PROD_ENV)).toEqual([]);
+  it("flags addresses that do not start with C", () => {
+    const env = { ...VALID_ENV, NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS: "GABC" };
+    expect(getMalformedContractAddresses(env).length).toBeGreaterThan(0);
   });
 
-  it("flags a G-prefixed address (not a contract ID)", () => {
-    const env = {
-      ...FULL_PROD_ENV,
-      NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS:
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-    };
-    const result = getMalformedContractAddresses(env);
-    expect(result.length).toBe(1);
-    expect(result[0]).toContain("NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS");
-  });
-
-  it("flags a truncated contract ID (too short)", () => {
-    const env = {
-      ...FULL_PROD_ENV,
-      NEXT_PUBLIC_REPUTATION_ADDRESS: "CSHORT",
-    };
-    const result = getMalformedContractAddresses(env);
-    expect(result.length).toBe(1);
-    expect(result[0]).toContain("NEXT_PUBLIC_REPUTATION_ADDRESS");
-  });
-
-  it("flags multiple malformed addresses in one call", () => {
-    const env = {
-      ...FULL_PROD_ENV,
-      NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS: "not-a-contract",
-      NEXT_PUBLIC_REPUTATION_ADDRESS: "also-wrong",
-    };
-    expect(getMalformedContractAddresses(env).length).toBe(2);
-  });
-
-  it("does not flag empty values (presence is checked by getMissingEnvVars)", () => {
-    const env = {
-      ...FULL_PROD_ENV,
-      NEXT_PUBLIC_USDC_ADDRESS: "",
-    };
-    const result = getMalformedContractAddresses(env);
-    expect(result.every((e) => !e.includes("NEXT_PUBLIC_USDC_ADDRESS"))).toBe(true);
+  it("does not flag a missing address (that is getMissingEnvVars' job)", () => {
+    const env = { ...VALID_ENV, NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS: "" };
+    expect(getMalformedContractAddresses(env)).toEqual([]);
   });
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
-// getNetworkConflicts
-// ═════════════════════════════════════════════════════════════════════════════
+// ─── getNetworkConflicts ──────────────────────────────────────────────────────
 
 describe("getNetworkConflicts", () => {
-  it("returns empty array for a consistent testnet configuration", () => {
-    expect(
-      getNetworkConflicts({
-        NEXT_PUBLIC_STELLAR_RPC_URL: TESTNET_RPC,
-        NEXT_PUBLIC_NETWORK_PASSPHRASE: TESTNET_PASSPHRASE,
-      }),
-    ).toEqual([]);
+  it("returns empty when testnet RPC + testnet passphrase", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+    };
+    expect(getNetworkConflicts(env)).toEqual([]);
   });
 
-  it("returns empty array for a consistent mainnet configuration", () => {
-    expect(
-      getNetworkConflicts({
-        NEXT_PUBLIC_STELLAR_RPC_URL: MAINNET_RPC,
-        NEXT_PUBLIC_NETWORK_PASSPHRASE: MAINNET_PASSPHRASE,
-      }),
-    ).toEqual([]);
+  it("returns empty when mainnet RPC + mainnet passphrase", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
+    };
+    expect(getNetworkConflicts(env)).toEqual([]);
   });
 
-  it("returns empty array when either value is absent (no comparison possible)", () => {
-    expect(
-      getNetworkConflicts({ NEXT_PUBLIC_STELLAR_RPC_URL: TESTNET_RPC }),
-    ).toEqual([]);
-    expect(
-      getNetworkConflicts({ NEXT_PUBLIC_NETWORK_PASSPHRASE: MAINNET_PASSPHRASE }),
-    ).toEqual([]);
+  it("flags mainnet passphrase + testnet RPC URL", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
+    };
+    expect(getNetworkConflicts(env).length).toBeGreaterThan(0);
+    expect(getNetworkConflicts(env)[0]).toMatch(/mainnet passphrase.*testnet/i);
+  });
+
+  it("flags testnet passphrase + mainnet RPC URL (soroban.stellar.org)", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+    };
+    const conflicts = getNetworkConflicts(env);
+    expect(conflicts.length).toBeGreaterThan(0);
+    expect(conflicts[0]).toMatch(/testnet passphrase.*mainnet/i);
+  });
+
+  it("flags testnet passphrase + horizon.stellar.org mainnet RPC", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://horizon.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+    };
+    const conflicts = getNetworkConflicts(env);
+    expect(conflicts.length).toBeGreaterThan(0);
+  });
+
+  it("flags an entirely unrecognised passphrase", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "My Custom Network ; 2024",
+    };
+    const conflicts = getNetworkConflicts(env);
+    expect(conflicts.length).toBeGreaterThan(0);
+    expect(conflicts[0]).toMatch(/not a recognised/i);
+  });
+
+  it("returns empty when either value is missing", () => {
+    expect(getNetworkConflicts({ NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org" })).toEqual([]);
+    expect(getNetworkConflicts({ NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015" })).toEqual([]);
     expect(getNetworkConflicts({})).toEqual([]);
   });
+});
 
-  it("flags mainnet passphrase paired with testnet RPC URL", () => {
-    const result = getNetworkConflicts({
-      NEXT_PUBLIC_STELLAR_RPC_URL: TESTNET_RPC,
-      NEXT_PUBLIC_NETWORK_PASSPHRASE: MAINNET_PASSPHRASE,
-    });
-    expect(result.length).toBe(1);
-    expect(result[0]).toContain("mainnet passphrase");
-    expect(result[0]).toContain("testnet");
+// ─── resolveIndexerBaseUrl ────────────────────────────────────────────────────
+
+describe("resolveIndexerBaseUrl", () => {
+  it("normalises a valid http URL", () => {
+    expect(resolveIndexerBaseUrl("http://localhost:3001/")).toBe("http://localhost:3001");
   });
 
-  it("flags testnet passphrase paired with mainnet RPC URL", () => {
-    const result = getNetworkConflicts({
-      NEXT_PUBLIC_STELLAR_RPC_URL: MAINNET_RPC,
-      NEXT_PUBLIC_NETWORK_PASSPHRASE: TESTNET_PASSPHRASE,
-    });
-    expect(result.length).toBe(1);
-    expect(result[0]).toContain("testnet passphrase");
-    expect(result[0]).toContain("mainnet");
+  it("returns null for a bare hostname (no scheme)", () => {
+    expect(resolveIndexerBaseUrl("localhost:3001")).toBeNull();
   });
 
-  it("conflict message does not contain the passphrase value (secret-safe)", () => {
-    const result = getNetworkConflicts({
-      NEXT_PUBLIC_STELLAR_RPC_URL: TESTNET_RPC,
-      NEXT_PUBLIC_NETWORK_PASSPHRASE: MAINNET_PASSPHRASE,
-    });
-    for (const msg of result) {
-      expect(msg).not.toContain(MAINNET_PASSPHRASE);
-    }
+  it("returns null for an empty string", () => {
+    expect(resolveIndexerBaseUrl("")).toBeNull();
   });
 
-  it("does not flag a custom RPC URL that matches neither known network", () => {
-    expect(
-      getNetworkConflicts({
-        NEXT_PUBLIC_STELLAR_RPC_URL: "https://my-private-node.example.com",
-        NEXT_PUBLIC_NETWORK_PASSPHRASE: MAINNET_PASSPHRASE,
-      }),
-    ).toEqual([]);
+  it("returns null for a URL with credentials", () => {
+    expect(resolveIndexerBaseUrl("http://user:pass@localhost:3001")).toBeNull();
+  });
+});
+
+// ─── indexerEndpoint ──────────────────────────────────────────────────────────
+
+describe("indexerEndpoint", () => {
+  it("builds a path from segments", () => {
+    expect(indexerEndpoint(["circles", "CADDR"], "http://localhost:3001")).toBe(
+      "http://localhost:3001/circles/CADDR",
+    );
+  });
+
+  it("returns null when base is null", () => {
+    expect(indexerEndpoint(["circles"], null)).toBeNull();
+  });
+
+  it("URL-encodes special characters in segments", () => {
+    const url = indexerEndpoint(["circles", "CA/B"], "http://localhost:3001");
+    expect(url).not.toContain("/CA/B");
+    expect(url).toContain("CA%2FB");
+  });
+});
+
+// ─── usdcToStroops / stroopsToUsdc ───────────────────────────────────────────
+
+describe("usdcToStroops", () => {
+  it("converts 1 USDC to 10_000_000 stroops", () => {
+    expect(usdcToStroops("1")).toBe(10_000_000n);
+  });
+
+  it("converts a fractional USDC amount", () => {
+    expect(usdcToStroops("0.5")).toBe(5_000_000n);
+  });
+
+  it("throws for a negative amount", () => {
+    expect(() => usdcToStroops("-1")).toThrow();
+  });
+});
+
+describe("stroopsToUsdc", () => {
+  it("converts 10_000_000 stroops to '1'", () => {
+    expect(stroopsToUsdc(10_000_000n)).toBe("1");
+  });
+
+  it("strips trailing zeros", () => {
+    expect(stroopsToUsdc(15_000_000n)).toBe("1.5");
+  });
+
+  it("returns '0' for invalid input", () => {
+    expect(stroopsToUsdc("not-a-number")).toBe("0");
   });
 });

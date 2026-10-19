@@ -89,11 +89,23 @@ export function getMalformedContractAddresses(
  * passphrase (or vice versa) will silently reject every transaction.  Returns
  * one diagnostic string per conflict.  Exported for unit testing.
  *
- * Detection is heuristic: it looks for "testnet" in the RPC hostname and
- * compares the passphrase against the two well-known public network strings.
+ * Detection is heuristic. Two signals are used in combination:
+ *
+ *  1. "testnet" in the RPC hostname → the URL is likely pointing at testnet.
+ *  2. The passphrase matches one of the two canonical public Stellar networks.
+ *
  * Custom or private networks that happen to use these patterns are out of
  * scope — operators running non-standard networks should set matching values
- * and this function will produce no output.
+ * and this function will produce no output for unrecognised passphrases.
+ *
+ * Both mismatch directions are checked:
+ *  - Mainnet passphrase + testnet RPC  → every tx will be rejected by the network.
+ *  - Testnet passphrase + mainnet RPC  → every tx will be rejected by the network.
+ *
+ * The passphrase must also be validated as a recognised known value; an
+ * unrecognised passphrase is flagged separately so operators on private
+ * networks are told what the recognised values are rather than seeing a silent
+ * pass that may mask a typo.
  */
 export function getNetworkConflicts(
   env: Record<string, string | undefined> = process.env as Record<
@@ -108,8 +120,31 @@ export function getNetworkConflicts(
   if (!rpcUrl || !passphrase) return conflicts;
 
   const rpcIsTestnet = /testnet/i.test(rpcUrl);
+  // "mainnet" in the URL or the well-known horizon/soroban mainnet hostnames.
+  const rpcIsMainnet =
+    /mainnet/i.test(rpcUrl) ||
+    (rpcUrl.includes("soroban.stellar.org") && !rpcIsTestnet) ||
+    rpcUrl.includes("horizon.stellar.org");
+
   const passphraseIsMainnet = passphrase === MAINNET_PASSPHRASE;
   const passphraseIsTestnet = passphrase === TESTNET_PASSPHRASE;
+
+  // Flag an entirely unrecognised passphrase so operators on standard networks
+  // catch typos before they deploy. Private/custom networks are deliberately
+  // exempt — if neither canonical passphrase matches we produce no output.
+  if (
+    passphrase !== "" &&
+    !passphraseIsMainnet &&
+    !passphraseIsTestnet
+  ) {
+    conflicts.push(
+      `NEXT_PUBLIC_NETWORK_PASSPHRASE "${passphrase}" is not a recognised Stellar network passphrase. ` +
+        `Expected "${TESTNET_PASSPHRASE}" for testnet or "${MAINNET_PASSPHRASE}" for mainnet. ` +
+        `Every transaction will be rejected. Correct the passphrase or leave this message if you are using a private network.`,
+    );
+    // Cannot determine direction mismatch for an unknown passphrase — stop here.
+    return conflicts;
+  }
 
   if (passphraseIsMainnet && rpcIsTestnet) {
     conflicts.push(
@@ -119,7 +154,7 @@ export function getNetworkConflicts(
     );
   }
 
-  if (passphraseIsTestnet && !rpcIsTestnet && rpcUrl.includes("soroban.stellar.org")) {
+  if (passphraseIsTestnet && rpcIsMainnet) {
     conflicts.push(
       `NEXT_PUBLIC_NETWORK_PASSPHRASE is the testnet passphrase but ` +
         `NEXT_PUBLIC_STELLAR_RPC_URL appears to target mainnet ("${rpcUrl}"). ` +
@@ -146,7 +181,10 @@ function assertEnvVars(): void {
     ...malformed.map((m) => `  • ${m}`),
     ...conflicts.map((c) => `  • ${c}`),
   ];
-  if (problems.length === 0) return;
+  if (problems.length === 0) {
+    console.log("[CircleUp] Environment validation passed ✓");
+    return;
+  }
 
   throw new Error(
     `[CircleUp] Environment variable configuration error:\n` +
@@ -179,6 +217,64 @@ export const USDC_ADDRESS: string =
 
 export const INDEXER_URL: string =
   process.env.NEXT_PUBLIC_INDEXER_URL || "http://localhost:3001";
+
+// ─── Indexer endpoint resolution ──────────────────────────────────────────────
+//
+// Every indexer fetch in the app goes through `indexerEndpoint`. A misconfigured
+// NEXT_PUBLIC_INDEXER_URL must never reach fetch() as-is:
+//   • "localhost:3001" (no scheme) parses as the `localhost:` protocol and makes
+//     fetch() throw, which callers report as "indexer unreachable".
+//   • "indexer.example.com" (no scheme) is a *relative* URL in the browser, so
+//     the request goes to this Next app and 404s, which callers report as
+//     "circle not found" / "no reputation record" — silently wrong data.
+// Callers get `null` instead and show a "misconfigured" message.
+
+/** Abort server-side indexer requests after this long, so a URL pointing at an
+ *  unroutable host fails the render quickly instead of hanging it. */
+export const INDEXER_TIMEOUT_MS = 10_000;
+
+/**
+ * Normalise an indexer base URL, or return `null` when it cannot be fetched
+ * safely: empty, not absolute, not http(s), or carrying credentials, a query
+ * string, or a fragment (all of which would corrupt the joined endpoint path).
+ * Trailing slashes are stripped so `base + "/circles"` never yields `//circles`.
+ * Exported for unit testing.
+ */
+export function resolveIndexerBaseUrl(raw: string | undefined | null): string | null {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (value === "") return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+}
+
+/** The validated indexer base URL, or `null` when NEXT_PUBLIC_INDEXER_URL is misconfigured. */
+export const INDEXER_BASE_URL: string | null = resolveIndexerBaseUrl(INDEXER_URL);
+
+/**
+ * Build an indexer endpoint URL from path segments, each URL-encoded so a route
+ * param can never add path segments or a query string. Returns `null` when the
+ * base URL is misconfigured — callers must treat that as a distinct
+ * "misconfigured" state, never as "not found" or "network".
+ *
+ *   indexerEndpoint(["circles", addr, "rounds"]) → "http://localhost:3001/circles/C…/rounds"
+ */
+export function indexerEndpoint(
+  segments: readonly string[],
+  base: string | null = INDEXER_BASE_URL,
+): string | null {
+  if (base === null) return null;
+  return `${base}/${segments.map((s) => encodeURIComponent(s)).join("/")}`;
+}
 
 // ─── Network resolution & block explorer links ────────────────────────────────
 //
@@ -258,10 +354,29 @@ export function getExplorerLink(
 // on @circleup/sdk (see lib/gating.ts), so the money math is duplicated here and
 // MUST stay behaviourally identical to the SDK: parse on strings only, never
 // through floating point, and refuse — never silently truncate — values with
-// more than 7 decimal places. Keep the two in sync.
+// more than USDC_DECIMALS (7) decimal places. Keep the two in sync.
+//
+// Sync checklist — whenever sdk/src/utils.ts changes its conversion logic:
+//   1. Update USDC_DECIMALS here if the constant changes in sdk/src/constants.ts.
+//   2. Re-verify every `USDC_DECIMALS` usage below matches the SDK's behaviour.
+//   3. Run app/src/__tests__/usdc-parity.test.ts — it imports both copies and
+//      asserts identical output for every representative input.
 
-/** 1 USDC = 10_000_000 stroops (7 decimal places) */
-export const STROOP = BigInt(10_000_000);
+/**
+ * Number of decimal places USDC supports (= `USDC_DECIMALS` in sdk/src/constants.ts).
+ *
+ * Declared here as a named constant — not a magic `7` — so:
+ *   a) it is easy to grep for all precision-dependent code, and
+ *   b) a future change to USDC_DECIMALS in the SDK is immediately visible as a
+ *      required sync here rather than a silent divergence in behaviour.
+ *
+ * INVARIANT: this value must always equal `USDC_DECIMALS` in sdk/src/constants.ts.
+ */
+export const USDC_DECIMALS = 7;
+
+/** 1 USDC = 10 ** USDC_DECIMALS stroops = 10_000_000 stroops.
+ *  Mirror of `STROOP` in sdk/src/utils.ts. */
+export const STROOP = BigInt(10 ** USDC_DECIMALS);
 
 /**
  * Convert a human-readable USDC amount to stroops (bigint), losslessly.
@@ -283,14 +398,14 @@ export function usdcToStroops(usdc: number | string): bigint {
   const [whole, fracRaw = ""] = str.split(".");
   // Trailing fractional zeros carry no value; drop them before counting places.
   const frac = fracRaw.replace(/0+$/, "");
-  if (frac.length > 7) {
+  if (frac.length > USDC_DECIMALS) {
     throw new TypeError(
       `usdcToStroops: "${str}" has ${frac.length} significant decimal places but USDC ` +
-        `supports at most 7. Round or truncate before converting — this function ` +
+        `supports at most ${USDC_DECIMALS}. Round or truncate before converting — this function ` +
         `refuses to drop digits silently.`,
     );
   }
-  const fracPadded = frac.padEnd(7, "0");
+  const fracPadded = frac.padEnd(USDC_DECIMALS, "0");
   return BigInt(whole) * STROOP + BigInt(fracPadded);
 }
 
@@ -340,15 +455,8 @@ function expandScientificNotation(intPart: string, fracPart: string, exp: number
 /**
  * Convert a stroops value to a human-readable USDC string.
  *
- * - Accepts `bigint | string | number` so callers don't need to cast.
- * - Returns `"0"` for falsy / invalid input rather than throwing.
- * - Strips trailing fractional zeros: 10.0000000 → "10", 1.5000000 → "1.5"
- */
-/**
- * Convert a stroops value to a human-readable USDC string.
- *
- * - The exact inverse of {@link usdcToStroops}: prints all 7 fractional digits
- *   and strips only trailing zeros, so no precision is lost.
+ * - The exact inverse of {@link usdcToStroops}: prints all {@link USDC_DECIMALS}
+ *   fractional digits and strips only trailing zeros, so no precision is lost.
  * - Accepts `bigint | string | number` so callers don't need to cast.
  * - Returns `"0"` for falsy / invalid / negative input rather than throwing.
  * - Strips trailing fractional zeros: 10.0000000 → "10", 1.5000000 → "1.5"
@@ -362,7 +470,7 @@ export function stroopsToUsdc(stroops: bigint | string | number): string {
   }
   if (n < 0n) return "0";
   const whole = n / STROOP;
-  const frac = (n % STROOP).toString().padStart(7, "0");
+  const frac = (n % STROOP).toString().padStart(USDC_DECIMALS, "0");
   return `${whole}.${frac}`.replace(/\.?0+$/, "") || "0";
 }
 
@@ -383,7 +491,7 @@ export function formatUsdc(stroops: bigint | string | number): string {
   }
   if (n < 0n) return "0.00";
   const whole = n / STROOP;
-  const frac = (n % STROOP).toString().padStart(7, "0").slice(0, 2); // 2 dp (truncate)
+  const frac = (n % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2); // 2 dp (truncate)
   return `${whole}.${frac}`;
 }
 
@@ -409,6 +517,31 @@ export function formatPot(
     return "0.00";
   }
   return formatUsdc(n * BigInt(memberCount));
+}
+
+// ─── Config-absent detection (mirrors sdk/src/client.ts isConfigAbsent) ──────
+//
+// The app does not depend on @circleup/sdk directly. This helper mirrors the
+// SDK's `isConfigAbsent` so app-layer fetch paths can distinguish "circle not
+// initialized" from any other indexer/network error and show clear UI feedback.
+
+/**
+ * Returns true when an error string from a config fetch indicates the circle
+ * contract has not been initialized (its `Config` storage key is absent).
+ *
+ * Use after any failed `get_config` simulation or after `fetchCircleData`
+ * returns `{ ok: false, error: "server" }` alongside a 500 body whose message
+ * mentions initialization, to give users a clear "not initialized yet" message
+ * rather than a generic "server error" banner.
+ */
+export function isConfigAbsent(error: string): boolean {
+  const lower = error.toLowerCase();
+  return (
+    lower.includes("not initialized") ||
+    lower.includes("notinitialized") ||
+    lower.includes("contract error code 1") ||
+    lower.includes("storage(missingvalue)")
+  );
 }
 
 // ─── Address helpers ──────────────────────────────────────────────────────────

@@ -206,6 +206,87 @@ test(
   }),
 );
 
+// ─── Rounds endpoint — status metadata (issue #529) ──────────────────────────
+//
+// The mock returns a real groupCircleRounds-shaped response so we can assert
+// that every round object in every bucket carries a `status` field.
+
+test(
+  "GET /circles/:address/rounds: completed rounds carry status='completed'",
+  withServer(async (s) => {
+    // Override the stub to return rounds that include status (mirrors real groupCircleRounds output)
+    const poolModule = await import("./db/pool");
+    const originalQuery = (poolModule as any).query;
+
+    // Return a circle row for the first query, empty arrays for the rest
+    let callCount = 0;
+    (poolModule as any).query = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return [{
+          address: VALID_C,
+          current_round: 1,
+          total_rounds: 2,
+          status: "Active",
+        }];
+      }
+      return [];
+    };
+
+    const groupRoundsModule = await import("./groupRounds");
+    const originalGroup = (groupRoundsModule as any).groupCircleRounds;
+    (groupRoundsModule as any).groupCircleRounds = () => ({
+      rounds: [
+        {
+          roundIndex: 0,
+          status: "completed",
+          recipient: VALID_G,
+          amount: "100",
+          txHash: "txABC",
+          ledger: "10",
+          contributions: [],
+          defaults: [],
+        },
+      ],
+      currentRound: {
+        roundIndex: 1,
+        status: "current",
+        recipient: null,
+        amount: null,
+        txHash: null,
+        ledger: null,
+        contributions: [],
+        defaults: [],
+      },
+      openRounds: [],
+      pendingDefaults: [],
+    });
+
+    try {
+      const { status: httpStatus, body } = await request(s, `/circles/${VALID_C}/rounds`);
+      assert.equal(httpStatus, 200);
+      assert.ok(Array.isArray(body.rounds), "rounds must be an array");
+      assert.ok(Array.isArray(body.openRounds), "openRounds must be an array");
+      assert.ok("currentRound" in body, "currentRound key must be present");
+
+      // Every round in `rounds` must have status: "completed"
+      for (const round of body.rounds as Array<Record<string, unknown>>) {
+        assert.ok("status" in round, "each round must have a status field");
+        assert.equal(round.status, "completed");
+      }
+
+      // currentRound must carry status: "current"
+      if (body.currentRound) {
+        assert.ok("status" in (body.currentRound as Record<string, unknown>), "currentRound must have a status field");
+        assert.equal((body.currentRound as Record<string, unknown>).status, "current");
+      }
+    } finally {
+      (poolModule as any).query = originalQuery;
+      (groupRoundsModule as any).groupCircleRounds = originalGroup;
+    }
+  }),
+);
+
 // ── /members/:member/contributions ───────────────────────────────────────────
 
 test(

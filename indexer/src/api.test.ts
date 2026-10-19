@@ -50,5 +50,32 @@ test("member contribution history route is documented in the module header", asy
   assert.match(source, /GET \/members\/:member\/contributions/);
   assert.match(source, /app\.get\("\/members\/:member\/contributions"/);
   assert.match(source, /Failed to load member contributions/);
-  assert.match(source, /Member address is required/);
+  // parseAddress("Member address") produces "Member address is required" at runtime;
+  // verify the label string is present in source.
+  assert.match(source, /Member address/);
+});
+
+test("members endpoint is documented with hasContributedCurrentRound in module header (#539)", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "api.ts"), "utf8");
+  assert.match(source, /GET \/circles\/:address\/members/);
+  assert.match(source, /has_contributed_current_round/);
+  assert.match(source, /roundDeadlineLedgers/);
+});
+
+test("rounds endpoint is documented with deadlineLedger in module header (#540)", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "api.ts"), "utf8");
+  assert.match(source, /GET \/circles\/:address\/rounds/);
+  assert.match(source, /deadlineLedger/);
+});
+
+test("member contributions endpoint includes totalAmount and hasMore in response (#541)", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "api.ts"), "utf8");
+  assert.match(source, /totalAmount/);
+  assert.match(source, /hasMore/);
 });

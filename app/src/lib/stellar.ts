@@ -58,7 +58,8 @@ import {
 export type WalletErrorReason =
   | "not_installed"
   | "permission_denied"
-  | "unknown";
+  | "unknown"
+  | "unsupported_capability";
 
 export class WalletError extends Error {
   constructor(
@@ -165,6 +166,213 @@ function getRpc() {
   return _rpc;
 }
 
+// ─── Transient RPC retry ──────────────────────────────────────────────────────
+
+/**
+ * Maximum retry attempts for a single RPC call before the error is surfaced
+ * to the caller as a typed failure.
+ *
+ * 3 attempts with a 400 ms base delay (doubling each time, full jitter) gives
+ * a worst-case budget of ~2.8 s per call — short enough to stay inside a
+ * reasonable UX window while surviving most transient blips.
+ */
+const RPC_RETRY_MAX_ATTEMPTS = 3;
+/** Base delay in milliseconds before the first retry. Doubles each attempt. */
+const RPC_RETRY_BASE_DELAY_MS = 400;
+
+/**
+ * Return true when `err` is a transient network or rate-limit condition that
+ * is safe to retry.  Non-transient errors (auth, bad request, etc.) fail
+ * immediately so the user gets feedback right away rather than waiting for
+ * retries to exhaust.
+ */
+export function isTransientRpcError(err: unknown): boolean {
+  if (err == null) return false;
+
+  const code =
+    typeof err === "object" && "code" in err
+      ? String((err as { code?: unknown }).code)
+      : "";
+  const status =
+    typeof err === "object" && "status" in err
+      ? Number((err as { status?: unknown }).status)
+      : NaN;
+  const message = err instanceof Error ? err.message : String(err);
+  const lower = message.toLowerCase();
+
+  // Node.js / fetch error codes
+  if (
+    code === "ECONNRESET" ||
+    code === "ECONNREFUSED" ||
+    code === "ETIMEDOUT" ||
+    code === "ENOTFOUND" ||
+    code === "EAI_AGAIN" ||
+    code === "EPIPE" ||
+    code === "EHOSTUNREACH"
+  ) {
+    return true;
+  }
+
+  // HTTP status codes that indicate transient server-side issues
+  if (status === 429 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+
+  // String-matched patterns for environments where the error code is absent
+  return (
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("econnreset") ||
+    lower.includes("socket hang up") ||
+    lower.includes("network") ||
+    lower.includes("failed to fetch") ||
+    lower.includes("fetch failed") ||
+    lower.includes("temporarily unavailable") ||
+    lower.includes("service unavailable") ||
+    lower.includes("bad gateway") ||
+    lower.includes("gateway timeout")
+  );
+}
+
+// ─── Cancellation helpers ─────────────────────────────────────────────────────
+
+/**
+ * A distinct result kind returned by SDK operations when the caller has
+ * aborted the operation via an {@link AbortSignal} *before* any transaction
+ * was broadcast to the network.
+ *
+ * Callers must never treat this as an on-chain failure — the transaction was
+ * either never submitted or the outcome is unknown (signal fired during
+ * polling).  The distinction allows UI layers to show "stopped waiting" copy
+ * rather than "transaction failed" copy.
+ */
+export interface LocalCancelResult {
+  /** Discriminant — always `"local_cancel"`. */
+  readonly kind: "local_cancel";
+  /**
+   * `true`  → signal fired before `sendTransaction` was called; on-chain
+   *            state is guaranteed unchanged.
+   * `false` → signal fired after `sendTransaction` returned a hash; the tx
+   *            may still confirm. Callers should surface a "check explorer"
+   *            advisory rather than claiming the tx was cancelled.
+   */
+  readonly submittedBeforeAbort: boolean;
+}
+
+/**
+ * Sleep for `ms` milliseconds, aborting early if `signal` fires.
+ *
+ * Resolves normally when the timeout expires.
+ * Rejects with the signal's abort reason when the signal fires before the
+ * timeout so the polling loop or retry delay can be interrupted immediately
+ * without waiting for the full interval.
+ *
+ * Cleans up its event listener on every terminal path so no listeners leak.
+ */
+export function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    // Already aborted before we even started — reject synchronously so the
+    // caller doesn't schedule a timer it will never need to clear.
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+
+    const id = setTimeout(resolve, ms);
+
+    if (!signal) return; // no abort signal — plain sleep, nothing more to do
+
+    const onAbort = () => {
+      clearTimeout(id);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    // Once the timer fires we must remove our listener to avoid a stale
+    // reference keeping the signal alive longer than needed.
+    // We wrap `resolve` so the listener is cleaned up before the promise
+    // settles.
+    clearTimeout(id); // cancel the one scheduled above and reschedule with cleanup
+    const cleanId = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    // Replace the abort handler with one that also clears `cleanId`.
+    signal.removeEventListener("abort", onAbort);
+    const onAbortClean = () => {
+      clearTimeout(cleanId);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbortClean, { once: true });
+  });
+}
+
+/**
+ * Run a single Soroban RPC call with capped exponential backoff + full jitter
+ * on transient failures.
+ *
+ * - Transient errors (network blips, rate-limits, gateway errors) are retried
+ *   up to `maxAttempts` times with a jittered exponential delay.
+ * - Non-transient errors (auth, bad request, simulation errors) propagate
+ *   immediately — burning retry budget on them would only delay user feedback.
+ * - When `signal` is provided, an abort before or during a retry delay
+ *   propagates the abort reason immediately so callers can clean up.
+ *
+ * Full jitter: the delay for attempt N is a random value in
+ * [0, baseDelayMs × 2^(N-1)] so concurrent clients spread their retries
+ * rather than thundering-herding the RPC.
+ *
+ * @param label       Short human-readable name for the call, used in logs.
+ * @param fn          The RPC call to execute.
+ * @param maxAttempts Total attempts allowed (first try + retries).
+ * @param baseDelayMs Base delay in ms for the first retry.
+ * @param sleep       Injectable sleep for testing (defaults to sleepWithAbort).
+ * @param signal      Optional AbortSignal; when fired the retry loop exits
+ *                    immediately by re-throwing the signal's reason.
+ */
+export async function withRpcRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  maxAttempts: number = RPC_RETRY_MAX_ATTEMPTS,
+  baseDelayMs: number = RPC_RETRY_BASE_DELAY_MS,
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void> = sleepWithAbort,
+  signal?: AbortSignal,
+): Promise<T> {
+  let lastErr: unknown;
+  const attempts = Math.max(1, maxAttempts);
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    // Check for abort at the top of every iteration so we never start a new
+    // RPC call after the caller has already given up.
+    signal?.throwIfAborted();
+
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const transient = isTransientRpcError(err);
+      if (!transient || attempt === attempts) {
+        break;
+      }
+      // Full jitter: random value in [0, baseDelayMs * 2^(attempt-1)]
+      const ceiling = baseDelayMs * 2 ** (attempt - 1);
+      const delayMs = Math.floor(Math.random() * ceiling);
+      console.warn(
+        `[stellar] Transient RPC failure during ${label} ` +
+          `(attempt ${attempt}/${attempts}) — retrying in ${delayMs}ms`,
+      );
+      // sleepWithAbort will throw the abort reason if the signal fires
+      // during the backoff window, propagating cleanly out of the loop.
+      await sleep(delayMs, signal);
+    }
+  }
+
+  throw lastErr;
+}
+
 // ─── Contract error helpers ───────────────────────────────────────────────────
 
 /** How many polling iterations to allow before giving up. */
@@ -225,6 +433,40 @@ export function formatContractError(raw: string | undefined): string {
 
   // Return the raw error, capitalised, for developer visibility
   return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+/**
+ * Extracts the stable XDR result-code name (e.g. `"txFailed"`, `"txBadSeq"`,
+ * `"txInsufficientFee"`) from a `xdr.TransactionResult` so
+ * {@link parseContractError} can map it to a specific user-facing message
+ * instead of a generic "unexpected error" (Issue #479).
+ *
+ * Returns `undefined` when the result is absent or cannot be inspected so
+ * callers can fall back to a marker string.
+ */
+function extractTxResultCode(
+  errorResult: xdr.TransactionResult | null | undefined,
+): string | undefined {
+  if (!errorResult) return undefined;
+  try {
+    const name = (errorResult as any)?.result?.()?.switch?.()?.name;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Builds the typed error for a transaction that reached the network and was
+ * rejected, preferring the extracted XDR result code.  Unrecognised result
+ * codes still receive the clear on-chain rejection copy rather than the
+ * generic UNKNOWN fallback (Issue #479).
+ */
+function onChainFailureError(code: string | undefined): ContractAppError {
+  const parsed = parseContractError(code ?? "transaction failed");
+  return parsed.code === "UNKNOWN"
+    ? parseContractError("transaction failed")
+    : parsed;
 }
 
 // ─── Typed result types ────────────────────────────────────────────────────────
@@ -291,6 +533,12 @@ export interface InvokeResult {
  * @param args          Encoded ScVal arguments.
  * @param walletAddress The signing account — used to fetch the sequence number.
  * @param txCtx         Telemetry context handle from {@link startTx}.
+ * @param signal        Optional {@link AbortSignal}. When fired before the
+ *                      simulation completes the function rejects immediately
+ *                      with the signal's reason, cleans up any in-flight
+ *                      work, and does **not** emit a `failed` telemetry event
+ *                      — stopping local observation is not a transaction
+ *                      failure.  Callers without a signal are unaffected.
  */
 export async function simulateContractTx(
   contractId: string,
@@ -298,7 +546,13 @@ export async function simulateContractTx(
   args: xdr.ScVal[],
   walletAddress: string,
   txCtx: ReturnType<typeof startTx>,
+  signal?: AbortSignal,
 ): Promise<SimulateContractTxResult> {
+  // ── Abort gate ───────────────────────────────────────────────────────────
+  // Checked eagerly so a signal that was already fired before the call never
+  // starts any network I/O.
+  signal?.throwIfAborted();
+
   // ── Address validation ───────────────────────────────────────────────────
   assertSorobanContractId(contractId, "contractId");
   assertStellarPublicKey(walletAddress, "walletAddress");
@@ -306,10 +560,22 @@ export async function simulateContractTx(
   const rpc = getRpc();
 
   // ── Account fetch ────────────────────────────────────────────────────────
+  // Wrapped with withRpcRetry so a single transient network blip doesn't
+  // fail the whole simulation — 3 attempts with jittered exponential backoff.
+  // The signal is forwarded so an abort during a retry delay exits promptly.
   let account: Awaited<ReturnType<typeof rpc.getAccount>>;
   try {
-    account = await rpc.getAccount(walletAddress);
+    account = await withRpcRetry(
+      "getAccount",
+      () => rpc.getAccount(walletAddress),
+      RPC_RETRY_MAX_ATTEMPTS,
+      RPC_RETRY_BASE_DELAY_MS,
+      sleepWithAbort,
+      signal,
+    );
   } catch (err: any) {
+    // Re-throw abort reasons directly — they are not transaction failures.
+    if (signal?.aborted) throw err;
     const msg: string = err?.message ?? "";
     const isNetwork =
       msg.toLowerCase().includes("network") || msg.toLowerCase().includes("fetch");
@@ -332,8 +598,41 @@ export async function simulateContractTx(
     .setTimeout(30)
     .build();
 
+  // ── Abort gate (post-build) ──────────────────────────────────────────────
+  // Check again after the synchronous TransactionBuilder work so a signal
+  // that fired while the account fetch was in flight exits before we start
+  // the simulation RPC call.
+  signal?.throwIfAborted();
+
   // ── Simulation ───────────────────────────────────────────────────────────
-  const simResult = await rpc.simulateTransaction(tx);
+  // RPC client failures during simulation surface as thrown exceptions —
+  // normalise them into the same typed failure result so callers always
+  // receive structured error feedback instead of an unhandled rejection
+  // (Issue #479).  withRpcRetry absorbs transient blips (network, rate-limit)
+  // before escalating to the typed failure path.
+  // The signal is forwarded so an abort during a retry delay exits promptly.
+  let simResult: SorobanRpc.Api.SimulateTransactionResponse;
+  try {
+    simResult = await withRpcRetry(
+      "simulateTransaction",
+      () => rpc.simulateTransaction(tx),
+      RPC_RETRY_MAX_ATTEMPTS,
+      RPC_RETRY_BASE_DELAY_MS,
+      sleepWithAbort,
+      signal,
+    );
+  } catch (err: unknown) {
+    // Re-throw abort reasons directly — they are not simulation failures.
+    if (signal?.aborted) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    emit(txCtx, "failed", categorizeError(msg));
+    const typedError = parseContractError(msg);
+    return {
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
+  }
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
     // Never forward the raw simResult.error string (may contain contract
@@ -350,11 +649,27 @@ export async function simulateContractTx(
   // ── Telemetry: simulated ─────────────────────────────────────────────────
   emit(txCtx, "simulated");
 
-  const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
+  // ── Assembly ─────────────────────────────────────────────────────────────
+  // Malformed simulation payloads or resource-limit rejections throw here;
+  // convert them to a typed failure so the user sees a clear message rather
+  // than a raw exception (Issue #479).
+  let preparedXdr: string;
+  try {
+    preparedXdr = SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emit(txCtx, "failed", categorizeError(msg));
+    const typedError = parseContractError(msg);
+    return {
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
+  }
 
   return {
     success: true,
-    preparedXdr: preparedTx.toXDR(),
+    preparedXdr,
     simResult: simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse,
   };
 }
@@ -387,14 +702,33 @@ export function checkWalletCapabilities(): ContractAppError | null {
  *  - Verifies the wallet provider can sign transactions before prompting.
  *  - Handles wallet rejection with typed error responses.
  *
+ * Cancellation semantics:
+ *  - If `signal` fires **before** `sendTransaction` is called, the function
+ *    throws the signal's reason immediately.  The transaction has never
+ *    reached the network — on-chain state is guaranteed unchanged.
+ *  - If `signal` fires **after** `sendTransaction` returns a hash (i.e.
+ *    during the confirmation polling loop), the function throws with a
+ *    {@link LocalCancelResult} attached as the error's `cause`.  The
+ *    transaction *may* still confirm — callers should show a "check
+ *    explorer" advisory rather than claiming it was cancelled.
+ *  - Callers that do not pass a `signal` are unaffected — existing behavior
+ *    is fully preserved.
+ *
  * @param preparedXdr Unsigned, assembled transaction XDR from {@link simulateContractTx}.
  * @param txCtx       Telemetry context handle from the originating {@link startTx} call.
+ * @param signal      Optional {@link AbortSignal} for local cancellation.
  */
 export async function submitContractTx(
   preparedXdr: string,
   txCtx: ReturnType<typeof startTx>,
+  signal?: AbortSignal,
 ): Promise<InvokeResult> {
   const rpc = getRpc();
+
+  // ── Abort gate: pre-flight ────────────────────────────────────────────────
+  // Checked before touching the wallet so a stale/already-aborted signal
+  // never opens a Freighter prompt.
+  signal?.throwIfAborted();
 
   // ── Pre-flight: verify wallet can sign ─────────────────────────────────────
   const capError = checkWalletCapabilities();
@@ -409,6 +743,10 @@ export async function submitContractTx(
   }
 
   // ── Wallet signing ───────────────────────────────────────────────────────
+  // Note: Freighter's signTransaction does not accept an AbortSignal, so we
+  // cannot interrupt the wallet prompt itself.  We check the signal again
+  // immediately after signing returns — if it fired while the user was
+  // approving in the extension we still exit before broadcasting.
   let signedXdr: string;
   try {
     signedXdr = await signTransaction(preparedXdr, {
@@ -453,13 +791,42 @@ export async function submitContractTx(
     };
   }
 
+  // ── Abort gate: post-signing, pre-broadcast ───────────────────────────────
+  // The transaction has been signed but NOT yet broadcast.  Aborting here is
+  // still "clean" — no on-chain state has changed.
+  signal?.throwIfAborted();
+
   // ── Submission ───────────────────────────────────────────────────────────
+  // withRpcRetry covers transient network blips at the submission layer.
+  // Note: we only retry on transient errors (connection reset, rate-limit).
+  // An "ERROR" status from the RPC means the transaction itself was rejected
+  // by the network and must NOT be retried — doing so would submit it again.
+  // The signal is forwarded so an abort during a retry backoff exits promptly.
   let sendResult: Awaited<ReturnType<typeof rpc.sendTransaction>>;
   try {
-    sendResult = await rpc.sendTransaction(
-      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any,
+    sendResult = await withRpcRetry(
+      "sendTransaction",
+      () =>
+        rpc.sendTransaction(
+          TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any,
+        ),
+      RPC_RETRY_MAX_ATTEMPTS,
+      RPC_RETRY_BASE_DELAY_MS,
+      sleepWithAbort,
+      signal,
     );
   } catch (err: any) {
+    // Re-throw abort reasons directly.  At this point the tx may or may not
+    // have reached the network depending on which retry attempt was in flight,
+    // so we attach a LocalCancelResult as the cause so callers can decide how
+    // to message this to the user.
+    if (signal?.aborted) {
+      const cancelInfo: LocalCancelResult = { kind: "local_cancel", submittedBeforeAbort: false };
+      const abortErr = new Error("Transaction submission cancelled by caller.", {
+        cause: cancelInfo,
+      });
+      throw abortErr;
+    }
     const typedError = parseContractError(err?.message ?? "network error");
     emit(txCtx, "failed", categorizeError(err?.message ?? "network error"));
     return {
@@ -472,9 +839,13 @@ export async function submitContractTx(
 
   if (sendResult.status === "ERROR") {
     // The hash is available at this point; included in the return value for
-    // the user but never forwarded to telemetry.
-    const rawErr = JSON.stringify(sendResult.errorResult);
-    const typedError = parseContractError(rawErr);
+    // the user but never forwarded to telemetry.  Prefer the extracted XDR
+    // result code (e.g. "txFailed") so the user gets specific feedback for
+    // the on-chain rejection (Issue #479); fall back to the serialised
+    // result, then to the canonical "transaction failed" marker.
+    const code = extractTxResultCode(sendResult.errorResult);
+    const rawErr = code ?? JSON.stringify(sendResult.errorResult);
+    const typedError = onChainFailureError(rawErr);
     emit(txCtx, "submission_failed", "on_chain_failed");
     return {
       txHash: sendResult.hash,
@@ -490,9 +861,43 @@ export async function submitContractTx(
   const hash = sendResult.hash;
 
   // ── Polling loop ─────────────────────────────────────────────────────────
+  //
+  // Cancellation semantics inside the loop:
+  //   • The interval sleep is replaced with sleepWithAbort so the full 2-second
+  //     wait is skipped immediately when the signal fires.
+  //   • After the sleep we re-check the signal *before* issuing the next RPC
+  //     call.  This ensures we never start a new getTransaction request after
+  //     the caller has given up.
+  //   • If the signal fires we throw with a LocalCancelResult cause that
+  //     carries submittedBeforeAbort=true — the tx has already been broadcast
+  //     and may still confirm on-chain.
   let attempts = TX_POLL_ATTEMPTS;
   while (attempts-- > 0) {
-    await new Promise((r) => setTimeout(r, TX_POLL_INTERVAL_MS));
+    try {
+      await sleepWithAbort(TX_POLL_INTERVAL_MS, signal);
+    } catch {
+      // Signal fired during the sleep — stop polling.  The tx was broadcast
+      // (submittedBeforeAbort = true) so warn the caller not to claim cancel.
+      const cancelInfo: LocalCancelResult = { kind: "local_cancel", submittedBeforeAbort: true };
+      const abortErr = new Error(
+        "Transaction confirmation polling cancelled by caller. " +
+          "The transaction may still confirm on-chain — check the explorer before retrying.",
+        { cause: cancelInfo },
+      );
+      throw abortErr;
+    }
+
+    // Abort gate: checked after sleep so we never start a new RPC call after
+    // the caller has already stopped waiting.
+    if (signal?.aborted) {
+      const cancelInfo: LocalCancelResult = { kind: "local_cancel", submittedBeforeAbort: true };
+      throw new Error(
+        "Transaction confirmation polling cancelled by caller. " +
+          "The transaction may still confirm on-chain — check the explorer before retrying.",
+        { cause: cancelInfo },
+      );
+    }
+
     let status: Awaited<ReturnType<typeof rpc.getTransaction>>;
     try {
       status = await rpc.getTransaction(hash);
@@ -506,7 +911,13 @@ export async function submitContractTx(
       return { txHash: hash, success: true };
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-      const typedError = parseContractError("transaction failed");
+      // Extract the XDR result code when available so the user sees exactly
+      // why the transaction failed on-chain (contract rule violation, low
+      // fee, sequence mismatch) instead of a generic error (Issue #479).
+      const code = extractTxResultCode(
+        (status as { errorResult?: xdr.TransactionResult }).errorResult,
+      );
+      const typedError = onChainFailureError(code);
       emit(txCtx, "failed", "on_chain_failed");
       return {
         txHash: hash,
@@ -540,26 +951,80 @@ export async function submitContractTx(
  * Address validation:
  *  - `contractId` must be a valid Soroban contract ID (C-prefix, 56 chars).
  *  - `walletAddress` must be a valid Stellar public key (G-prefix, 56 chars).
+ *
+ * Cancellation:
+ *  Pass an {@link AbortSignal} to allow the caller to stop waiting without
+ *  claiming the transaction was cancelled on-chain.  When the signal fires
+ *  before broadcast, `invokeContract` throws with a {@link LocalCancelResult}
+ *  cause.  When it fires during polling, the same throw occurs but
+ *  `submittedBeforeAbort` is `true` — the transaction may still confirm.
+ *  Callers without a signal are unaffected.
  */
 export async function invokeContract(
   contractId: string,
   method: string,
   args: xdr.ScVal[],
   walletAddress: string,
+  signal?: AbortSignal,
 ): Promise<InvokeResult> {
   const txCtx = startTx(method);
 
-  const simOutcome = await simulateContractTx(contractId, method, args, walletAddress, txCtx);
-  if (!simOutcome.success) {
+  // Every failure path — including unexpected synchronous exceptions such as
+  // address assertions or SDK client throws — is converted to a typed
+  // InvokeResult so callers always receive structured error feedback instead
+  // of an unhandled rejection (Issue #479).  Unrecognised failures keep the
+  // original message so validation hints stay visible to the user.
+  //
+  // LocalCancelResult (abort before/during polling) is re-thrown so the
+  // caller can distinguish "user stopped waiting" from "transaction failed".
+  // It is never recorded as a telemetry failure event.
+  try {
+    const simOutcome = await simulateContractTx(
+      contractId,
+      method,
+      args,
+      walletAddress,
+      txCtx,
+      signal,
+    );
+    if (!simOutcome.success) {
+      return {
+        txHash: "",
+        success: false,
+        error: simOutcome.error,
+        typedError: simOutcome.typedError,
+      };
+    }
+
+    return await submitContractTx(simOutcome.preparedXdr, txCtx, signal);
+  } catch (err: unknown) {
+    // Re-throw LocalCancelResult causes so UI layers can distinguish
+    // "stopped waiting" from a genuine transaction failure.
+    if (
+      err instanceof Error &&
+      err.cause != null &&
+      typeof err.cause === "object" &&
+      (err.cause as LocalCancelResult).kind === "local_cancel"
+    ) {
+      throw err;
+    }
+    // Also re-throw raw abort reasons (signal.throwIfAborted() throws the
+    // reason directly, which may not be an Error wrapping a LocalCancelResult).
+    if (signal?.aborted) throw err;
+
+    const raw = err instanceof Error ? err.message : String(err);
+    const typedError = parseContractError(raw);
+    emit(txCtx, "failed", categorizeError(raw));
     return {
       txHash: "",
       success: false,
-      error: simOutcome.error,
-      typedError: simOutcome.typedError,
+      error:
+        typedError.kind === "unknown" && raw
+          ? raw
+          : userMessageForError(typedError),
+      typedError,
     };
   }
-
-  return submitContractTx(simOutcome.preparedXdr, txCtx);
 }
 
 // ─── Read-only simulation ─────────────────────────────────────────────────────
@@ -596,7 +1061,9 @@ export async function readContract<T>(
     .setTimeout(30)
     .build();
 
-  const simResult = await rpc.simulateTransaction(tx);
+  const simResult = await withRpcRetry("simulateTransaction(read)", () =>
+    rpc.simulateTransaction(tx),
+  );
   if (SorobanRpc.Api.isSimulationError(simResult)) {
     throw new Error(simResult.error);
   }

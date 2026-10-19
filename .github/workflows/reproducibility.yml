@@ -1,14 +1,15 @@
-# CI — Contract build reproducibility (Issue #396)
+# CI — Contract build reproducibility and provenance verification (Issues #396, #705)
 #
 # Builds Soroban WASM artifacts twice from a clean state using the pinned
 # toolchain in contracts/rust-toolchain.toml, then verifies that the
 # resulting artifacts match the expected hashes in
-# contracts/expected-hashes.json.
+# contracts/expected-hashes.json and generates release provenance metadata.
 #
 # This workflow:
 #   - Never deploys contracts or submits transactions.
 #   - Requires no deployment secrets.
 #   - Fails fast when toolchain drift or source changes alter artifact bytes.
+#   - Publishes reproducible release WASM artifacts with cryptographically verifiable provenance.
 
 name: Contract Build Reproducibility
 
@@ -24,10 +25,12 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 jobs:
   reproducibility:
-    name: Verify WASM artifact hashes
+    name: Verify WASM artifact hashes & provenance
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -74,10 +77,14 @@ jobs:
           echo "=== First-pass artifact sizes ==="
           ls -lh target/wasm32-unknown-unknown/release/*.wasm
 
+      # Generate provenance metadata for the built artifacts
+      - name: Generate build provenance metadata
+        working-directory: scripts
+        run: npx ts-node src/check-artifact-hashes.ts --provenance
+
       # Verify hashes against contracts/expected-hashes.json.
-      # When expected hashes are empty (first bootstrap), this step is
-      # informational only.
-      - name: Verify artifact hashes
+      # Fails CI if there is any bytecode drift or unpopulated expected hashes.
+      - name: Verify artifact hashes against expected-hashes.json
         working-directory: scripts
         run: npx ts-node src/check-artifact-hashes.ts
 
@@ -94,6 +101,22 @@ jobs:
       - name: Compare first and second pass hashes
         working-directory: scripts
         run: npx ts-node src/check-artifact-hashes.ts
+
+      # Upload release provenance artifact
+      - name: Upload build provenance metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-provenance
+          path: contracts/provenance.json
+          if-no-files-found: error
+
+      # Upload verifiable release WASM binaries
+      - name: Upload compiled contract WASMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-wasm-artifacts
+          path: contracts/target/wasm32-unknown-unknown/release/*.wasm
+          if-no-files-found: error
 
       - name: Print toolchain info
         if: always()

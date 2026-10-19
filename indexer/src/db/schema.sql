@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS circle_members (
     circle_address  TEXT NOT NULL REFERENCES circles(address),
     member_address  TEXT NOT NULL,
     payout_order    INTEGER NOT NULL,        -- 0-indexed position in rotation
+    join_order      INTEGER,                 -- 1-based join-queue position (NULL until joined)
     collateral      NUMERIC NOT NULL DEFAULT 0,
     defaults        INTEGER NOT NULL DEFAULT 0,
     joined_at       TIMESTAMPTZ,
@@ -102,6 +103,29 @@ CREATE TABLE IF NOT EXISTS ledger_checkpoints (
     processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Durable, payload-free evidence for events skipped because their handler
+-- failed. Same DDL as migrations/006_event_failures.sql (see there for the
+-- column semantics) so fresh installs and live upgrades both get it.
+CREATE TABLE IF NOT EXISTS event_failures (
+    event_id          TEXT PRIMARY KEY,
+    ledger            BIGINT NOT NULL,
+    tx_hash           TEXT,
+    contract_id       TEXT,
+    event_type        TEXT,
+    error_class       TEXT NOT NULL,
+    error_name        TEXT,
+    error_message     TEXT,
+    attempts          INTEGER NOT NULL DEFAULT 1,
+    first_failed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_failed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at       TIMESTAMPTZ,
+    acknowledged_at   TIMESTAMPTZ,
+    acknowledged_note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_event_failures_ledger ON event_failures(ledger);
+CREATE INDEX IF NOT EXISTS idx_event_failures_open ON event_failures(ledger)
+    WHERE resolved_at IS NULL AND acknowledged_at IS NULL;
+
 -- Tracks which files under src/db/migrations/ have been applied, so
 -- migrate.ts can report schema version/status and skip re-applying files.
 -- Defined here (rather than only in migrate.ts) so the schema's version
@@ -114,6 +138,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_circle_members_address ON circle_members(member_address);
+CREATE INDEX IF NOT EXISTS idx_circle_members_join_order ON circle_members(circle_address, join_order) WHERE join_order IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_contributions_member ON contributions(member_address);
 CREATE INDEX IF NOT EXISTS idx_payouts_recipient ON payouts(recipient);
 CREATE INDEX IF NOT EXISTS idx_defaults_member ON defaults(member_address);

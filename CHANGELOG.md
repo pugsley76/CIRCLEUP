@@ -8,7 +8,84 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (SDK)
+- **Strict RPC decoding** (`sdk/src/types.ts`): reads now fail at the
+  decoding boundary, with the method or field named, on wrong variants, absent
+  fields, and out-of-range values. New narrow decoders: `decodeI128`,
+  `decodeU64`, `decodeU32InRange`, `decodeRecord`. `mapRawConfig` enforces
+  distinct members (≤ 256), `round_amount ≥ 1`, and the contract's deadline
+  bounds. `getCollateral` rejects negative values. `assertValidCircleStatus`
+  now accepts the `#[contracttype]` enum wire form (`["Active"]`) that
+  `get_status` actually returns, as well as a bare symbol. `createCircle`
+  only reports a contract address as `circleAddress`.
+- **Write retry safety** (`sdk/src/client.ts`): a write is never rebuilt
+  inside the SDK. `sendTransaction` resends only the identical signed
+  envelope. When a send may have reached the RPC without a reply, the SDK looks
+  the locally computed hash up instead of reporting a retryable error.
+  New `TxErrorCode`s: `outcome_unknown` (not retryable, carries
+  `diagnostics: SubmissionDiagnostics`) and `tx_expired` (retryable — the
+  envelope passed its time bound unincluded). **Behaviour change:** losing
+  connectivity while polling an accepted transaction now returns
+  `outcome_unknown` instead of `network_error`. `network_error` now always
+  means the request never reached the RPC. Added
+  `CircleUpClient.lookupTransaction(hash)`.
+- **Indexer paging** (`IndexerClient`): query options are validated locally
+  (`RangeError`, before any request), unknown keys are rejected instead of
+  dropped, and responses must carry a pagination envelope matching the request.
+  Added the bounded iterators `iterateCircles` / `iterateMemberContributions`
+  (default 10 pages), `GetMemberContributionsParams`, `IndexerPagination`
+  (incl. `hasMore`), `totalAmount` on contributions, and
+  `INDEXER_DEFAULT_PAGE_SIZE` / `INDEXER_MAX_PAGE_SIZE`.
+- **Public API boundary**: `package.json` now declares `exports` (root only) and
+  `files`. Co-located `src/*.test.ts` files are no longer emitted to `dist/`.
+  The test-only helpers `isTransientRpcError` and `withRpcRetry` are no longer
+  exported from the package root. New release check `npm run check:api` (clean
+  build, compile `examples/` against `dist/`, verify documented imports, and
+  block deep imports) runs in CI.
+
+### Fixed (SDK)
+- Restored `formatMismatchMessage`, which `CircleClient.preflight` calls but a
+  merge had removed, leaving `sdk/src/client.ts` unable to compile.
+
 ### Added
+- **Issue 32**: Bounded timeouts and categorised failures for SDK indexer
+  requests (`sdk/src/client.ts`) — every `IndexerClient` request (connect,
+  headers and body) is bounded by `DEFAULT_INDEXER_TIMEOUT_MS` (10 s,
+  configurable per client and per call) and honours a caller `AbortSignal`.
+  `IndexerError` gains `kind` (`network` | `timeout` | `aborted` | `http` |
+  `json` | `schema`) and `retryable`; error messages never include full
+  response bodies. Covered by `sdk/src/__tests__/indexerClient.test.ts`
+- **Issue 34**: Indexer response compatibility checks
+  (`sdk/src/indexerSchema.ts`, `docs/INDEXER_API_COMPATIBILITY.md`) — runtime
+  wire schemas for list, detail, members, rounds, history, reputation, audit,
+  health and state responses, with representative fixtures validated in
+  `sdk/src/__tests__/indexerContract.test.ts`. Documents which response changes
+  are additive and which need a coordinated release
+- **Issue 35**: Opt-in `CircleUpClient.verifyDeployment()` (`sdk/src/client.ts`)
+  — read-only, time-bounded check of the RPC network passphrase and the
+  factory / reputation / USDC contract identities against the config, with a
+  typed per-check result (`ok` | `mismatch` | `missing` | `incompatible` |
+  `unreachable` | `skipped`). Construction stays offline. Covered by
+  `sdk/src/__tests__/verifyDeployment.test.ts`
+- **Issue 41**: Query-plan review for indexer indexes (`indexer/src/db/explain.ts`,
+  `docs/QUERY_PLANS.md`, `indexer/src/db/migrations/006_status_and_history_composite_indexes.sql`)
+  — `npm run explain` now reports cardinalities, per-query cost / time / scan
+  nodes, and queries that miss their expected index. Adds composite indexes
+  for `GET /circles?status=` and `GET /members/:member/contributions?circle=`,
+  whose filter-only indexes forced a full Sort before LIMIT
+- **Issue 477**: Address validation for every member entry on the create flow
+  (`app/src/lib/address.ts`, `app/src/app/create/CreateClient.tsx`)
+  — Added dependency-free strkey checksum verification (base32 decode +
+  CRC16/XMODEM) as `hasValidStrKeyChecksum` / `isValidStellarAccount`, plus a
+  per-row `validateMemberEntry` that `validateCreateForm` now applies to every
+  filled member row. A string that is 56 base32 characters but fails its
+  checksum — a single mistyped character or a truncated copy-paste — was
+  accepted by the form and only failed later inside transaction construction,
+  after the wallet prompt had already appeared. Each failure mode (lowercase,
+  contract `C…`, muxed `M…`, bad shape, bad checksum) now reports its own
+  `Member N:` message under the offending row. Covered by
+  `app/src/__tests__/member-address-validation.test.ts` and the updated
+  create-form, submission-guard, and member-list suites
 - **Issue 30**: Contract argument compatibility fixtures (`sdk/src/__tests__/contractFixtures.test.ts`)
   — Base64-encoded XDR fixtures for every public contract method (factory, circle,
   reputation) that verify SDK argument encoding remains compatible with contract

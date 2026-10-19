@@ -16,6 +16,11 @@
  *   checkSchemaHealth     – surface checkMigrationHealth() result so schema
  *                           drift is visible in /health without a separate
  *                           /migrate status call
+ *   checkEventFailures    – count open event_failures rows (events skipped by
+ *                           a failing handler and not yet re-ingested or
+ *                           acknowledged); degraded when any failure is
+ *                           recurring or the open count reaches
+ *                           EVENT_FAILURE_ALERT_COUNT
  *
  * Contract state drift (checkContractStateDrift) is intentionally kept
  * separate from the above: it requires an active RPC connection and fetches
@@ -30,6 +35,7 @@
 import { SorobanRpc, xdr, scValToNative, Contract } from "@stellar/stellar-sdk";
 import type { MigrationHealth } from "./db/migrate";
 import { query } from "./db/pool";
+import { isUndefinedTable, summarizeOpenEventFailures } from "./eventFailures";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -42,17 +48,28 @@ export interface ComponentHealth {
 
 export interface HealthReport {
   status: "ok" | "degraded";
+  serviceStatus: "healthy" | "degraded" | "unavailable";
   timestamp: string;
   db: ComponentHealth;
   rpc: ComponentHealth;
   indexerLag: ComponentHealth;
   schema: ComponentHealth;
   contractDrift: ComponentHealth;
+  eventFailures: ComponentHealth;
   /** Config snapshot surfaced so operators can cross-check env alignment. */
   config: {
     usdcAddress: string;
     lagAlertLedgers: number;
     driftRoundThreshold: number;
+    eventFailureAlertCount: number;
+    eventFailureRecurringAttempts: number;
+  };
+  diagnostics: {
+    lastIndexedLedger: number | null;
+    rpcLatestLedger: number | null;
+    lagLedgers: number | null;
+    dbAvailable: boolean;
+    rpcAvailable: boolean;
   };
 }
 
@@ -77,6 +94,28 @@ export const INDEXER_LAG_ALERT_LEDGERS = parseInt(
  */
 export const DRIFT_ROUND_THRESHOLD = parseInt(
   process.env.DRIFT_ROUND_THRESHOLD || "1",
+  10,
+);
+
+/**
+ * Number of open (unresolved, unacknowledged) event failures at which the
+ * eventFailures check reports "degraded".  Default 1: any event the indexer
+ * skipped is missing data until it is re-ingested or an operator acknowledges
+ * it.  Set to 0 to disable the count-based alert (recurring failures still
+ * degrade).
+ */
+export const EVENT_FAILURE_ALERT_COUNT = parseInt(
+  process.env.EVENT_FAILURE_ALERT_COUNT || "1",
+  10,
+);
+
+/**
+ * An open failure whose `attempts` reached this value is "recurring" — it
+ * failed again after a retry or replay, which points at a poison event or a
+ * handler bug rather than a one-off.  Any recurring failure degrades health.
+ */
+export const EVENT_FAILURE_RECURRING_ATTEMPTS = parseInt(
+  process.env.EVENT_FAILURE_RECURRING_ATTEMPTS || "2",
   10,
 );
 
@@ -254,6 +293,66 @@ export async function checkSchemaHealth(
       },
     };
   } catch (err) {
+    return {
+      status: "error",
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Surface events the indexer skipped because their handler failed.
+ *
+ * Reports:
+ *   "ok"       — no open failures, or fewer than EVENT_FAILURE_ALERT_COUNT and
+ *                none recurring; also when the event_failures table does not
+ *                exist yet (the schema check already reports pending migrations)
+ *   "degraded" — any recurring failure, or open count ≥ EVENT_FAILURE_ALERT_COUNT
+ *   "error"    — the query itself failed
+ *
+ * Details carry counts and the ledger range only — never payloads.  Use
+ * GET /indexer/failures for the individual rows.
+ */
+export async function checkEventFailures(): Promise<ComponentHealth> {
+  const start = Date.now();
+  try {
+    const summary = await withTimeout(
+      summarizeOpenEventFailures(EVENT_FAILURE_RECURRING_ATTEMPTS),
+      HEALTH_TIMEOUT_MS,
+    );
+    const details = {
+      open: summary.open,
+      recurring: summary.recurring,
+      oldestLedger: summary.oldestLedger,
+      newestLedger: summary.newestLedger,
+      lastFailedAt: summary.lastFailedAt,
+      alertCount: EVENT_FAILURE_ALERT_COUNT,
+      recurringAttempts: EVENT_FAILURE_RECURRING_ATTEMPTS,
+    };
+
+    const overCount =
+      EVENT_FAILURE_ALERT_COUNT > 0 && summary.open >= EVENT_FAILURE_ALERT_COUNT;
+    if (summary.recurring > 0 || overCount) {
+      return {
+        status: "degraded",
+        latencyMs: Date.now() - start,
+        error:
+          `${summary.open} event(s) skipped after handler failures are still open ` +
+          `(${summary.recurring} recurring, ledgers ${summary.oldestLedger}–${summary.newestLedger}). ` +
+          `See GET /indexer/failures.`,
+        details,
+      };
+    }
+    return { status: "ok", latencyMs: Date.now() - start, details };
+  } catch (err) {
+    if (isUndefinedTable(err)) {
+      return {
+        status: "ok",
+        latencyMs: Date.now() - start,
+        details: { skipped: true, reason: "event_failures table missing — run migrations" },
+      };
+    }
     return {
       status: "error",
       latencyMs: Date.now() - start,
@@ -486,9 +585,10 @@ export async function runAllHealthChecks({
       ? (rpcCheck.details.latestLedger as number)
       : null;
 
-  const [indexerLag, contractDrift] = await Promise.all([
+  const [indexerLag, contractDrift, eventFailures] = await Promise.all([
     checkIndexerLag(rpcLatestLedger),
     checkContractStateDrift(rpc, rpcCheck.status),
+    checkEventFailures(),
   ]);
 
   // Strip the internal latestLedger field from the RPC component before
@@ -500,21 +600,51 @@ export async function runAllHealthChecks({
     ...(rpcCheck.details ? { details: rpcCheck.details } : {}),
   };
 
-  const allComponents = [db, rpcComponent, indexerLag, schema, contractDrift];
+  const allComponents = [db, rpcComponent, indexerLag, schema, contractDrift, eventFailures];
   const overallOk = allComponents.every((c) => c.status === "ok");
+  const dbAvailable = db.status !== "error";
+  const rpcAvailable = rpcComponent.status !== "error";
+  const serviceStatus =
+    !dbAvailable ? "unavailable" : overallOk ? "healthy" : "degraded";
+  const lagDetails = indexerLag.details ?? {};
+  const lastIndexedLedger =
+    typeof lagDetails.lastIndexedLedger === "number"
+      ? lagDetails.lastIndexedLedger
+      : null;
+  const latestLedgerForDiagnostics =
+    typeof lagDetails.rpcLatestLedger === "number"
+      ? lagDetails.rpcLatestLedger
+      : rpcLatestLedger;
+  const lagLedgers =
+    typeof lagDetails.lagLedgers === "number"
+      ? lagDetails.lagLedgers
+      : lastIndexedLedger != null && latestLedgerForDiagnostics != null
+      ? latestLedgerForDiagnostics - lastIndexedLedger
+      : null;
 
   return {
     status: overallOk ? "ok" : "degraded",
+    serviceStatus,
     timestamp: new Date().toISOString(),
     db,
     rpc: rpcComponent,
     indexerLag,
     schema,
     contractDrift,
+    eventFailures,
     config: {
       usdcAddress,
       lagAlertLedgers: INDEXER_LAG_ALERT_LEDGERS,
       driftRoundThreshold: DRIFT_ROUND_THRESHOLD,
+      eventFailureAlertCount: EVENT_FAILURE_ALERT_COUNT,
+      eventFailureRecurringAttempts: EVENT_FAILURE_RECURRING_ATTEMPTS,
+    },
+    diagnostics: {
+      lastIndexedLedger,
+      rpcLatestLedger: latestLedgerForDiagnostics,
+      lagLedgers,
+      dbAvailable,
+      rpcAvailable,
     },
   };
 }

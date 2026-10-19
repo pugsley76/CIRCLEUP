@@ -142,7 +142,11 @@ describe("CircleClient.getCurrentRound (typed simulateAndReadOrThrow)", () => {
     vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("circle is not active"),
     );
-    await expect(makeClient().getCurrentRound()).rejects.toThrow("circle is not active");
+    // getCurrentRound now normalises CircleNotActive errors — the thrown message
+    // is the canonical "No active round" form, not the raw RPC error string.
+    await expect(makeClient().getCurrentRound()).rejects.toThrow(
+      "No active round",
+    );
   });
 });
 

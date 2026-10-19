@@ -78,3 +78,68 @@ export function describeError(err: unknown): string {
   if (err instanceof IndexerError) return `indexer ${err.status} at ${err.url}: ${err.message}`;
   return "unknown error";
 }
+
+// ─── Indexer paging, decoding, and write recovery ─────────────────────────────
+
+import {
+  IndexerClient,
+  INDEXER_MAX_PAGE_SIZE,
+  isRetryable,
+  isTxFailure,
+  mapRawConfig,
+  assertValidCircleStatus,
+  decodeI128,
+  type ApiCircleRow,
+  type CircleConfig,
+  type CircleStatus,
+  type IndexerPagination,
+  type SubmissionDiagnostics,
+  type TxLookup,
+  type TxResult,
+} from "@circleup/sdk";
+
+/** Walk at most three pages of Active circles, keeping each page's metadata. */
+export async function activeCircles(
+  indexer: IndexerClient,
+): Promise<{ rows: ApiCircleRow[]; last: IndexerPagination | null }> {
+  const rows: ApiCircleRow[] = [];
+  let last: IndexerPagination | null = null;
+  for await (const page of indexer.iterateCircles(
+    { status: "Active", limit: INDEXER_MAX_PAGE_SIZE },
+    { maxPages: 3 },
+  )) {
+    rows.push(...page.circles);
+    last = page.pagination;
+  }
+  return { rows, last };
+}
+
+/** Narrow raw `scValToNative` output through the root-exported decoders. */
+export function decodeReads(
+  rawConfig: unknown,
+  rawStatus: unknown,
+  rawCollateral: unknown,
+): { config: CircleConfig; status: CircleStatus; collateral: bigint } {
+  return {
+    config: mapRawConfig(rawConfig),
+    status: assertValidCircleStatus(rawStatus),
+    collateral: decodeI128(rawCollateral, "collateral", { min: 0n }),
+  };
+}
+
+/**
+ * Decide how to recover from a write: resubmit only when the SDK says it is
+ * safe, otherwise settle the original hash first.
+ */
+export async function recover(
+  client: CircleUpClient,
+  result: TxResult,
+): Promise<"done" | "resubmit" | TxLookup["status"] | "lookup_failed"> {
+  if (!isTxFailure(result)) return "done";
+  if (isRetryable(result)) return "resubmit";
+  const diagnostics: SubmissionDiagnostics | undefined = result.diagnostics;
+  const hash = diagnostics?.txHash ?? result.txHash;
+  if (!hash) return "lookup_failed";
+  const lookup = await client.lookupTransaction(hash);
+  return lookup.ok ? lookup.value.status : "lookup_failed";
+}

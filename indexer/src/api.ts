@@ -2,24 +2,41 @@
  * CircleUp REST API
  *
  * GET /circles                         → list circles (paginated, sortable, status-filterable)
- * GET /circles/summary                 → circle counts by status
+ *                                        ?status=  Pending|Active|Completed|Cancelled|Closed
+ *                                        ?sort=    created_ledger|updated_at|round_amount|member_count|status
+ *                                        ?order=   asc|desc  (default: desc)
+ *                                        ?page=    positive integer (default: 1)
+ *                                        ?limit=   1–100 (default: 20)
+ * GET /circles/summary                 → circle counts by status (Pending/Active/Completed/Cancelled/Closed)
  * GET /circles/:address                → circle detail + members + rounds
- * GET /circles/:address/members        → members with contribution status
- * GET /circles/:address/rounds         → all rounds (payouts + defaults)
+ * GET /circles/:address/members        → members with reputation, contribution counts, and current-round status
+ * GET /circles/:address/rounds         → all rounds grouped by round_index: payouts + contributions + defaults
  * GET /members/:member/contributions   → member contribution history (optional ?circle=)
  * GET /reputation/:member              → member reputation score
- * GET /indexer/state                   → indexer audit: last ledger + event counts
+ * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
+ * GET /indexer/schema                  → schema versioning and migration status diagnostics
+ * GET /indexer/failures                → open event-handler failures (skipped events)
+ *                                        ?ledger=   restrict to one ledger
+ *                                        ?eventId=  look up one RPC event id
+ *                                        ?limit=    1–100 (default: 20)
  * GET /health                          → health check (db + RPC status)
+ *
+ * DB helpers used: query<T> (many rows), queryOne<T> (0‥1 rows → T|null),
+ * queryExact<T> (exactly 1 row or throws). The queryOne/queryExact helpers
+ * replace the fragile `const [row] = await query(...)` destructuring pattern
+ * that silently produced undefined when no row existed (see pool.ts).
  */
 
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { query } from "./db/pool";
+import { query, queryOne, queryExact } from "./db/pool";
 import { rpc, USDC, getIndexerMetrics, isIndexerRunning } from "./indexer";
 import { groupCircleRounds } from "./groupRounds";
 import { runAllHealthChecks } from "./health";
+import { isUndefinedTable, listOpenEventFailures } from "./eventFailures";
 import { redactAddress } from "./redact";
+import { logApiCorsRejected, logApiRequest, logApiRequestError } from "./logger";
 import type { MigrationHealth } from "./db/migrate";
 
 // ── Address validation ────────────────────────────────────────────────────────
@@ -244,7 +261,12 @@ const SORTABLE_FIELDS = [
 ] as const;
 type SortableField = (typeof SORTABLE_FIELDS)[number];
 
-const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled"] as const;
+// "Closed" is not a contract-enum variant — the contract records it as a
+// boolean flag (DataKey::Closed), but the indexer projects it as a status
+// string when it receives a circle/closed event.  Including it here lets
+// callers filter GET /circles?status=Closed to retrieve fully-settled circles
+// without a full scan and client-side filter.
+const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled", "Closed"] as const;
 type CircleStatus = (typeof CIRCLE_STATUSES)[number];
 
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
@@ -379,6 +401,7 @@ interface CircleMemberRow {
   circle_address: string;
   member_address: string;
   payout_order: number;
+  join_order: number | null;
   collateral: string;
   defaults: number;
   joined_at: string | null;
@@ -456,18 +479,52 @@ interface EventTypeCountRow {
   count: string;
 }
 
+interface EntityCountsSingleRow {
+  circles: string;
+  members: string;
+  contributions: string;
+  payouts: string;
+  defaults: string;
+}
+
+interface CircleStatusCountRow {
+  status: string;
+  count: string;
+}
+
+
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
   const app = express();
   app.set("trust proxy", TRUST_PROXY_HOPS);
   app.use(cors(buildCorsOptions()));
   app.use(express.json());
 
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    const startedAt = Date.now();
+
+    _res.on("finish", () => {
+      logApiRequest({
+        method: req.method,
+        path: req.originalUrl || req.url,
+        statusCode: _res.statusCode,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
+    next();
+  });
+
   // cors() calls next(err) for rejected origins instead of sending a response
   // itself — without this handler, Express's default error page would leak a
   // stack trace instead of a clean 403.
   app.use(
-    (err: Error, _req: Request, res: Response, next: express.NextFunction) => {
+    (err: Error, req: Request, res: Response, next: express.NextFunction) => {
       if (err.message.startsWith("Origin ")) {
+        logApiCorsRejected({
+          method: req.method,
+          path: req.originalUrl || req.url,
+          origin: req.headers.origin ?? undefined,
+        });
         res.status(403).json({ error: err.message });
         return;
       }
@@ -495,7 +552,9 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       usdcAddress: USDC,
       cachedMigrationHealth: options.cachedMigrationHealth ?? null,
     });
-    res.status(report.status === "ok" ? 200 : 503).json(report);
+    res.status(
+      report.serviceStatus === "healthy" || report.status === "ok" ? 200 : 503,
+    ).json(report);
   });
 
   // ── Circles ──────────────────────────────────────────────────────────────────
@@ -588,6 +647,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       for (const row of rows) {
         const count = Number(row.count);
         total += count;
+        // Accept any known status, including the indexer-only "Closed" value
+        // that the contract does not expose as an enum variant.
         if ((CIRCLE_STATUSES as readonly string[]).includes(row.status)) {
           byStatus[row.status as CircleStatus] = count;
         }
@@ -608,12 +669,19 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
     const address = addressResult;
     try {
-      const [circle] = await query<CircleRow>(
+      const circle = await queryOne<CircleRow>(
         `SELECT * FROM circles WHERE address = $1`,
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
@@ -628,7 +696,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
       // Attach the latest indexed ledger so the client can derive wall-clock
       // estimates for the deadline countdown without a separate request.
-      const [indexerState] = await query<IndexerStateRow>(
+      const indexerState = await queryOne<IndexerStateRow>(
         `SELECT last_ledger FROM indexer_state WHERE id = 1`,
       );
       const latestLedger = indexerState ? Number(indexerState.last_ledger) : null;
@@ -667,6 +735,18 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
+  // ── Dedicated members endpoint (#539) ────────────────────────────────────────
+  //
+  // Returns all members for a single circle in payout_order with:
+  //   • reputation score (joined from reputation table)
+  //   • total historical contribution count across all rounds
+  //   • hasContributedCurrentRound — whether the member has contributed in the
+  //     circle's current round index (useful for the circle detail UI without
+  //     needing to load the full rounds history)
+  //   • totals aggregate: memberCount, totalCollateral, totalContributions
+  //   • roundDeadlineLedgers — from the circle row, so clients can derive
+  //     per-member deadline estimates without a second request
+
   app.get("/circles/:address/members", detailRateLimiter, async (req: Request, res: Response) => {
     const addressResult = parseAddress(req.params.address, "Circle address");
     if (isParseError(addressResult)) {
@@ -675,37 +755,45 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
     const address = addressResult;
     try {
-      const [circle] = await query<Pick<CircleRow, "address">>(
-        `SELECT address FROM circles WHERE address = $1`,
+      const circle = await queryOne<Pick<CircleRow, "address" | "current_round" | "round_deadline_ledgers">>(
+        `SELECT address, current_round, round_deadline_ledgers FROM circles WHERE address = $1`,
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
       const [members, [totals]] = await Promise.all([
         query<CircleMemberWithContributionsRow>(
-          `SELECT cm.member_address, cm.payout_order, cm.collateral,
+          `SELECT cm.member_address, cm.payout_order, cm.join_order, cm.collateral,
                   cm.defaults, cm.joined_at,
                   r.score as reputation_score,
-                  (
-                    SELECT COUNT(*) FROM contributions c2
-                    WHERE c2.circle_address = cm.circle_address
-                      AND c2.member_address = cm.member_address
+                  COALESCE(
+                    (SELECT COUNT(*) FROM contributions c2
+                     WHERE c2.circle_address = cm.circle_address
+                       AND c2.member_address = cm.member_address),
+                    0
                   ) as total_contributions
            FROM circle_members cm
            LEFT JOIN reputation r ON r.member_address = cm.member_address
            WHERE cm.circle_address = $1
            ORDER BY cm.payout_order`,
-          [address],
+          [address, circle.current_round],
         ),
         // COALESCE guards SUM/COUNT-derived totals against NULL, which
         // Postgres returns for aggregates over zero rows (e.g. a circle with
         // no members yet, or no contributions recorded) — without it, a
         // freshly created circle would report total_collateral: null instead
         // of "0", inconsistent with member_count: 0.
-        query<CircleMemberTotalsRow>(
+        queryOne<CircleMemberTotalsRow>(
           `SELECT
              COUNT(cm.*) as member_count,
              COALESCE(SUM(cm.collateral), 0) as total_collateral,
@@ -719,19 +807,44 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         ),
       ]);
 
+      // totals will always have a row (COUNT over zero rows returns one row
+      // with count=0); use queryOne default fallback just in case.
+      const t = totals ?? { member_count: "0", total_collateral: "0", total_contributions: "0" };
+
       res.json({
-        members,
+        members: members.map((m) => ({
+          ...m,
+          total_contributions: Number(m.total_contributions),
+        })),
         totals: {
-          memberCount: Number(totals.member_count),
-          totalCollateral: totals.total_collateral,
-          totalContributions: Number(totals.total_contributions),
+          memberCount: Number(t.member_count),
+          totalCollateral: t.total_collateral,
+          totalContributions: Number(t.total_contributions),
         },
+        roundDeadlineLedgers: circle.round_deadline_ledgers,
       });
     } catch (err) {
       console.error(`[api] Failed to load members for circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle members", getErrorMessage(err));
     }
   });
+
+  // ── Rounds history endpoint (#540) ───────────────────────────────────────────
+  //
+  // Returns all indexed rounds for a circle grouped by round_index.  Each round
+  // includes its payout (if settled), all contributions, all defaults, and a
+  // resolved `status` (completed | current | cancelled | open).
+  //
+  // Grouping improvements over a flat payout list:
+  //   • Rounds that have contributions or defaults but no payout yet are
+  //     surfaced in `openRounds` instead of being silently dropped.
+  //   • The active current round is always present in `currentRound` even when
+  //     it has no activity yet.
+  //   • Duplicate payout rows (replay / ingest anomaly) are de-duplicated by
+  //     `buildPayoutIndex` with a non-fatal warning log.
+  //   • `deadlineLedger` is computed for every round from
+  //     `created_ledger + (roundIndex + 1) * round_deadline_ledgers` so clients
+  //     can display a countdown without a separate RPC call.
 
   app.get("/circles/:address/rounds", detailRateLimiter, async (req: Request, res: Response) => {
     const addressResult = parseAddress(req.params.address, "Circle address");
@@ -741,14 +854,21 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
     const address = addressResult;
     try {
-      const [circle] = await query<
-        Pick<CircleRow, "address" | "current_round" | "total_rounds" | "status">
+      const circle = await queryOne<
+        Pick<CircleRow, "address" | "current_round" | "total_rounds" | "status" | "created_ledger" | "round_deadline_ledgers">
       >(
-        `SELECT address, current_round, total_rounds, status FROM circles WHERE address = $1`,
+        `SELECT address, current_round, total_rounds, status, created_ledger, round_deadline_ledgers FROM circles WHERE address = $1`,
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
@@ -770,15 +890,47 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       // Single-pass grouping by round_index so contributions/defaults for
       // unpaid rounds are never silently dropped, and we avoid O(n×m)
       // filter scans per payout.
+      //
+      // Every GroupedRound carries a `status` field ("completed", "current",
+      // "cancelled", or "open") that is included in the serialised JSON so
+      // clients can branch on lifecycle phase directly rather than inferring
+      // it from the presence/absence of payout fields (issue #529).
       const { rounds, currentRound, openRounds, pendingDefaults } =
         groupCircleRounds(circle, payouts, contributions, defaults);
 
+      // Compute deadlineLedger for each round when the circle has the
+      // round_deadline_ledgers field set (present on circles created after
+      // migration 001). Formula:
+      //   deadline = created_ledger + (roundIndex + 1) * round_deadline_ledgers
+      //
+      // This is an approximation derived from the creation ledger; the exact
+      // per-round deadline is set inside the contract but is not yet stored
+      // as a separate indexed column.
+      //
+      // `circle` is non-null here — the early return above guards that — but
+      // TypeScript cannot narrow it across a function boundary, so we capture
+      // the non-null value explicitly.
+      const nonNullCircle = circle;
+      const computeDeadlineLedger = (roundIndex: number): number | null => {
+        if (nonNullCircle.round_deadline_ledgers == null || nonNullCircle.created_ledger == null) {
+          return null;
+        }
+        return (
+          Number(nonNullCircle.created_ledger) +
+          (roundIndex + 1) * Number(nonNullCircle.round_deadline_ledgers)
+        );
+      };
+
+      const annotate = <C extends { round_index: number }, D extends { round_index: number }>(
+        r: import("./groupRounds").GroupedRound<C, D>,
+      ) => ({ ...r, deadlineLedger: computeDeadlineLedger(r.roundIndex) });
+
       res.json({
-        rounds,
-        currentRound,
+        rounds: rounds.map(annotate),
+        currentRound: currentRound ? annotate(currentRound) : null,
         // Unpaid non-current rounds that still have activity (rare, but
         // previously invisible to clients).
-        openRounds,
+        openRounds: openRounds.map(annotate),
         pendingDefaults,
       });
     } catch (err) {
@@ -787,7 +939,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  // ── Member contribution history ──────────────────────────────────────────────
+  // ── Member contribution history endpoint (#541) ───────────────────────────────
   //
   // Read-only ledger of every indexed contribution for a member. Unlike
   // /reputation/:member (which returns per-circle counts) and
@@ -799,6 +951,11 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // yield an empty list (not 404) — same convention as /reputation/:member.
   // An unknown ?circle= address is a 404 so callers get a clear signal that
   // the filter itself is invalid rather than a silently empty result.
+  //
+  // The response includes a `totalAmount` aggregate (sum of all contribution
+  // amounts for the queried scope) and a `hasMore` boolean convenience field
+  // derived from the pagination envelope so clients can page without computing
+  // `page < totalPages` themselves.
 
   app.get("/members/:member/contributions", historyRateLimiter, async (req: Request, res: Response) => {
     const memberResult = parseAddress(req.params.member, "Member address");
@@ -828,12 +985,18 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
     try {
       if (circleFilter) {
-        const [circle] = await query<Pick<CircleRow, "address">>(
+        const circle = await queryOne<Pick<CircleRow, "address">>(
           `SELECT address FROM circles WHERE address = $1`,
           [circleFilter],
         );
         if (!circle) {
-          res.status(404).json({ error: `Circle '${circleFilter}' not found` });
+          res.status(404).json({
+            error: "Circle not found",
+            detail:
+              `No circle with address '${circleFilter}' has been indexed yet. ` +
+              `The ?circle= filter must reference an address that exists in the indexer.`,
+            address: circleFilter,
+          });
           return;
         }
       }
@@ -845,7 +1008,9 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         ? [member, circleFilter]
         : [member];
 
-      const [contributions, [countRow]] = await Promise.all([
+      interface ContribAggRow { count: string; total_amount: string }
+
+      const [contributions, agg] = await Promise.all([
         query<ContributionRow>(
           `SELECT c.circle_address, c.member_address, c.round_index, c.amount::text as amount,
                   c.tx_hash, c.ledger, c.created_at
@@ -855,23 +1020,28 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
            LIMIT $${whereParams.length + 1} OFFSET $${whereParams.length + 2}`,
           [...whereParams, limit, offset],
         ),
-        query<{ count: string }>(
-          `SELECT COUNT(*) as count FROM contributions c ${whereSql}`,
+        queryOne<ContribAggRow>(
+          `SELECT COUNT(*) as count, COALESCE(SUM(c.amount), 0)::text as total_amount
+           FROM contributions c
+           ${whereSql}`,
           whereParams,
         ),
       ]);
 
-      const total = Number(countRow.count);
+      const total = Number(agg?.count ?? 0);
+      const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
 
       res.json({
         member,
         circle: circleFilter ?? null,
         contributions,
+        totalAmount: agg?.total_amount ?? "0",
         pagination: {
           page,
           limit,
           total,
-          totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+          totalPages,
+          hasMore: page < totalPages,
         },
       });
     } catch (err) {
@@ -909,7 +1079,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     const circleFilter = circleResult;
 
     try {
-      const [row] = await query<ReputationRow>(
+      const row = await queryOne<ReputationRow>(
         `SELECT * FROM reputation WHERE member_address = $1`,
         [member],
       );
@@ -942,6 +1112,16 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       res.json({
         member,
         found: row != null,
+        // When `found` is false, the member has no recorded reputation activity
+        // yet. This means either no reputation/increment event has been emitted
+        // for this wallet address, or the indexer has not yet processed it.
+        // A score of 0 is returned in either case; clients can use `found` to
+        // distinguish an untracked wallet from one with an explicit zero score.
+        detail: row == null
+          ? `Member '${member}' has no reputation record in the indexer. ` +
+            `This address has not completed any circle rounds yet, or the ` +
+            `reputation/increment event has not been indexed.`
+          : undefined,
         score: row?.score ?? 0,
         contributions: contributions.map((c) => ({
           circle_address: c.circle_address,
@@ -960,6 +1140,67 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
+  // ── Circle audit events ───────────────────────────────────────────────────────
+  //
+  // Returns the structured audit log for terminal lifecycle transitions
+  // (cancelled and closed) for a specific circle.  This is distinct from
+  // /indexer/state (which reports aggregate event counts across all circles)
+  // and /circles/:address (which returns the summarised status row).
+  //
+  // Callers can use this endpoint to:
+  //   - Display the exact closer address and release amounts in the UI
+  //   - Compute penalty forfeitures: total_expected_collateral - total_released
+  //   - Audit which member triggered cancellation / closure and when
+  //
+  // Returns an empty `events` array (not 404) when no audit rows exist yet
+  // for the circle, since events may arrive slightly after the status update
+  // during indexer replay.
+
+  app.get("/circles/:address/audit", detailRateLimiter, async (req: Request, res: Response) => {
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
+      return;
+    }
+    const address = addressResult;
+
+    try {
+      const [circle] = await query<Pick<CircleRow, "address">>(
+        `SELECT address FROM circles WHERE address = $1`,
+        [address],
+      );
+      if (!circle) {
+        res.status(404).json({ error: `Circle '${address}' not found` });
+        return;
+      }
+
+      const events = await query<{
+        id: number;
+        circle_address: string;
+        event_type: string;
+        triggered_by: string | null;
+        ledger: string | null;
+        tx_hash: string | null;
+        total_released: string | null;
+        total_expected_collateral: string | null;
+        close_reason: string | null;
+        created_at: string;
+      }>(
+        `SELECT id, circle_address, event_type, triggered_by, ledger, tx_hash,
+                total_released, total_expected_collateral, close_reason, created_at
+         FROM circle_audit_events
+         WHERE circle_address = $1
+         ORDER BY created_at ASC`,
+        [address],
+      );
+
+      res.json({ circle_address: address, events });
+    } catch (err) {
+      console.error(`[api] Failed to load audit events for circle ${redactAddress(address)}`, err);
+      sendError(res, 500, "Failed to load circle audit events", getErrorMessage(err));
+    }
+  });
+
   // ── Indexer ──────────────────────────────────────────────────────────────────
 
   // Audit endpoint for ops/monitoring: reports how far the indexer has
@@ -967,16 +1208,27 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // /health (which only checks connectivity, not indexing progress).
   app.get("/indexer/state", detailRateLimiter, async (_req: Request, res: Response) => {
     try {
-      const [stateRows, eventCountRows] = await Promise.all([
+      const [stateRows, eventCountRows, [entityCounts], statusRows] = await Promise.all([
         query<IndexerStateAuditRow>(
           `SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1`,
         ),
         query<EventTypeCountRow>(
           `SELECT event_type, COUNT(*) as count FROM ingested_events GROUP BY event_type`,
         ),
+        query<EntityCountsSingleRow>(
+          `SELECT
+             (SELECT COUNT(*) FROM circles)::text AS circles,
+             (SELECT COUNT(*) FROM circle_members)::text AS members,
+             (SELECT COUNT(*) FROM contributions)::text AS contributions,
+             (SELECT COUNT(*) FROM payouts)::text AS payouts,
+             (SELECT COUNT(*) FROM defaults)::text AS defaults`,
+        ),
+        query<CircleStatusCountRow>(
+          `SELECT status, COUNT(*) as count FROM circles GROUP BY status`,
+        ),
       ]);
 
-      const [state] = stateRows;
+      const state = stateRows[0] ?? null;
       if (!state) {
         sendError(res, 500, "Indexer state has not been initialized");
         return;
@@ -990,11 +1242,24 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         eventCounts[row.event_type ?? "unknown"] = count;
       }
 
+      const circlesByStatus: Record<string, number> = {};
+      for (const row of statusRows) {
+        circlesByStatus[row.status] = Number(row.count);
+      }
+
       res.json({
         lastLedger: Number(state.last_ledger),
         updatedAt: state.updated_at,
         totalEvents,
         eventCounts,
+        entityCounts: {
+          circles: Number(entityCounts?.circles ?? 0),
+          members: Number(entityCounts?.members ?? 0),
+          contributions: Number(entityCounts?.contributions ?? 0),
+          payouts: Number(entityCounts?.payouts ?? 0),
+          defaults: Number(entityCounts?.defaults ?? 0),
+          circlesByStatus,
+        },
       });
     } catch (err) {
       console.error("[api] Failed to load indexer state", err);
@@ -1018,6 +1283,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         events: {
           processed: metrics.totalEventsProcessed,
           failed: metrics.totalEventsFailed,
+          skipped: metrics.totalEventsSkipped,
+          retried: metrics.totalEventsRetried,
         },
         pollCycles: {
           completed: metrics.pollCyclesCompleted,
@@ -1038,9 +1305,82 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  // Events the indexer skipped because their handler failed, and which have
+  // not since been re-ingested or acknowledged.  Rows carry the event's
+  // identity (RPC event id, ledger, tx hash, contract, type) and a redacted
+  // error — never the event payload.  See docs/INDEXER_RELIABILITY.md for the
+  // safe reprocessing path.
+  app.get("/indexer/failures", detailRateLimiter, async (req: Request, res: Response) => {
+    const limitResult = parseLimit(req.query.limit);
+    if (isParseError(limitResult)) {
+      sendError(res, 400, limitResult.error);
+      return;
+    }
+
+    let ledger: number | undefined;
+    if (req.query.ledger !== undefined) {
+      const n = Number(req.query.ledger);
+      if (!Number.isInteger(n) || n < 0) {
+        sendError(res, 400, "ledger must be a non-negative integer");
+        return;
+      }
+      ledger = n;
+    }
+
+    let eventId: string | undefined;
+    if (req.query.eventId !== undefined) {
+      if (typeof req.query.eventId !== "string" || !/^[0-9A-Za-z:_-]{1,200}$/.test(req.query.eventId)) {
+        sendError(res, 400, "eventId must be an RPC event id");
+        return;
+      }
+      eventId = req.query.eventId;
+    }
+
+    try {
+      const failures = await listOpenEventFailures({ ledger, eventId, limit: limitResult });
+      res.json({ failures, count: failures.length, limit: limitResult });
+    } catch (err) {
+      if (isUndefinedTable(err)) {
+        sendError(res, 503, "event_failures table is missing — run migrations");
+        return;
+      }
+      console.error("[api] Failed to load event failures", err);
+      sendError(res, 500, "Failed to load event failures", getErrorMessage(err));
+    }
+  });
+
+  // Exposes the full migration history for ops and diagnostics: which migrations
+  // have been applied, which are pending, and whether the schema is clean.
+  app.get("/indexer/schema", detailRateLimiter, async (_req: Request, res: Response) => {
+    try {
+      const { checkMigrationHealth } = await import("./db/migrate");
+      const health = await checkMigrationHealth();
+      res.json({
+        state: health.state,
+        summary: health.summary,
+        canStartSafely: health.canStartSafely,
+        currentVersion: health.status.currentVersion,
+        applied: health.status.applied,
+        pending: health.status.pending,
+        missingOnDisk: health.status.missingOnDisk,
+        modified: health.status.modified,
+      });
+    } catch (err) {
+      console.error("[api] Failed to load schema status", err);
+      sendError(res, 500, "Failed to load schema status", getErrorMessage(err));
+    }
+  });
+
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const message = getErrorMessage(err);
+    logApiRequestError({
+      method: req.method,
+      path: req.originalUrl || req.url,
+      statusCode: 500,
+      error: message,
+    });
     console.error("[api] Unhandled error", err);
-    sendError(res, 500, "Internal server error", getErrorMessage(err));
+    sendError(res, 500, "Internal server error", message);
   });
 
   return app;

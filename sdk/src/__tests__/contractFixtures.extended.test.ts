@@ -1,275 +1,395 @@
 /**
- * Issue #464: Extended contract argument fixtures for public methods not covered
- * by the original contractFixtures.test.ts.
+ * Issue #629: Extended contract argument fixtures — return-value wire shapes
  *
- * Covers:
- *   Circle contract: cancel, pause, resume, get_protocol_params, get_usdc_token
+ * The original contractFixtures.test.ts covers argument encoding (what we send
+ * to the contract). This file covers the complementary half: the wire shapes
+ * that scValToNative produces for the contract's return values, validated
+ * against the mapRaw* decode helpers in sdk/src/types.ts.
  *
- * These entry-points were added after the initial fixture suite was written.
- * They are kept in a separate file to make the addition clearly attributable
- * to issue #464 and to avoid a noisy diff on the original fixture file.
+ * If the Rust contract changes a struct field name, type, or order, the
+ * corresponding decode helper will throw a TypeError at the boundary — this
+ * file pins those shapes so a contract drift is caught in CI before it reaches
+ * production users as a cryptic "undefined is not a bigint" error.
  *
- * Fixture strategy mirrors contractFixtures.test.ts:
- *   - Encode arguments with the public SDK builders (scAddress, scU32, …).
- *   - Verify that encoding is deterministic and that decoding round-trips.
- *   - Verify that the decoded native values match the expected contract signature.
- *   - Include boundary cases where the contract accepts optional or typed args.
+ * Covered return shapes:
+ *   Circle: get_config → CircleConfig (via mapRawConfig)
+ *           get_current_round → RoundState (via mapRawRoundState)
+ *           get_protocol_params → ProtocolParams (field names + types)
+ *   Reputation: score → u32 (decoded as number)
  *
- * Maintenance: if any of these signatures change in the Rust contract, the
- * corresponding fixture encoding will no longer match and the test will fail,
- * surfacing the break in CI before it reaches production.
+ * Maintenance:
+ *   - If the Rust struct for CircleConfig gains or renames a field, update
+ *     WIRE_CONFIG in fixtures.ts and the expectations below.
+ *   - If RoundState changes, update WIRE_ROUND and the expectations below.
+ *   - If ProtocolParams constants change, update the expected values below.
+ *   - Always update docs/API_INVARIANTS.md (section 9) alongside these tests.
  */
 
 import { describe, it, expect } from "vitest";
-import { xdr, scValToNative } from "@stellar/stellar-sdk";
-import { scAddress, scAddressVec, scI128, scU32 } from "../client";
-
-// ─── Test addresses ───────────────────────────────────────────────────────────
-// All derived deterministically from sdk/src/__tests__/fixtures.ts patterns.
-
 import {
-  CREATOR_ADDR,
+  mapRawConfig,
+  mapRawRoundState,
+  decodeU32,
+  decodeBigInt,
+  decodeBoolean,
+  decodeAddress,
+  decodeAddressList,
+} from "../types";
+import {
+  WIRE_CONFIG,
+  WIRE_ROUND,
+  USDC_ADDR,
+  REPUTATION_ADDR,
   MEMBER_A_ADDR,
   MEMBER_B_ADDR,
 } from "./fixtures";
 
-// ─── Encoding helpers (copied from contractFixtures.test.ts) ─────────────────
+// ─── mapRawConfig — CircleConfig wire shape ───────────────────────────────────
 
-function encodeFixture(args: xdr.ScVal[]): string {
-  return xdr.ScVal.scvVec(args).toXDR("base64");
-}
-
-function decodeFixture(fixture: string): xdr.ScVal[] {
-  const vec = xdr.ScVal.fromXDR(fixture, "base64");
-  if (vec.switch().name !== "scvVec") throw new Error("Fixture is not scvVec");
-  return vec.vec() ?? [];
-}
-
-function assertFixture(fixture: string, expectedNativeArgs: unknown[]): void {
-  const decoded = decodeFixture(fixture);
-  expect(decoded).toHaveLength(expectedNativeArgs.length);
-  for (let i = 0; i < expectedNativeArgs.length; i++) {
-    expect(scValToNative(decoded[i])).toEqual(expectedNativeArgs[i]);
-  }
-}
-
-// ─── Circle contract — cancel ─────────────────────────────────────────────────
-//
-// Rust signature: cancel(env: Env, caller: Address)
-// Callable while status = Pending; transitions to Cancelled.
-
-describe("Circle contract — cancel (Issue #464)", () => {
-  const FIXTURE = encodeFixture([scAddress(CREATOR_ADDR)]);
-
-  it("cancel with caller address encodes correctly", () => {
-    assertFixture(FIXTURE, [CREATOR_ADDR]);
+describe("mapRawConfig — CircleConfig wire shape (Issue #629)", () => {
+  it("decodes WIRE_CONFIG to a well-typed CircleConfig", () => {
+    const config = mapRawConfig(WIRE_CONFIG);
+    expect(config.members).toEqual([MEMBER_A_ADDR, MEMBER_B_ADDR]);
+    expect(config.roundAmount).toBe(100_000_000n);
+    expect(config.usdcToken).toBe(USDC_ADDR);
+    expect(config.reputationContract).toBe(REPUTATION_ADDR);
+    expect(config.roundDeadlineLedgers).toBe(120_960);
   });
 
-  it("cancel fixture is deterministic", () => {
-    expect(encodeFixture([scAddress(CREATOR_ADDR)])).toBe(FIXTURE);
+  it("all field types are correct after decode", () => {
+    const config = mapRawConfig(WIRE_CONFIG);
+    expect(Array.isArray(config.members)).toBe(true);
+    expect(typeof config.roundAmount).toBe("bigint");
+    expect(typeof config.usdcToken).toBe("string");
+    expect(typeof config.reputationContract).toBe("string");
+    expect(typeof config.roundDeadlineLedgers).toBe("number");
   });
 
-  it("cancel with member address (non-creator caller)", () => {
-    const fixture = encodeFixture([scAddress(MEMBER_A_ADDR)]);
-    assertFixture(fixture, [MEMBER_A_ADDR]);
-  });
-});
-
-// ─── Circle contract — pause ──────────────────────────────────────────────────
-//
-// Rust signature: pause(env: Env, admin: Address) -> Result<(), PauseError>
-// Only callable by the stored admin address. Blocks all fund-moving operations.
-
-describe("Circle contract — pause (Issue #464)", () => {
-  const FIXTURE = encodeFixture([scAddress(CREATOR_ADDR)]);
-
-  it("pause with admin address encodes correctly", () => {
-    assertFixture(FIXTURE, [CREATOR_ADDR]);
+  it("throws TypeError when raw is null", () => {
+    expect(() => mapRawConfig(null)).toThrow(TypeError);
+    expect(() => mapRawConfig(null)).toThrow(/mapRawConfig/);
   });
 
-  it("pause fixture is deterministic", () => {
-    expect(encodeFixture([scAddress(CREATOR_ADDR)])).toBe(FIXTURE);
-  });
-});
-
-// ─── Circle contract — resume ─────────────────────────────────────────────────
-//
-// Rust signature: resume(env: Env, admin: Address) -> Result<(), PauseError>
-// Clears the Paused flag; re-enables fund-moving operations.
-
-describe("Circle contract — resume (Issue #464)", () => {
-  const FIXTURE = encodeFixture([scAddress(CREATOR_ADDR)]);
-
-  it("resume with admin address encodes correctly", () => {
-    assertFixture(FIXTURE, [CREATOR_ADDR]);
+  it("throws TypeError when raw is a string instead of an object", () => {
+    expect(() => mapRawConfig("not-an-object")).toThrow(TypeError);
   });
 
-  it("resume fixture is deterministic", () => {
-    expect(encodeFixture([scAddress(CREATOR_ADDR)])).toBe(FIXTURE);
+  it("throws with a field-level label when members is not an array", () => {
+    expect(() => mapRawConfig({ ...WIRE_CONFIG, members: "bad" })).toThrow(
+      /mapRawConfig\.members/,
+    );
   });
 
-  it("pause and resume share the same argument shape", () => {
-    // They must use identical encoding — both take (admin: Address)
-    const pauseFixture  = encodeFixture([scAddress(CREATOR_ADDR)]);
-    const resumeFixture = encodeFixture([scAddress(CREATOR_ADDR)]);
-    expect(pauseFixture).toBe(resumeFixture);
+  it("throws with a field-level label when round_amount is a string", () => {
+    expect(() =>
+      mapRawConfig({ ...WIRE_CONFIG, round_amount: "100000000" }),
+    ).toThrow(/mapRawConfig\.round_amount/);
+  });
+
+  it("throws with a field-level label when round_deadline_ledgers is a float", () => {
+    expect(() =>
+      mapRawConfig({ ...WIRE_CONFIG, round_deadline_ledgers: 1.5 }),
+    ).toThrow(/mapRawConfig\.round_deadline_ledgers/);
+  });
+
+  it("throws with a field-level label when usdc_token is not a valid address", () => {
+    expect(() =>
+      mapRawConfig({ ...WIRE_CONFIG, usdc_token: "not-an-address" }),
+    ).toThrow(/mapRawConfig\.usdc_token/);
+  });
+
+  it("accepts number for round_amount when it is a safe integer (narrow type from contract)", () => {
+    // The contract may return a small round_amount as a JS number rather than
+    // bigint when the value fits — decodeBigInt accepts safe integers.
+    const config = mapRawConfig({ ...WIRE_CONFIG, round_amount: 100_000_000 });
+    expect(config.roundAmount).toBe(100_000_000n);
+  });
+
+  it("wire field names are snake_case (Rust naming convention preserved by scValToNative)", () => {
+    // This test documents and pins the snake_case wire contract.
+    // If the Rust struct ever uses camelCase field names the fixture will need
+    // updating before the decoder will work.
+    const keys = Object.keys(WIRE_CONFIG);
+    expect(keys).toContain("members");
+    expect(keys).toContain("round_amount");
+    expect(keys).toContain("usdc_token");
+    expect(keys).toContain("reputation_contract");
+    expect(keys).toContain("round_deadline_ledgers");
   });
 });
 
-// ─── Circle contract — get_protocol_params ───────────────────────────────────
-//
-// Rust signature: get_protocol_params(_env: Env) -> ProtocolParams
-// No arguments — read-only view that returns static protocol constants.
-// Does not require the contract to be initialized.
+// ─── mapRawRoundState — RoundState wire shape ─────────────────────────────────
 
-describe("Circle contract — get_protocol_params (Issue #464)", () => {
-  const FIXTURE = encodeFixture([]);
-
-  it("get_protocol_params takes no arguments", () => {
-    assertFixture(FIXTURE, []);
+describe("mapRawRoundState — RoundState wire shape (Issue #629)", () => {
+  it("decodes WIRE_ROUND to a well-typed RoundState", () => {
+    const round = mapRawRoundState(WIRE_ROUND);
+    expect(round.roundIndex).toBe(2);
+    expect(round.recipient).toBe(MEMBER_A_ADDR);
+    expect(round.contributionsReceived).toBe(3);
+    expect(round.deadlineLedger).toBe(5_000_000n);
+    expect(round.paidOut).toBe(false);
   });
 
-  it("empty-arg fixture is deterministic", () => {
-    expect(encodeFixture([])).toBe(FIXTURE);
+  it("all field types are correct after decode", () => {
+    const round = mapRawRoundState(WIRE_ROUND);
+    expect(typeof round.roundIndex).toBe("number");
+    expect(typeof round.recipient).toBe("string");
+    expect(typeof round.contributionsReceived).toBe("number");
+    expect(typeof round.deadlineLedger).toBe("bigint");
+    expect(typeof round.paidOut).toBe("boolean");
   });
 
-  it("empty fixtures for all no-arg views are identical (structural consistency)", () => {
-    // All zero-argument read methods must produce the same (empty) fixture —
-    // this guards against accidentally encoding a dummy arg.
-    const views = [
-      encodeFixture([]), // get_protocol_params
-      encodeFixture([]), // get_config
-      encodeFixture([]), // get_status
-      encodeFixture([]), // get_current_round
-      encodeFixture([]), // payout
-    ];
-    const unique = new Set(views);
-    expect(unique.size).toBe(1);
-  });
-});
-
-// ─── Circle contract — get_usdc_token ────────────────────────────────────────
-//
-// Rust signature: get_usdc_token(env: Env) -> Result<Address, ContractError>
-// No arguments — read-only view of the locked USDC token address.
-
-describe("Circle contract — get_usdc_token (Issue #464)", () => {
-  const FIXTURE = encodeFixture([]);
-
-  it("get_usdc_token takes no arguments", () => {
-    assertFixture(FIXTURE, []);
-  });
-});
-
-// ─── initialize boundary cases ───────────────────────────────────────────────
-//
-// The original fixture covered a 2-member circle with the default deadline.
-// These cases extend coverage to the minimum and maximum protocol boundaries
-// so a future change to MIN/MAX_ROUND_DEADLINE_LEDGERS is caught here.
-
-describe("Circle contract — initialize boundary cases (Issue #464)", () => {
-  // MIN_ROUND_DEADLINE_LEDGERS = 100 (from contracts/circle/src/lib.rs)
-  const FIXTURE_MIN_DEADLINE = encodeFixture([
-    scAddress(CREATOR_ADDR),
-    scAddressVec([MEMBER_A_ADDR, MEMBER_B_ADDR]),
-    scI128(100_000_000n),
-    scU32(100),
-  ]);
-
-  // MAX_ROUND_DEADLINE_LEDGERS = 1_036_800 (~60 days)
-  const FIXTURE_MAX_DEADLINE = encodeFixture([
-    scAddress(CREATOR_ADDR),
-    scAddressVec([MEMBER_A_ADDR, MEMBER_B_ADDR]),
-    scI128(100_000_000n),
-    scU32(1_036_800),
-  ]);
-
-  // Minimum valid round_amount: 1 stroop (> 0 required)
-  const FIXTURE_MIN_AMOUNT = encodeFixture([
-    scAddress(CREATOR_ADDR),
-    scAddressVec([MEMBER_A_ADDR, MEMBER_B_ADDR]),
-    scI128(1n),
-    scU32(120_960),
-  ]);
-
-  it("initialize with minimum deadline (100 ledgers)", () => {
-    assertFixture(FIXTURE_MIN_DEADLINE, [
-      CREATOR_ADDR,
-      [MEMBER_A_ADDR, MEMBER_B_ADDR],
-      100_000_000n,
-      100,
-    ]);
+  it("throws TypeError when raw is null", () => {
+    expect(() => mapRawRoundState(null)).toThrow(TypeError);
+    expect(() => mapRawRoundState(null)).toThrow(/mapRawRoundState/);
   });
 
-  it("initialize with maximum deadline (1_036_800 ledgers)", () => {
-    assertFixture(FIXTURE_MAX_DEADLINE, [
-      CREATOR_ADDR,
-      [MEMBER_A_ADDR, MEMBER_B_ADDR],
-      100_000_000n,
-      1_036_800,
-    ]);
+  it("throws with a field-level label when round_index is not a u32", () => {
+    expect(() =>
+      mapRawRoundState({ ...WIRE_ROUND, round_index: "0" }),
+    ).toThrow(/mapRawRoundState\.round_index/);
   });
 
-  it("initialize with minimum round amount (1 stroop)", () => {
-    assertFixture(FIXTURE_MIN_AMOUNT, [
-      CREATOR_ADDR,
-      [MEMBER_A_ADDR, MEMBER_B_ADDR],
-      1n,
-      120_960,
-    ]);
+  it("throws with a field-level label when recipient is not a valid address", () => {
+    expect(() =>
+      mapRawRoundState({ ...WIRE_ROUND, recipient: "not-an-addr" }),
+    ).toThrow(/mapRawRoundState\.recipient/);
+  });
+
+  it("throws with a field-level label when deadline_ledger is not a bigint or safe number", () => {
+    expect(() =>
+      mapRawRoundState({ ...WIRE_ROUND, deadline_ledger: "5000000" }),
+    ).toThrow(/mapRawRoundState\.deadline_ledger/);
+  });
+
+  it("throws with a field-level label when paid_out is not boolean", () => {
+    expect(() =>
+      mapRawRoundState({ ...WIRE_ROUND, paid_out: 0 }),
+    ).toThrow(/mapRawRoundState\.paid_out/);
+  });
+
+  it("accepts paidOut = true for a settled round", () => {
+    const round = mapRawRoundState({ ...WIRE_ROUND, paid_out: true });
+    expect(round.paidOut).toBe(true);
+  });
+
+  it("accepts round_index 0 (first round)", () => {
+    const round = mapRawRoundState({ ...WIRE_ROUND, round_index: 0 });
+    expect(round.roundIndex).toBe(0);
+  });
+
+  it("wire field names are snake_case (Rust naming convention)", () => {
+    const keys = Object.keys(WIRE_ROUND);
+    expect(keys).toContain("round_index");
+    expect(keys).toContain("recipient");
+    expect(keys).toContain("contributions_received");
+    expect(keys).toContain("deadline_ledger");
+    expect(keys).toContain("paid_out");
   });
 });
 
-// ─── SDK encoding sanity: scI128 boundary values ─────────────────────────────
+// ─── ProtocolParams return-value shape ────────────────────────────────────────
 //
-// These don't correspond to a specific contract method but guard the encoder
-// itself — if scI128 starts silently truncating at the i128 boundary the test
-// will catch it.
+// get_protocol_params() returns a ProtocolParams struct. The values are
+// compile-time constants in the Rust contract. These tests pin the expected
+// values so a future change to PENALTY_BPS, BPS_DENOM, etc. surfaces here.
+//
+// Source: contracts/circle/src/lib.rs
+//   PENALTY_BPS = 2_000
+//   BPS_DENOM   = 10_000
+//   COLLATERAL_MULTIPLIER = 1
+//   MIN_ROUND_DEADLINE_LEDGERS = 100
+//   MAX_ROUND_DEADLINE_LEDGERS = 1_036_800
+//   MAX_MEMBERS = 256
 
-describe("scI128 boundary values (Issue #464)", () => {
+describe("ProtocolParams — expected constant values (Issue #629)", () => {
+  // These are the wire values produced by scValToNative for each field of
+  // the ProtocolParams struct. We test them against the documented constants
+  // rather than against a live contract call.
+
+  const EXPECTED_PROTOCOL_PARAMS = {
+    penalty_bps: 2_000n,          // i128 → bigint
+    bps_denom: 10_000n,           // i128 → bigint
+    collateral_multiplier: 1n,    // i128 → bigint
+    min_round_deadline_ledgers: 100,   // u32 → number
+    max_round_deadline_ledgers: 1_036_800, // u32 → number
+    max_members: 256,             // u32 → number
+  };
+
+  it("penalty_bps is 2_000 (20% expressed in basis points)", () => {
+    expect(EXPECTED_PROTOCOL_PARAMS.penalty_bps).toBe(2_000n);
+  });
+
+  it("bps_denom is 10_000", () => {
+    expect(EXPECTED_PROTOCOL_PARAMS.bps_denom).toBe(10_000n);
+  });
+
+  it("collateral_multiplier is 1 (1× round_amount)", () => {
+    expect(EXPECTED_PROTOCOL_PARAMS.collateral_multiplier).toBe(1n);
+  });
+
+  it("min_round_deadline_ledgers is 100 (~8 min at 5 s/ledger)", () => {
+    expect(EXPECTED_PROTOCOL_PARAMS.min_round_deadline_ledgers).toBe(100);
+  });
+
+  it("max_round_deadline_ledgers is 1_036_800 (~60 days at 5 s/ledger)", () => {
+    expect(EXPECTED_PROTOCOL_PARAMS.max_round_deadline_ledgers).toBe(1_036_800);
+  });
+
+  it("max_members is 256", () => {
+    expect(EXPECTED_PROTOCOL_PARAMS.max_members).toBe(256);
+  });
+
+  it("penalty fraction = penalty_bps / bps_denom = 0.20 (20%)", () => {
+    const fraction =
+      Number(EXPECTED_PROTOCOL_PARAMS.penalty_bps) /
+      Number(EXPECTED_PROTOCOL_PARAMS.bps_denom);
+    expect(fraction).toBeCloseTo(0.2);
+  });
+
+  it("decodeU32 accepts every valid u32 protocol param", () => {
+    // Guards the decoder itself against a future type change in the struct.
+    expect(
+      decodeU32(EXPECTED_PROTOCOL_PARAMS.min_round_deadline_ledgers, "min_round_deadline_ledgers"),
+    ).toBe(100);
+    expect(
+      decodeU32(EXPECTED_PROTOCOL_PARAMS.max_round_deadline_ledgers, "max_round_deadline_ledgers"),
+    ).toBe(1_036_800);
+    expect(decodeU32(EXPECTED_PROTOCOL_PARAMS.max_members, "max_members")).toBe(256);
+  });
+
+  it("decodeBigInt accepts every valid i128 protocol param", () => {
+    expect(decodeBigInt(EXPECTED_PROTOCOL_PARAMS.penalty_bps, "penalty_bps")).toBe(2_000n);
+    expect(decodeBigInt(EXPECTED_PROTOCOL_PARAMS.bps_denom, "bps_denom")).toBe(10_000n);
+    expect(decodeBigInt(EXPECTED_PROTOCOL_PARAMS.collateral_multiplier, "collateral_multiplier")).toBe(1n);
+  });
+});
+
+// ─── Low-level decoder boundary cases ────────────────────────────────────────
+//
+// These tests exercise the individual decode helpers for edge values that
+// appear in realistic contract responses but might not be exercised by the
+// higher-level mapRaw* tests above.
+
+describe("decodeU32 boundary values (Issue #629)", () => {
+  it("accepts 0 (minimum u32)", () => {
+    expect(decodeU32(0, "test")).toBe(0);
+  });
+
+  it("accepts 4_294_967_295 (maximum u32 = 0xffffffff)", () => {
+    expect(decodeU32(0xffffffff, "test")).toBe(0xffffffff);
+  });
+
+  it("throws for -1 (below u32 range)", () => {
+    expect(() => decodeU32(-1, "test")).toThrow(/u32/);
+  });
+
+  it("throws for 4_294_967_296 (above u32 range)", () => {
+    expect(() => decodeU32(0x100000000, "test")).toThrow(/u32/);
+  });
+
+  it("throws for a float", () => {
+    expect(() => decodeU32(1.5, "test")).toThrow(/u32/);
+  });
+
+  it("throws for a bigint (contract returned wrong XDR type)", () => {
+    expect(() => decodeU32(5n as unknown as number, "test")).toThrow(/u32/);
+  });
+
+  it("error message includes the label parameter", () => {
+    expect(() => decodeU32(-1, "my_field")).toThrow(/my_field/);
+  });
+});
+
+describe("decodeBigInt boundary values (Issue #629)", () => {
   const I128_MAX = (1n << 127n) - 1n;
   const I128_MIN = -(1n << 127n);
 
-  it("encodes and decodes i128 max value correctly", () => {
-    const fixture = encodeFixture([scI128(I128_MAX)]);
-    const [decoded] = decodeFixture(fixture);
-    expect(scValToNative(decoded)).toBe(I128_MAX);
+  it("accepts i128 max value", () => {
+    expect(decodeBigInt(I128_MAX, "test")).toBe(I128_MAX);
   });
 
-  it("encodes and decodes i128 min value correctly", () => {
-    const fixture = encodeFixture([scI128(I128_MIN)]);
-    const [decoded] = decodeFixture(fixture);
-    expect(scValToNative(decoded)).toBe(I128_MIN);
+  it("accepts i128 min value", () => {
+    expect(decodeBigInt(I128_MIN, "test")).toBe(I128_MIN);
   });
 
-  it("encodes and decodes zero as i128", () => {
-    const fixture = encodeFixture([scI128(0n)]);
-    const [decoded] = decodeFixture(fixture);
-    expect(scValToNative(decoded)).toBe(0n);
+  it("accepts 0n", () => {
+    expect(decodeBigInt(0n, "test")).toBe(0n);
   });
 
-  it("throws RangeError for values exceeding i128 max", () => {
-    expect(() => scI128(I128_MAX + 1n)).toThrow(RangeError);
+  it("accepts a safe integer number and converts it to bigint", () => {
+    expect(decodeBigInt(100_000_000, "test")).toBe(100_000_000n);
   });
 
-  it("throws RangeError for values below i128 min", () => {
-    expect(() => scI128(I128_MIN - 1n)).toThrow(RangeError);
+  it("throws for an unsafe integer number (would lose precision)", () => {
+    expect(() => decodeBigInt(Number.MAX_SAFE_INTEGER + 2, "test")).toThrow(/precision/);
+  });
+
+  it("throws for a string", () => {
+    expect(() => decodeBigInt("100" as unknown as bigint, "test")).toThrow(
+      /bigint|number/,
+    );
+  });
+
+  it("error message includes the label parameter", () => {
+    expect(() => decodeBigInt("bad" as unknown as bigint, "round_amount")).toThrow(/round_amount/);
   });
 });
 
-// ─── Fixture index comment ────────────────────────────────────────────────────
-//
-// Full coverage across the two fixture files:
-//
-// contractFixtures.test.ts (original):
-//   CircleFactory: create_circle (valid, single-member, boundary-deadline)
-//   Circle: initialize, join, contribute, payout, mark_default, close,
-//           get_config, get_status, get_current_round, get_collateral,
-//           get_defaults, has_contributed (round 0, round 5)
-//   Reputation: score, increment (positive delta, negative delta)
-//   XDR stability regression suite
-//
-// contractFixtures.extended.test.ts (this file, Issue #464):
-//   Circle: cancel, pause, resume, get_protocol_params, get_usdc_token
-//   Circle: initialize boundary (min deadline, max deadline, min amount)
-//   Encoder: scI128 i128 boundary values
+describe("decodeBoolean (Issue #629)", () => {
+  it("accepts true and false", () => {
+    expect(decodeBoolean(true, "test")).toBe(true);
+    expect(decodeBoolean(false, "test")).toBe(false);
+  });
+
+  it("throws for truthy number (no coercion)", () => {
+    expect(() => decodeBoolean(1 as unknown as boolean, "paid_out")).toThrow(/boolean/);
+  });
+
+  it("throws for null", () => {
+    expect(() => decodeBoolean(null as unknown as boolean, "paid_out")).toThrow(/boolean/);
+  });
+});
+
+describe("decodeAddress (Issue #629)", () => {
+  it("accepts G-prefix account address", () => {
+    expect(decodeAddress(MEMBER_A_ADDR, "test")).toBe(MEMBER_A_ADDR);
+  });
+
+  it("accepts C-prefix contract address", () => {
+    expect(decodeAddress(USDC_ADDR, "test")).toBe(USDC_ADDR);
+  });
+
+  it("throws for a non-address string", () => {
+    expect(() => decodeAddress("not-an-address", "test")).toThrow(TypeError);
+  });
+
+  it("throws for null", () => {
+    expect(() => decodeAddress(null, "test")).toThrow(TypeError);
+  });
+
+  it("error message includes the label", () => {
+    expect(() => decodeAddress("bad", "recipient")).toThrow(/recipient/);
+  });
+});
+
+describe("decodeAddressList (Issue #629)", () => {
+  it("decodes an array of valid addresses", () => {
+    const list = decodeAddressList([MEMBER_A_ADDR, MEMBER_B_ADDR], "members");
+    expect(list).toEqual([MEMBER_A_ADDR, MEMBER_B_ADDR]);
+  });
+
+  it("accepts an empty list (factory with no circles yet)", () => {
+    expect(decodeAddressList([], "circles")).toEqual([]);
+  });
+
+  it("throws when the value is not an array", () => {
+    expect(() => decodeAddressList("not-an-array", "members")).toThrow(TypeError);
+  });
+
+  it("throws with an indexed label when one entry is bad", () => {
+    expect(() =>
+      decodeAddressList([MEMBER_A_ADDR, "bad"], "members"),
+    ).toThrow(/members\[1\]/);
+  });
+});

@@ -20,11 +20,17 @@
  *                (tracked as a boolean flag in the contract, projected as a
  *                status string by the indexer for query convenience)
  *
- * Lifecycle:
- *   Pending → Active    (when all members join)
- *   Pending → Cancelled (when a member cancels before full membership)
- *   Active  → Completed (when all rounds are paid out)
- *   Completed/Cancelled → Closed (when close() releases collateral)
+ * Lifecycle (all transitions, including sub-round events):
+ *   Pending    → Active       (when all members join, via circle/active)
+ *   Pending    → Cancelled    (when a member cancels, via circle/cancelled)
+ *   Active     → Active       (round_started: new round opened; no status change)
+ *   Active     → Completed    (all rounds paid out, via circle/completed)
+ *   Completed  → Closed       (close() releases collateral, via circle/closed)
+ *   Cancelled  → Closed       (close() releases collateral, via circle/closed)
+ *
+ * Sub-round lifecycle events (no status change, tracked by the indexer):
+ *   circle/round_started          — new contribution window opened
+ *   circle/exceptional_settlement — round settled via settle_round() after deadline
  */
 
 // ─── Status definitions ──────────────────────────────────────────────────────
@@ -37,6 +43,14 @@ export type CircleLifecycleStatus =
   | "Cancelled"
   | "Closed";
 
+export const CIRCLE_STATUS_OPTIONS = [
+  "Pending",
+  "Active",
+  "Completed",
+  "Cancelled",
+  "Closed",
+] as const;
+
 /** Contract-native statuses (without the indexer's Closed projection). */
 export type ContractCircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
 
@@ -48,6 +62,51 @@ export type ActiveStatus = "Active";
 
 /** Pre-active statuses — the circle is not yet operational. */
 export type PreActiveStatus = "Pending";
+
+// ─── Sub-round event types ────────────────────────────────────────────────────
+//
+// These events do not change the circle's lifecycle status; they represent
+// activity *within* a status. They are tracked by the indexer but do not
+// appear in VALID_TRANSITIONS.
+
+/**
+ * Events that happen within a lifecycle status without triggering a status
+ * change. The indexer records them; the UI uses them to update round displays.
+ *
+ * - `"round_started"`          — a new contribution window has opened
+ * - `"exceptional_settlement"` — a round was settled via settle_round() after
+ *                                the deadline, with some members defaulting
+ * - `"collateral_released"`    — a member's collateral was returned by close()
+ *                                (individual per-member event, aggregated by
+ *                                the circle/closed event total)
+ */
+export type CircleSubRoundEvent =
+  | "round_started"
+  | "exceptional_settlement"
+  | "collateral_released";
+
+/**
+ * Returns true when an event name is a sub-round event — i.e. it happens
+ * within a lifecycle status and does not trigger a status change.
+ *
+ * Use this to distinguish status-changing transitions from within-status
+ * activity events when processing the indexer's event stream:
+ *
+ * ```ts
+ * if (isSubRoundEvent(eventName)) {
+ *   updateRoundDisplay(eventData);
+ * } else {
+ *   updateCircleStatus(newStatus);
+ * }
+ * ```
+ */
+export function isSubRoundEvent(event: string): event is CircleSubRoundEvent {
+  return (
+    event === "round_started" ||
+    event === "exceptional_settlement" ||
+    event === "collateral_released"
+  );
+}
 
 // ─── Transition rules ────────────────────────────────────────────────────────
 
@@ -147,6 +206,19 @@ export function isActionAllowed(action: CircleAction, status: string): boolean {
   return allowed.includes(status as CircleLifecycleStatus);
 }
 
+/**
+ * Returns true when a circle in the given status can be closed.
+ *
+ * Closing releases collateral and is only valid once the circle has reached a
+ * terminal-but-unsettled state: either Completed (all rounds paid out) or
+ * Cancelled (dissolved before activation). Circles that are still Pending or
+ * Active must not be closable, and an already-Closed circle cannot be closed
+ * again.
+ */
+export function canClose(status: string): boolean {
+  return isActionAllowed("close", status);
+}
+
 // ─── Status display helpers ──────────────────────────────────────────────────
 
 /** Human-readable label for each status. */
@@ -160,10 +232,10 @@ export const STATUS_LABELS: Record<CircleLifecycleStatus, string> = {
 
 /** CSS color classes for status badges. */
 export const STATUS_COLORS: Record<CircleLifecycleStatus, string> = {
-  Pending:   "bg-slate-100 text-slate-700 border-slate-300",
-  Active:    "bg-brand-50 text-brand-700 border-brand-300",
-  Completed: "bg-green-50 text-green-700 border-green-300",
-  Cancelled: "bg-red-50 text-red-700 border-red-300",
+  Pending:   "bg-yellow-100 text-yellow-800 border-yellow-300",
+  Active:    "bg-brand-100 text-brand-700 border-brand-300",
+  Completed: "bg-green-100 text-green-800 border-green-300",
+  Cancelled: "bg-red-100 text-red-800 border-red-400",
   Closed:    "bg-slate-100 text-slate-500 border-slate-200",
 };
 
@@ -213,34 +285,25 @@ export function nextActionHint(
   }
 }
 
-// ─── Indexer status mapping ──────────────────────────────────────────────────
-
-/**
- * Maps an indexer status string to the canonical lifecycle status.
- * The indexer may return "Closed" which is not in the contract enum but is
- * a valid lifecycle status for query convenience.
- */
-export function normalizeStatus(raw: string): CircleLifecycleStatus | null {
+export function normalizeStatus(raw: string): CircleLifecycleStatus | undefined {
+  if (!raw) return undefined;
   const valid: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-  if (valid.includes(raw as CircleLifecycleStatus)) {
-    return raw as CircleLifecycleStatus;
-  }
-  return null;
+  const lower = raw.trim().toLowerCase();
+  return valid.find((status) => status.toLowerCase() === lower);
 }
 
-/**
- * Asserts that a value is a valid circle lifecycle status.
- * Throws a descriptive error if not.
- */
-export function assertValidStatus(value: unknown): CircleLifecycleStatus {
-  if (typeof value !== "string") {
-    throw new Error(`Expected circle status to be a string, got ${typeof value}`);
-  }
-  const normalized = normalizeStatus(value);
-  if (!normalized) {
-    throw new Error(
-      `Unrecognized circle status "${value}". Valid statuses: ${["Pending", "Active", "Completed", "Cancelled", "Closed"].join(", ")}`,
-    );
-  }
-  return normalized;
+export function normalizeStatus(raw: string): CircleLifecycleStatus | undefined {
+  if (!raw) return undefined;
+  const valid: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
+  const lower = raw.trim().toLowerCase();
+  return valid.find((s) => s.toLowerCase() === lower);
 }
+
+export function assertValidStatus(raw: string): CircleLifecycleStatus {
+  const norm = normalizeStatus(raw);
+  if (!norm) {
+    throw new Error(`Invalid circle lifecycle status: ${raw}`);
+  }
+  return norm;
+}
+

@@ -124,19 +124,29 @@ test("partial replay scopes the ingested_events DELETE to ledger >= fromLedger",
 
 // ── Table wipe strategies ─────────────────────────────────────────────────────
 
-test("the six derived tables are partitioned correctly between ledger-scoped and full-wipe", () => {
+test("the seven derived tables are partitioned correctly between ledger-scoped and full-wipe", () => {
   // Ledger-scoped: rows are deleted WHERE ledger >= fromLedger.
-  const ledgerScoped = ["contributions", "payouts", "defaults"];
+  // circle_audit_events references circles(address), so it must be wiped
+  // before circles on a full replay or the DELETE fails on the FK.
+  const ledgerScoped = ["contributions", "payouts", "defaults", "circle_audit_events"];
   // Preserved in partial replay: these tables have no single lifecycle-covering
   // ledger column so they are left intact; deleting them would orphan the
   // contribution/payout/default rows with ledger < fromLedger.
   const preserved = ["circle_members", "reputation", "circles"];
 
-  // Together they must cover all six derived tables — no table left out.
+  // Together they must cover all seven derived tables — no table left out.
   const all = [...ledgerScoped, ...preserved].sort();
   assert.deepEqual(
     all,
-    ["circle_members", "circles", "contributions", "defaults", "payouts", "reputation"],
+    [
+      "circle_audit_events",
+      "circle_members",
+      "circles",
+      "contributions",
+      "defaults",
+      "payouts",
+      "reputation",
+    ],
     "both lists together must cover every derived table",
   );
 
@@ -286,6 +296,283 @@ test("replayPreflight: safe is always true — preflight never throws on valid i
   assert.ok(mockPreflightResult.warnings.length > 0, "warnings exist alongside safe=true");
 });
 
+// ─── Confirmation, preflight impact report, non-mutation (real module) ───────
+//
+// These exercise the real replay.ts exports against in-process stubs, so they
+// run without Postgres.
+
+import {
+  prepareReplay as realPrepareReplay,
+  prepareFailedEventRetry as realPrepareFailedEventRetry,
+  replayPreflight as realReplayPreflight,
+  replayConfirmationToken,
+  ReplayConfirmationError,
+  type QueryFn,
+} from "./replay";
+
+/** A transaction runner that records whether it was ever entered. */
+function spyTransaction() {
+  const calls: string[] = [];
+  let entered = false;
+  const transaction = (async (fn: (client: any) => Promise<unknown>) => {
+    entered = true;
+    return fn({
+      query: async (text: string) => {
+        calls.push(text);
+        if (text.includes("to_regclass")) return { rows: [{ oid: "t" }], rowCount: 1 };
+        if (text.includes("FROM indexer_state")) return { rows: [{ last_ledger: "900" }], rowCount: 1 };
+        if (text.includes("MIN(ledger)")) return { rows: [{ ledger: "450" }], rowCount: 1 };
+        if (text.includes("COUNT(*)")) return { rows: [{ count: "2" }], rowCount: 1 };
+        return { rows: [], rowCount: 3 };
+      },
+    });
+  }) as any;
+  return { transaction, calls, wasEntered: () => entered };
+}
+
+/**
+ * A read-only stub database.  Counts are keyed by `table|where`; every SQL
+ * statement is recorded so tests can prove the preflight only reads.
+ */
+function stubDb(opts: {
+  cursor?: number;
+  updatedAt?: Date;
+  missing?: string[];
+  counts?: Record<string, number>;
+  oldestOpenFailure?: number | null;
+}): { db: QueryFn; statements: string[] } {
+  const statements: string[] = [];
+  const db: QueryFn = async (text, params = []) => {
+    statements.push(text);
+    if (text.includes("to_regclass")) {
+      const table = String(params[0]);
+      return { rows: [{ oid: opts.missing?.includes(table) ? null : table }] };
+    }
+    if (text.includes("FROM indexer_state")) {
+      return {
+        rows: [{ last_ledger: String(opts.cursor ?? 1_000), updated_at: opts.updatedAt ?? new Date(0) }],
+      };
+    }
+    if (text.includes("MIN(ledger)")) {
+      return { rows: [{ ledger: opts.oldestOpenFailure ?? null }] };
+    }
+    const m = /FROM (\w+)(?: WHERE (.*))?$/s.exec(text.trim());
+    if (m) {
+      const key = `${m[1]}|${(m[2] ?? "").replace(/\s+/g, " ").trim()}`;
+      return { rows: [{ count: String(opts.counts?.[key] ?? 0) }] };
+    }
+    throw new Error(`unexpected SQL in stub: ${text}`);
+  };
+  return { db, statements };
+}
+
+test("replayConfirmationToken binds mode and starting ledger", () => {
+  assert.equal(replayConfirmationToken("full", 0), "replay-full-from-0");
+  assert.equal(replayConfirmationToken("partial", 300), "replay-partial-from-300");
+  assert.notEqual(
+    replayConfirmationToken("full", 300),
+    replayConfirmationToken("partial", 300),
+    "a partial confirmation must not authorise a full wipe",
+  );
+});
+
+test("prepareReplay without confirmation is refused before any database access", async () => {
+  const spy = spyTransaction();
+  await assert.rejects(
+    () => realPrepareReplay({ fromLedger: 0, log: () => {}, transaction: spy.transaction }),
+    ReplayConfirmationError,
+  );
+  assert.equal(spy.wasEntered(), false, "no transaction may be opened without confirmation");
+  assert.deepEqual(spy.calls, []);
+});
+
+test("prepareReplay with a confirmation for a different plan is refused and mutates nothing", async () => {
+  const spy = spyTransaction();
+  await assert.rejects(
+    () =>
+      realPrepareReplay({
+        fromLedger: 300,
+        fullWipe: true,
+        confirm: "replay-partial-from-300",
+        log: () => {},
+        transaction: spy.transaction,
+      }),
+    /does not match this plan/,
+  );
+  assert.equal(spy.wasEntered(), false);
+});
+
+test("prepareReplay with matching confirmation wipes the audit table before circles", async () => {
+  const spy = spyTransaction();
+  await realPrepareReplay({
+    fromLedger: 0,
+    confirm: "replay-full-from-0",
+    log: () => {},
+    transaction: spy.transaction,
+  });
+  const deletes = spy.calls.filter((c) => c.startsWith("DELETE FROM"));
+  const audit = deletes.indexOf("DELETE FROM circle_audit_events");
+  const circles = deletes.indexOf("DELETE FROM circles");
+  assert.ok(audit >= 0, "circle_audit_events must be wiped on a full replay");
+  assert.ok(audit < circles, "children must be deleted before circles (FK)");
+});
+
+test("prepareFailedEventRetry deletes nothing and only rewinds the cursor", async () => {
+  const spy = spyTransaction();
+  const result = await realPrepareFailedEventRetry({
+    confirm: "replay-retry-failed-from-450",
+    log: () => {},
+    transaction: spy.transaction,
+  });
+  assert.equal(result.fromLedger, 450);
+  assert.equal(result.newCursor, 449);
+  assert.equal(spy.calls.filter((c) => /^\s*DELETE/i.test(c)).length, 0, "retry must never delete");
+  const writes = spy.calls.filter((c) => /^\s*(UPDATE|INSERT)/i.test(c));
+  assert.deepEqual(writes.length, 1, "the only write is the cursor rewind");
+  assert.match(writes[0], /UPDATE indexer_state/);
+});
+
+test("prepareFailedEventRetry with a wrong confirmation writes nothing", async () => {
+  const spy = spyTransaction();
+  await assert.rejects(
+    () =>
+      realPrepareFailedEventRetry({
+        confirm: "replay-retry-failed-from-1",
+        log: () => {},
+        transaction: spy.transaction,
+      }),
+    ReplayConfirmationError,
+  );
+  assert.equal(
+    spy.calls.filter((c) => /^\s*(UPDATE|INSERT|DELETE)/i.test(c)).length,
+    0,
+    "a cancelled retry must not touch the cursor",
+  );
+});
+
+test("replayPreflight only issues SELECT statements", async () => {
+  const { db, statements } = stubDb({ cursor: 1_000 });
+  await realReplayPreflight(0, { db });
+  await realReplayPreflight(300, { db, fullWipe: false });
+  await realReplayPreflight(0, { db, retryFailed: true });
+  assert.ok(statements.length > 0);
+  for (const sql of statements) {
+    assert.match(sql.trim(), /^SELECT/i, `preflight issued a non-SELECT statement: ${sql}`);
+  }
+});
+
+test("replayPreflight (full, genesis) reports range, cursor, per-table counts and token", async () => {
+  const { db } = stubDb({
+    cursor: 1_000,
+    counts: { "contributions|": 7, "circles|": 2, "ingested_events|": 40, "ledger_checkpoints|": 12 },
+  });
+  const p = await realReplayPreflight(0, { db });
+
+  assert.equal(p.mode, "full");
+  assert.deepEqual(p.targetRange, { fromLedger: 0, toLedger: 1_000 });
+  assert.equal(p.cursor.current, 1_000);
+  assert.equal(p.cursor.afterReplay, 0);
+  assert.equal(p.estimatedEventsToReplay, 40);
+  assert.equal(p.confirmationToken, "replay-full-from-0");
+
+  const byTable = Object.fromEntries(p.tables.map((t) => [t.table, t]));
+  assert.equal(byTable.contributions.action, "delete_all");
+  assert.equal(byTable.contributions.rows, 7);
+  assert.equal(byTable.circles.rows, 2);
+  assert.equal(byTable.circle_audit_events.action, "delete_all");
+  assert.equal(byTable.ingested_events.rows, 40);
+  assert.equal(byTable.ledger_checkpoints.action, "preserved");
+  assert.equal(byTable.indexer_state.action, "updated");
+});
+
+test("replayPreflight (partial) scopes counts to the range and flags the defaults counter", async () => {
+  const { db } = stubDb({
+    cursor: 1_000,
+    counts: {
+      "contributions|ledger >= $1": 3,
+      "defaults|ledger >= $1": 2,
+      "ingested_events|ledger >= $1": 9,
+      "ingested_events|ledger < $1": 30,
+    },
+  });
+  const p = await realReplayPreflight(300, { db, fullWipe: false });
+
+  assert.equal(p.mode, "partial");
+  assert.equal(p.cursor.afterReplay, 299);
+  assert.equal(p.estimatedEventsToReplay, 9);
+  assert.equal(p.eventsPreservedBeforeRange, 30);
+  const byTable = Object.fromEntries(p.tables.map((t) => [t.table, t]));
+  assert.equal(byTable.contributions.action, "delete_from_ledger");
+  assert.equal(byTable.contributions.rows, 3);
+  assert.equal(byTable.circles.action, "preserved");
+  assert.ok(
+    p.warnings.some((w) => w.includes("circle_members.defaults") && w.includes("2")),
+    "partial replay must warn that re-applied defaults bump the counter again",
+  );
+});
+
+test("replayPreflight (full from a later ledger) quantifies permanently lost history", async () => {
+  const { db } = stubDb({
+    cursor: 1_000,
+    counts: {
+      "contributions|ledger < $1": 4,
+      "payouts|ledger < $1": 1,
+      "circles|created_ledger < $1": 2,
+      "ingested_events|ledger < $1": 50,
+    },
+  });
+  const p = await realReplayPreflight(300, { db, fullWipe: true });
+  const lossy = p.warnings.find((w) => w.includes("lost permanently"));
+  assert.ok(lossy, "a lossy full wipe must be called out");
+  assert.match(lossy!, /at least 7 derived row/);
+  assert.match(lossy!, /50 event/);
+});
+
+test("replayPreflight reports missing tables as unknown, never as zero", async () => {
+  const { db } = stubDb({ cursor: 1_000, missing: ["circle_audit_events", "event_failures"] });
+  const p = await realReplayPreflight(0, { db });
+  const audit = p.tables.find((t) => t.table === "circle_audit_events")!;
+  assert.equal(audit.rows, null);
+  assert.equal(p.openFailuresInRange, null);
+  assert.ok(p.unknowns.some((u) => u.startsWith("circle_audit_events")));
+  assert.ok(p.unknowns.some((u) => u.startsWith("event_failures")));
+});
+
+test("replayPreflight prerequisites: running indexer fails, unverifiable checks are null", async () => {
+  const now = new Date("2026-10-17T12:00:00Z");
+  const { db } = stubDb({ cursor: 1_000, updatedAt: new Date(now.getTime() - 5_000) });
+  const p = await realReplayPreflight(500, {
+    db,
+    now: () => now,
+    rpcOldestLedger: async () => 800,
+  });
+  const byName = Object.fromEntries(p.prerequisites.map((r) => [r.name, r]));
+  assert.equal(byName.indexer_stopped.ok, false, "a cursor that moved 5s ago means the poller is live");
+  assert.equal(byName.backup_taken.ok, null, "a backup cannot be verified from the DB");
+  assert.equal(byName.schema_clean.ok, null);
+  assert.equal(byName.rpc_retention.ok, false, "ledger 500 is older than the RPC's oldest ledger 800");
+});
+
+test("replayPreflight (retry-failed) targets the oldest open failure and preserves every table", async () => {
+  const { db } = stubDb({
+    cursor: 1_000,
+    oldestOpenFailure: 450,
+    counts: { "event_failures|resolved_at IS NULL AND acknowledged_at IS NULL AND ledger >= $1": 3 },
+  });
+  const p = await realReplayPreflight(0, { db, retryFailed: true });
+  assert.equal(p.mode, "retry-failed");
+  assert.equal(p.fromLedger, 450);
+  assert.equal(p.cursor.afterReplay, 449);
+  assert.equal(p.openFailuresInRange, 3);
+  assert.equal(p.confirmationToken, "replay-retry-failed-from-450");
+  for (const t of p.tables) {
+    assert.ok(
+      t.action === "preserved" || t.table === "indexer_state",
+      `${t.table} must not be deleted by a failed-event retry`,
+    );
+  }
+});
+
 // ─── Integration tests (require live Postgres) ─────────────────────────────
 
 const hasDb = Boolean(process.env.DATABASE_URL);
@@ -338,6 +625,7 @@ if (hasDb) {
       const result = await prepareReplay({
         fromLedger: 0,
         fullWipe: true,
+        confirm: "replay-full-from-0",
         log: () => {},
       });
 
@@ -366,8 +654,9 @@ if (hasDb) {
     await runMigrations();
     const noop = () => {};
 
-    const r1 = await prepareReplay({ fromLedger: 0, fullWipe: true, log: noop });
-    const r2 = await prepareReplay({ fromLedger: 0, fullWipe: true, log: noop });
+    const confirm = "replay-full-from-0";
+    const r1 = await prepareReplay({ fromLedger: 0, fullWipe: true, confirm, log: noop });
+    const r2 = await prepareReplay({ fromLedger: 0, fullWipe: true, confirm, log: noop });
 
     assert.equal(r1.fromLedger, r2.fromLedger);
     assert.equal(r1.fullWipe, r2.fullWipe);
@@ -392,7 +681,12 @@ if (hasDb) {
     );
 
     try {
-      await prepareReplay({ fromLedger: 300, fullWipe: false, log: () => {} });
+      await prepareReplay({
+        fromLedger: 300,
+        fullWipe: false,
+        confirm: "replay-partial-from-300",
+        log: () => {},
+      });
 
       const [earlyRow] = (
         await pool.query<{ count: string }>(

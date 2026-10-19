@@ -69,6 +69,7 @@ describe("CircleCard — status chip", () => {
     ["Pending", /Pending/],
     ["Completed", /Completed/],
     ["Cancelled", /Cancelled/],
+    ["Closed", /Closed/],
   ])("renders %s status chip", (status, pattern) => {
     render(<CircleCard circle={{ ...baseCircle, status }} />);
     expect(screen.getByText(pattern)).toBeInTheDocument();
@@ -77,6 +78,28 @@ describe("CircleCard — status chip", () => {
   it("falls back gracefully for unknown status", () => {
     render(<CircleCard circle={{ ...baseCircle, status: "Weird" }} />);
     expect(screen.getByText("Weird")).toBeInTheDocument();
+  });
+
+  it("unknown status chip has accessible description mentioning unrecognized", () => {
+    render(<CircleCard circle={{ ...baseCircle, status: "Weird" }} />);
+    const chip = document.querySelector('span[aria-label^="Status: Weird"]');
+    expect(chip).not.toBeNull();
+    expect(chip?.getAttribute("aria-label")).toMatch(/Unrecognized/i);
+  });
+
+  it("Closed status chip is visually distinct (slate, not a primary color)", () => {
+    render(<CircleCard circle={{ ...baseCircle, status: "Closed" }} />);
+    // The chip span carries aria-label "Status: Closed. ..." — target it directly
+    const chip = document.querySelector('span[aria-label^="Status: Closed"]');
+    expect(chip).not.toBeNull();
+    expect(chip?.className).toMatch(/slate/);
+  });
+
+  it("Completed status chip uses green (success semantics)", () => {
+    render(<CircleCard circle={{ ...baseCircle, status: "Completed" }} />);
+    const chip = document.querySelector('span[aria-label^="Status: Completed"]');
+    expect(chip).not.toBeNull();
+    expect(chip?.className).toMatch(/green/);
   });
 });
 
@@ -125,9 +148,32 @@ describe("getStatusMeta", () => {
     expect(getStatusMeta("Active").label).toBe("Active");
   });
 
+  it("returns known meta for all 5 valid statuses", () => {
+    expect(getStatusMeta("Pending").label).toBe("Pending");
+    expect(getStatusMeta("Active").label).toBe("Active");
+    expect(getStatusMeta("Completed").label).toBe("Completed");
+    expect(getStatusMeta("Cancelled").label).toBe("Cancelled");
+    expect(getStatusMeta("Closed").label).toBe("Closed");
+  });
+
+  it("Closed has slate chip classes (visually de-emphasized)", () => {
+    expect(getStatusMeta("Closed").chipClasses).toMatch(/slate/);
+  });
+
+  it("Completed uses green chip classes (success semantics)", () => {
+    expect(getStatusMeta("Completed").chipClasses).toMatch(/green/);
+  });
+
   it("returns unknown fallback for unrecognised status", () => {
     const meta = getStatusMeta("bogus");
     expect(meta.label).toBe("bogus");
     expect(meta.chipClasses).toMatch(/slate/);
+    // Description should mention unrecognized so it's diagnosable
+    expect(meta.description).toMatch(/Unrecognized/i);
+  });
+
+  it("returns explicit Unknown label for empty string", () => {
+    const meta = getStatusMeta("");
+    expect(meta.label).toBe("Unknown");
   });
 });

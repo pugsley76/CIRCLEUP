@@ -1040,6 +1040,7 @@ mod prop_tests {
 
         // Pass the circle itself as the token — must panic
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &1_000_000i128,
             &circle_id,      // ← usdc_token == circle
@@ -1071,6 +1072,7 @@ mod prop_tests {
         members.push_back(Address::generate(&env));
 
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &1_000_000i128,
             &token_address,
@@ -1101,6 +1103,7 @@ mod prop_tests {
         members.push_back(Address::generate(&env));
 
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &1_000_000i128,
             &token_address,
@@ -1222,6 +1225,7 @@ mod prop_tests {
             };
 
             let result = circle.try_initialize(
+                &Address::generate(&env),
                 &members,
                 &round_amount,
                 &bad_token,

@@ -1,39 +1,108 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { INDEXER_URL, shortAddress } from "@/lib/config";
+import { indexerEndpoint, shortAddress } from "@/lib/config";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
 import { isCanonicalStellarAddress } from "@/lib/address";
+// Issue #513: ReputationResponse is now the shared type from circleTypes.ts.
+// parseReputationResponse validates the raw JSON at the network boundary
+// instead of the previous bare `as ReputationResponse` cast.
+import { type ReputationResponse, parseReputationResponse } from "@/lib/circleTypes";
 
-// ─── Local type definition ────────────────────────────────────────────────────
+// ─── Reputation event naming & total score semantics ──────────────────────────
 //
-// The app package does not depend on @circleup/sdk directly; types that mirror
-// indexer API shapes are declared here. Keep in sync with:
-//   sdk/src/types.ts → ApiReputationResponse
+// Issue #565: the indexer emits reputation events whose `type` field is a
+// free-form string. Historically the UI rendered that raw string verbatim,
+// which produced inconsistent, ambiguous labels (e.g. "tip_received" vs
+// "Tip Received" vs "tip") and made the running total impossible to audit.
+//
+// We normalise the raw event type to a canonical, human-readable label and
+// expose a single, well-defined total. The total is the sum of the signed
+// `delta` of every event; it is NOT the sum of the displayed magnitudes, so a
+// negative event (e.g. a slash) correctly reduces the total. This keeps the
+// displayed total consistent with the on-chain reputation score.
 
-/** @see ApiReputationResponse in sdk/src/types.ts */
-interface ReputationResponse {
-  member: string;
-  /** true when a reputation row exists; false means no activity recorded yet. */
-  found: boolean;
-  score: number;
-  contributions: Array<{
-    circle_address: string;
-    contributions: number;
-    total_rounds: number;
-  }>;
-  defaults: Array<{
-    circle_address: string;
-    count: number;
-  }>;
-  updatedAt: string | null;
+/** Canonical reputation event kinds, in the order they are documented. */
+export type ReputationEventKind =
+  | "tip_received"
+  | "tip_sent"
+  | "slash"
+  | "bonus"
+  | "unknown";
+
+/** Human-readable labels for each canonical event kind. */
+const EVENT_LABELS: Record<ReputationEventKind, string> = {
+  tip_received: "Tip received",
+  tip_sent: "Tip sent",
+  slash: "Slash",
+  bonus: "Bonus",
+  unknown: "Other activity",
+};
+
+/**
+ * Normalise a raw indexer event type into a canonical kind.
+ *
+ * The indexer has emitted several spellings over time (snake_case, kebab-case,
+ * and spaced variants). Mapping them here keeps the UI stable and unambiguous
+ * regardless of which spelling the indexer currently uses.
+ */
+export function normaliseEventKind(raw: string): ReputationEventKind {
+  const key = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  switch (key) {
+    case "tip_received":
+    case "tipreceived":
+    case "received_tip":
+      return "tip_received";
+    case "tip_sent":
+    case "tipsent":
+    case "sent_tip":
+      return "tip_sent";
+    case "slash":
+    case "slashed":
+    case "penalty":
+      return "slash";
+    case "bonus":
+    case "reward":
+      return "bonus";
+    default:
+      return "unknown";
+  }
+}
+
+/** Human-readable label for a raw event type. */
+export function eventLabel(raw: string): string {
+  return EVENT_LABELS[normaliseEventKind(raw)];
+}
+
+/**
+ * Compute the reputation total from a list of events.
+ *
+ * The total is the signed sum of every event's `delta`. Events with a
+ * non-finite delta are ignored rather than poisoning the total with NaN, so a
+ * single malformed event cannot silently blank out the whole score.
+ */
+export function computeTotal(events: ReadonlyArray<{ delta: number }>): number {
+  return events.reduce(
+    (sum, e) => (Number.isFinite(e.delta) ? sum + e.delta : sum),
+    0,
+  );
 }
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
 type FetchResult =
   | { ok: true; data: ReputationResponse }
-  | { ok: false; reason: "not_found" | "network" | "unknown" | "aborted" };
+  | {
+      ok: false;
+      reason:
+        | "not_found"
+        | "network"
+        | "unknown"
+        | "aborted"
+        | "indexer_outage"
+        | "misconfigured"
+        | "malformed";
+    };
 
 async function fetchReputation(member: string, signal?: AbortSignal): Promise<FetchResult> {
   // Validate the route param before making any network request. A malformed
@@ -42,14 +111,25 @@ async function fetchReputation(member: string, signal?: AbortSignal): Promise<Fe
   if (!isCanonicalStellarAddress(member)) {
     return { ok: false, reason: "not_found" };
   }
+  // A misconfigured NEXT_PUBLIC_INDEXER_URL must not fall through to fetch():
+  // a scheme-less value is a relative URL here, so the request would hit this
+  // Next app, 404, and render "No reputation record found" for a real member.
+  const url = indexerEndpoint(["reputation", member]);
+  if (url === null) return { ok: false, reason: "misconfigured" };
   try {
-    const res = await fetch(`${INDEXER_URL}/reputation/${member}`, {
+    const res = await fetch(url, {
       cache: "no-store",
       signal,
     });
     if (res.status === 404) return { ok: false, reason: "not_found" };
+    if (res.status === 503) return { ok: false, reason: "indexer_outage" };
     if (!res.ok) return { ok: false, reason: "unknown" };
-    return { ok: true, data: (await res.json()) as ReputationResponse };
+    // Issue #513: validate the response shape before returning it as typed data.
+    // Structural errors return "malformed" so the UI displays explicit error messaging.
+    const rawJson = await res.json();
+    const parsed = parseReputationResponse(rawJson);
+    if (!parsed) return { ok: false, reason: "malformed" };
+    return { ok: true, data: parsed };
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
       return { ok: false, reason: "aborted" };
@@ -67,6 +147,10 @@ export default function ReputationClient({ member }: { member: string }) {
   );
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
+  // Tracks successful manual refreshes to announce completion to screen readers.
+  // Increments on each successful manual refresh; the sr-only live region uses
+  // this as a key so it remounts (and re-announces) on every new refresh.
+  const [refreshCount, setRefreshCount] = useState(0);
 
   const load = useCallback(
     async (isManual = false, signal?: AbortSignal) => {
@@ -75,7 +159,10 @@ export default function ReputationClient({ member }: { member: string }) {
       if (signal?.aborted) return;
       setResult(fetched);
       setLastRefreshed(new Date());
-      if (isManual) setRefreshing(false);
+      if (isManual) {
+        setRefreshing(false);
+        if (fetched.ok) setRefreshCount((c) => c + 1);
+      }
     },
     [member],
   );
@@ -129,7 +216,16 @@ export default function ReputationClient({ member }: { member: string }) {
     const errorMessages: Record<string, string> = {
       network: "The reputation service is unreachable. Check your connection and try again.",
       unknown: "An unexpected error occurred loading reputation data.",
+      indexer_outage:
+        "The indexer is running but currently degraded. Reputation data may be temporarily unavailable. Try again in a few minutes.",
+      misconfigured:
+        "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
+        "Set a valid indexer URL in app/.env.local and restart the server.",
+      malformed:
+        "Malformed reputation data received from server. The response payload structure is invalid.",
     };
+    // Retrying cannot fix a configuration error, so don't offer it.
+    const canRetry = result.reason !== "misconfigured";
 
     return (
       <div className="text-center py-16 text-slate-500">
@@ -138,13 +234,15 @@ export default function ReputationClient({ member }: { member: string }) {
         <p className="text-sm mt-1 text-slate-500">
           {errorMessages[result.reason] ?? errorMessages.unknown}
         </p>
-        <button
-          onClick={() => load(true)}
-          disabled={refreshing}
-          className="mt-4 text-sm text-brand-600 hover:underline disabled:opacity-50"
-        >
-          {refreshing ? "Retrying…" : "Try again"}
-        </button>
+        {canRetry && (
+          <button
+            onClick={() => load(true)}
+            disabled={refreshing}
+            className="mt-4 text-sm text-brand-600 hover:underline disabled:opacity-50"
+          >
+            {refreshing ? "Retrying…" : "Try again"}
+          </button>
+        )}
       </div>
     );
   }
@@ -153,8 +251,29 @@ export default function ReputationClient({ member }: { member: string }) {
 
   const { data } = result;
 
+  const events = data.events ?? [];
+  const total = events.length > 0 ? computeTotal(events) : data.score;
+  const isNoRecord = !data.found || (data.score === null && events.length === 0);
+
   return (
     <div className="max-w-xl mx-auto space-y-6">
+      {/*
+        Screen-reader announcement for manual refresh completion.
+      */}
+      {refreshCount > 0 && (
+        <span
+          key={refreshCount}
+          className="sr-only"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {isNoRecord
+            ? "Reputation data updated. No reputation record recorded yet."
+            : `Reputation data updated. Total score: ${total}.`}
+        </span>
+      )}
+
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>
@@ -173,115 +292,85 @@ export default function ReputationClient({ member }: { member: string }) {
             onClick={() => load(true)}
             disabled={refreshing}
             aria-label="Refresh reputation data"
-            className="inline-flex items-center gap-1.5 text-sm text-brand-600 hover:text-brand-800 disabled:opacity-50 transition-colors"
+            className="inline-flex items-center gap-1.5 text-sm text-brand-600 hover:underline disabled:opacity-50"
           >
-            <span
-              aria-hidden="true"
-              className={refreshing ? "animate-spin inline-block" : "inline-block"}
-            >
-              🔄
-            </span>
             {refreshing ? "Refreshing…" : "Refresh"}
           </button>
           {lastRefreshed && (
-            <p className="text-xs text-slate-400 mt-0.5">
-              Updated{" "}
-              {lastRefreshed.toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-              })}
+            <p className="text-xs text-slate-400 mt-1">
+              Updated {lastRefreshed.toLocaleTimeString()}
             </p>
           )}
         </div>
       </div>
 
-      {/* Score card */}
-      <div
-        className="bg-white rounded-xl border border-slate-200 p-6 text-center"
-        aria-label={`Reputation score: ${data.score}`}
-      >
-        <ReputationBadge score={data.score} size="lg" />
-        <p className="text-3xl font-bold text-slate-900 mt-3">{data.score}</p>
-        <p className="text-slate-500 text-sm">completed rounds</p>
-        {!data.found && (
-          <p className="text-xs text-slate-400 mt-2 italic">
-            No on-chain activity recorded yet.
+      {/* State display card */}
+      {isNoRecord ? (
+        <div className="rounded-lg border border-slate-200 bg-white p-6 text-center space-y-3">
+          <div className="text-3xl" aria-hidden="true">🌱</div>
+          <h2 className="text-lg font-semibold text-slate-800">No Reputation Record Yet</h2>
+          <p className="text-sm text-slate-600 max-w-md mx-auto">
+            {data.detail ??
+              "This address has no on-chain reputation record or circle participation history on CircleUp yet."}
           </p>
+          <div className="pt-2 flex justify-center">
+            <ReputationBadge score={null} />
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-slate-200 bg-white p-6 text-center">
+          <p className="text-sm text-slate-500">Total reputation score</p>
+          <p
+            className="text-4xl font-bold text-slate-900 mt-1"
+            aria-label={`Total reputation score: ${total}`}
+          >
+            {total ?? 0}
+          </p>
+          <p className="text-xs text-slate-400 mt-1">
+            {events.length > 0
+              ? "Signed sum of all reputation events."
+              : "On-chain reputation score recorded by contract."}
+          </p>
+        </div>
+      )}
+
+      {/* Event list */}
+      <div>
+        <h2 className="text-sm font-semibold text-slate-700 mb-2">
+          Reputation events
+        </h2>
+        {events.length === 0 ? (
+          <p className="text-sm text-slate-500">No reputation events recorded.</p>
+        ) : (
+          <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white">
+            {events.map((event, i) => (
+              <li
+                key={`${event.type}-${i}`}
+                className="flex items-center justify-between px-4 py-3"
+              >
+                <span className="text-sm text-slate-700">
+                  {eventLabel(event.type)}
+                </span>
+                <span
+                  className={
+                    event.delta >= 0
+                      ? "text-sm font-medium text-emerald-600"
+                      : "text-sm font-medium text-red-600"
+                  }
+                >
+                  {event.delta >= 0 ? `+${event.delta}` : event.delta}
+                </span>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
 
-      {/* Circle participation */}
-      {data.contributions.length > 0 && (
-        <div className="bg-white rounded-xl border border-slate-200 p-5">
-          <h2 className="font-semibold text-slate-800 mb-3">
-            Circle participation
-          </h2>
-          <div
-            className="space-y-2"
-            role="list"
-            aria-label="Circles this member has participated in"
-          >
-            {data.contributions.map((c) => (
-              <div
-                key={c.circle_address}
-                role="listitem"
-                className="flex items-center justify-between text-sm"
-              >
-                <span
-                  className="font-mono text-slate-600 text-xs"
-                  title={c.circle_address}
-                  aria-label={`Circle ${c.circle_address}`}
-                >
-                  {shortAddress(c.circle_address)}
-                </span>
-                <span className="text-slate-500">
-                  <span aria-label={`${c.contributions} of ${c.total_rounds} rounds contributed`}>
-                    {c.contributions} / {c.total_rounds} rounds
-                  </span>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Defaults */}
-      {data.defaults.length > 0 && (
-        <div className="bg-red-50 border border-red-200 rounded-xl p-5">
-          <h2 className="font-semibold text-red-800 mb-3">Defaults</h2>
-          <div
-            className="space-y-2"
-            role="list"
-            aria-label="Circles where this member has defaulted"
-          >
-            {data.defaults.map((d) => (
-              <div
-                key={d.circle_address}
-                role="listitem"
-                className="flex items-center justify-between text-sm"
-              >
-                <span
-                  className="font-mono text-slate-600 text-xs"
-                  title={d.circle_address}
-                  aria-label={`Circle ${d.circle_address}`}
-                >
-                  {shortAddress(d.circle_address)}
-                </span>
-                <span
-                  className="text-red-700 font-medium"
-                  aria-label={`${d.count} default${d.count !== 1 ? "s" : ""}`}
-                >
-                  {d.count} default{d.count !== 1 ? "s" : ""}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Reputation badge legend */}
-      <ReputationLegend />
+      {/* Badge + legend */}
+      <div className="flex flex-col items-center gap-3">
+        {!isNoRecord && <ReputationBadge score={total} />}
+        <ReputationLegend />
+      </div>
     </div>
   );
 }

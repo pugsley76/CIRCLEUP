@@ -12,6 +12,7 @@ Thank you for helping build trustless savings circles for the world. Every contr
 - [Commit Style](#commit-style)
 - [Pull Request Process](#pull-request-process)
 - [Code Style](#code-style)
+- [Governance References](#governance-references)
 - [Definition of Done](#definition-of-done)
   - [How to use this section](#how-to-use-this-section)
   - [Scope A — Contract change (funds, guards, deadlines, protocol constants)](#scope-a--contract-change-funds-guards-deadlines-protocol-constants)
@@ -102,10 +103,12 @@ Types: `feat`, `fix`, `docs`, `test`, `chore`, `refactor`, `ci`, `build`
 
 1. Make sure CI passes (TypeScript build + Rust compile + ESLint)
 2. Keep PRs focused — one feature or fix per PR
-3. Update `CHANGELOG.md` under `[Unreleased]` with what you changed
+3. Update `CHANGELOG.md` under `[Unreleased]` with what you changed, following the issue reference format in the [Traceability Policy](./docs/TRACEABILITY_POLICY.md)
 4. Fill in the PR template, including the Definition of Done checklist for your scope
 5. Request a review from a maintainer
 6. PRs are squash-merged into `main`
+
+If your PR removes or renames a public interface (REST field, SDK export, contract event, error code), follow the notice and deprecation procedure in the [Deprecation Policy](./docs/DEPRECATION_POLICY.md) before merging.
 
 ---
 
@@ -116,6 +119,20 @@ Types: `feat`, `fix`, `docs`, `test`, `chore`, `refactor`, `ci`, `build`
 **TypeScript** — ESLint + Prettier. Run `npm run lint` before committing.
 
 **React** — Server components for data fetching, client components only where interactivity is needed. Keep `"use client"` boundaries minimal.
+
+---
+
+## Governance References
+
+These documents define standards that apply across the whole codebase. Read the
+one(s) relevant to your change before opening a PR.
+
+| Document | When to read it |
+|---|---|
+| [docs/DEPRECATION_POLICY.md](./docs/DEPRECATION_POLICY.md) | Before removing or renaming any REST field, SDK export, contract event topic/field, or error message |
+| [docs/DATA_DICTIONARY.md](./docs/DATA_DICTIONARY.md) | When adding or changing indexer schema columns, migrations, or API response fields; or to understand units, nullability, and rebuildability for any table |
+| [docs/DEPLOYMENT_LIFECYCLE.md](./docs/DEPLOYMENT_LIFECYCLE.md) | Before redeploying contracts to any network; defines how to archive superseded manifests and update profiles |
+| [docs/TRACEABILITY_POLICY.md](./docs/TRACEABILITY_POLICY.md) | Defines when issue numbers belong in test names, migration comments, CHANGELOG entries, and PR descriptions |
 
 ---
 
@@ -135,6 +152,7 @@ Reviewers: your job is to verify that evidence exists for each gate, not to re-r
 2. For each scope, work through its gate list and collect the evidence (command output, test names, migration filenames, etc.).
 3. Paste the evidence into the PR description under the corresponding scope heading.
 4. If you skip a gate, explain why in the PR description. Unexplained skips block merge.
+5. For CHANGELOG entries and test names, follow the [Traceability Policy](./docs/TRACEABILITY_POLICY.md) — issue references belong in the CHANGELOG bullet and in test names that cover non-obvious invariants or specific bug fixes.
 
 A change can touch multiple scopes. A contract change that also requires an indexer migration must satisfy both Scope A and Scope C.
 
@@ -219,6 +237,8 @@ Evidence required: rollback notes in the PR description, or confirmation that st
 
 Applies to modifications of `app/src/lib/gating.ts`, `app/src/lib/stellar.ts`, `app/src/lib/config.ts`, or any SDK package under `sdk/`.
 
+If your change removes or renames an exported symbol, a type, or an error message string, follow the [Deprecation Policy](./docs/DEPRECATION_POLICY.md) notice procedure before removing the old symbol.
+
 #### Success path gates
 
 **B1 — Gating mutation tests pass**
@@ -273,6 +293,8 @@ Evidence required: confirmation that stale_snapshot is the first gate for the ne
 ### Scope C — Indexer change (schema, events, API, migrations)
 
 Applies to modifications of anything under `indexer/src/`.
+
+For column units, nullability, uniqueness rules, source events, and API field names see the [Data Dictionary](./docs/DATA_DICTIONARY.md). If your change removes or renames a response field, follow the [Deprecation Policy](./docs/DEPRECATION_POLICY.md).
 
 #### Success path gates
 
@@ -488,6 +510,8 @@ Evidence required: revert-safety note in the PR description.
 ### Scope G — Deployment or infrastructure change
 
 Applies to modifications of `docker-compose.yml`, `Dockerfile` (if added), CI workflow files under `.github/`, environment variable schemas (`app/.env.example`, `indexer/.env.example`), or the runbook (`docs/RUNBOOK.md`).
+
+If your change involves redeploying contracts to any network, follow the [Deployment Lifecycle](./docs/DEPLOYMENT_LIFECYCLE.md) to archive the superseded manifest and update profiles before the new addresses go live.
 
 #### Success path gates
 

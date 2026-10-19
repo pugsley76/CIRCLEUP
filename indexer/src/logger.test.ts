@@ -35,6 +35,9 @@ import {
   logConfigMissing,
   logMigrationApplied,
   logMigrationFailed,
+  logApiRequest,
+  logApiRequestError,
+  logApiCorsRejected,
 } from "./logger";
 
 // ── Test spy factory ──────────────────────────────────────────────────────────
@@ -190,6 +193,21 @@ test("log: a throwing transport does not propagate the error", () => {
   assert.doesNotThrow(() => {
     log("info", "poll_completed", {});
   });
+});
+
+test("api request logging emits the expected structured event", () => {
+  const { entries, transport } = makeCollector();
+  configureLogger({ transport, minLevel: "debug" });
+
+  logApiRequest({ method: "GET", path: "/circles", statusCode: 200, durationMs: 12 });
+  logApiRequestError({ method: "GET", path: "/circles", statusCode: 500, error: "db unavailable" });
+  logApiCorsRejected({ method: "GET", path: "/health", origin: "https://evil.example.com" });
+
+  assert.equal(entries.length, 3);
+  assert.equal(entries[0].event, "api_request");
+  assert.equal(entries[1].event, "api_request_error");
+  assert.equal(entries[2].event, "api_cors_rejected");
+  assert.match(entries[1].msg ?? "", /db unavailable/);
 });
 
 // ── configureLogger / resetLogger ─────────────────────────────────────────────
@@ -446,3 +464,47 @@ test("log: bigint context values are serialisable to JSON", () => {
     );
   });
 });
+/**
+ * Issue #463: Structured log schema for CircleUp indexer lifecycle events.
+ *
+ * Replaces scattered `console.error` / `console.warn` / `console.log` calls
+ * with a single `log()` helper that emits machine-parseable JSON lines.
+ * Every event has a `level`, `msg`, and `ts` (ISO timestamp) field; optional
+ * contextual fields narrow to specific subtypes so log aggregators can filter
+ * and alert on individual lifecycle stages without string-matching.
+ *
+ * Levels follow the standard syslog-inspired scale:
+ *   debug   — high-frequency lifecycle chatter (event ingested, ledger advanced)
+ *   info    — normal operational milestones (indexer started, poll completed)
+ *   warn    — recoverable anomalies (transient RPC failure, backoff applied)
+ *   error   — non-fatal failures (event handler error, DB write failed for one event)
+ *   fatal   — process-level failures that will terminate (missing config, migration error)
+ *
+ * Transport: structured JSON to stdout by default, which is what log
+ * aggregators (CloudWatch Logs, Loki, Datadog, etc.) expect when running
+ * in a container. Override with `configureLogger({ transport })` to swap in
+ * a different sink (e.g. pino, winston, or a test spy).
+ *
+ * Privacy: addresses and transaction hashes are redacted via the shared
+ * `redactAddress` / `redactTxHash` helpers before being embedded in log fields.
+ * Raw Stellar addresses and full hashes must never appear in log output.
+ *
+ * Usage:
+ *   import { log } from "./logger";
+ *
+ *   log("info", "poll_completed", {
+ *     fromLedger: 1000,
+ *     toLedger: 1010,
+ *     eventsProcessed: 3,
+ *     eventsFailed: 0,
+ *     durationMs: 120,
+ *   });
+ *
+ *   log("warn", "rpc_retry", {
+ *     attempt: 2,
+ *     maxAttempts: 4,
+ *     delayMs: 1000,
+ *     error: "ECONNRESET",
+ *     label: "getEvents(factory+reputation)",
+ *   });
+ */

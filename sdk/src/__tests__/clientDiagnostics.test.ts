@@ -495,11 +495,18 @@ describe("formatRpcError — network error messages (via buildAndSend)", () => {
     vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockRejectedValue(
       new Error("Failed to fetch"),
     );
+    // A failed fetch may still have delivered the request, so the SDK looks
+    // the hash up; keep that lookup failing too.
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockRejectedValue(
+      new Error("Failed to fetch"),
+    );
+    vi.spyOn(Math, "random").mockReturnValue(0);
     const result = await new TestClient(SDK_CONFIG, FAST_POLL).call();
     expect(isTxFailure(result)).toBe(true);
     if (isTxFailure(result)) {
-      expect(result.errorCode).toBe("network_error");
+      expect(result.errorCode).toBe("outcome_unknown");
       expect(result.errorMessage).toMatch(/fetch|network/i);
+      expect(result.diagnostics?.lastError).toMatch(/fetch/i);
     }
   });
 
@@ -518,7 +525,8 @@ describe("formatRpcError — network error messages (via buildAndSend)", () => {
     const result = await new TestClient(SDK_CONFIG, FAST_POLL).call();
     expect(isTxFailure(result)).toBe(true);
     if (isTxFailure(result)) {
-      expect(result.errorCode).toBe("network_error");
+      // Submitted and accepted, then connectivity was lost: outcome unknown.
+      expect(result.errorCode).toBe("outcome_unknown");
       expect(result.errorMessage).toMatch(/connection refused/i);
     }
   });

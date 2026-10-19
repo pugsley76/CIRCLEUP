@@ -136,7 +136,10 @@ describe("buildAndSend — account loading", () => {
     expect(isTxFailure(result)).toBe(true);
     if (isTxFailure(result)) {
       expect(result.errorCode).toBe("network_error");
-      expect(result.errorMessage).toContain("ECONNREFUSED");
+      // withRpcRetry passes the error through formatRpcError, which rewrites
+      // the raw "ECONNREFUSED" into a human-readable "connection refused" message.
+      // Assert on the error code (stable) rather than the raw token.
+      expect(result.errorMessage).toMatch(/connection refused|network|ECONNREFUSED/i);
     }
   });
 });
@@ -205,8 +208,27 @@ describe("buildAndSend — submission", () => {
     );
   });
 
-  it("returns errorCode 'network_error' when sendTransaction throws", async () => {
+  it("returns errorCode 'network_error' when sendTransaction never reached the RPC", async () => {
     vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockRejectedValue(
+      new Error("connect ECONNREFUSED 127.0.0.1:8000"),
+    );
+    vi.spyOn(Math, "random").mockReturnValue(0); // no backoff between resends
+
+    const result = await makeClient().callBuildAndSend();
+
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorCode).toBe("network_error");
+      expect(result.errorMessage).toMatch(/connection refused/i);
+      expect(result.txHash).toBe("");
+    }
+  });
+
+  it("returns 'outcome_unknown' (not 'network_error') when a send may have been delivered", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockRejectedValue(
+      new Error("connection reset"),
+    );
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockRejectedValue(
       new Error("connection reset"),
     );
 
@@ -214,8 +236,10 @@ describe("buildAndSend — submission", () => {
 
     expect(isTxFailure(result)).toBe(true);
     if (isTxFailure(result)) {
-      expect(result.errorCode).toBe("network_error");
+      expect(result.errorCode).toBe("outcome_unknown");
       expect(result.errorMessage).toContain("connection reset");
+      expect(result.txHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(result.diagnostics?.submission).toBe("unknown");
     }
   });
 
@@ -276,7 +300,7 @@ describe("buildAndSend — confirmation polling", () => {
     }
   });
 
-  it("returns errorCode 'network_error' after 5 consecutive polling failures", async () => {
+  it("returns errorCode 'outcome_unknown' after 5 consecutive polling failures", async () => {
     vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockRejectedValue(
       new Error("RPC unreachable"),
     );
@@ -285,7 +309,10 @@ describe("buildAndSend — confirmation polling", () => {
 
     expect(isTxFailure(result)).toBe(true);
     if (isTxFailure(result)) {
-      expect(result.errorCode).toBe("network_error");
+      // The RPC accepted the transaction, so it may still confirm — this must
+      // not be reported with a code that invites a blind resubmission.
+      expect(result.errorCode).toBe("outcome_unknown");
+      expect(result.diagnostics?.submission).toBe("accepted");
       expect(result.errorMessage).toContain("RPC unreachable");
       // tx hash is still present (transaction was submitted)
       expect(result.txHash).toBe("TX_POLLING");

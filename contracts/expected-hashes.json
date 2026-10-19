@@ -6,8 +6,8 @@
   "target": "wasm32-unknown-unknown",
   "profile": "release",
   "artifacts": {
-    "reputation.wasm": "",
-    "circle_factory.wasm": "",
-    "circle.wasm": ""
+    "reputation.wasm": "c8919f9828b4da157d278779c2a024ded0565b7dfec7066eb76e891d8bd349e4",
+    "circle_factory.wasm": "89610a8735da34d9bebe4e0b6459dede6f95016a17ab08f595d779b44d3a394a",
+    "circle.wasm": "1de343ae6804f1cc09623fb7846fa030c3f7f3a03e1b81251ba07f3306a52d6c"
   }
 }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { connectWithRetry } from "./pool";
+import { connectWithRetry, queryOne, queryExact } from "./pool";
 
 function fakePool(failuresBeforeSuccess: number) {
   let calls = 0;
@@ -66,4 +66,85 @@ test("connectWithRetry surfaces a useful message for a refused-connection Aggreg
       return true;
     },
   );
+});
+
+// ── queryOne ──────────────────────────────────────────────────────────────────
+//
+// queryOne and queryExact call query() which calls pool.connect() internally.
+// We stub pool.connect() to return a fake client that replays canned rows,
+// so these unit tests run without a real Postgres instance.
+
+import * as poolModule from "./pool";
+
+function stubPoolConnect(rows: unknown[]) {
+  const original = (poolModule.pool as any).connect;
+  (poolModule.pool as any).connect = async () => ({
+    query: async () => ({ rows }),
+    release: () => {},
+  });
+  return () => { (poolModule.pool as any).connect = original; };
+}
+
+test("queryOne returns the first row when query returns results", async () => {
+  const restore = stubPoolConnect([{ id: 1 }, { id: 2 }]);
+  try {
+    const row = await queryOne<{ id: number }>("SELECT 1");
+    assert.deepEqual(row, { id: 1 });
+  } finally {
+    restore();
+  }
+});
+
+test("queryOne returns null when query returns an empty array", async () => {
+  const restore = stubPoolConnect([]);
+  try {
+    const row = await queryOne<{ id: number }>("SELECT 1");
+    assert.equal(row, null);
+  } finally {
+    restore();
+  }
+});
+
+// ── queryExact ────────────────────────────────────────────────────────────────
+
+test("queryExact returns the first row when query returns results", async () => {
+  const restore = stubPoolConnect([{ id: 42 }]);
+  try {
+    const row = await queryExact<{ id: number }>("SELECT 1");
+    assert.deepEqual(row, { id: 42 });
+  } finally {
+    restore();
+  }
+});
+
+test("queryExact throws with default message when query returns no rows", async () => {
+  const restore = stubPoolConnect([]);
+  try {
+    await assert.rejects(
+      () => queryExact<{ id: number }>("SELECT 1"),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /Expected exactly one row but got none/);
+        return true;
+      },
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("queryExact throws with custom message when provided", async () => {
+  const restore = stubPoolConnect([]);
+  try {
+    await assert.rejects(
+      () => queryExact<{ id: number }>("SELECT 1", [], "Circle not found"),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /Circle not found/);
+        return true;
+      },
+    );
+  } finally {
+    restore();
+  }
 });

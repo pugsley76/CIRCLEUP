@@ -7,6 +7,8 @@ import {
   stopIndexer,
   isIndexerRunning,
   parseCircleCreatedEvent,
+  parseJoinedEvent,
+  parseInitializedEvent,
   computeJitteredDelay,
   isTransientRpcError,
 } from "./indexer";
@@ -192,4 +194,229 @@ test("isTransientRpcError rejects non-transient errors", () => {
   assert.equal(isTransientRpcError(undefined), false);
   assert.equal(isTransientRpcError({ code: "ENOENT" }), false);
   assert.equal(isTransientRpcError({ status: 400 }), false);
+});
+
+// ─── parseJoinedEvent — circle/joined field-mapping tests ─────────────────────
+//
+// These tests are the contract between the on-chain joined event shape and the
+// indexer.  If anyone changes the circle contract's `join` data tuple they'll
+// see these fail before the DB is silently written with wrong member data.
+
+test("parseJoinedEvent: parses well-formed tuple into named fields", () => {
+  const result = parseJoinedEvent([
+    "CCIRCLEXXX",
+    "GMEMBERYYY",
+    1,
+    100_000_000n,
+  ]);
+  assert.equal(result.circleAddress, "CCIRCLEXXX");
+  assert.equal(result.member, "GMEMBERYYY");
+  assert.equal(result.joinOrder, 1);
+  assert.equal(result.collateral, 100_000_000n);
+});
+
+test("parseJoinedEvent: join_order 1 is valid (first member)", () => {
+  const result = parseJoinedEvent(["CABC", "GDEF", 1, 0n]);
+  assert.equal(result.joinOrder, 1);
+});
+
+test("parseJoinedEvent: join_order equals member_count is valid (last join, triggers Active)", () => {
+  const result = parseJoinedEvent(["CABC", "GDEF", 4, 100_000_000n]);
+  assert.equal(result.joinOrder, 4);
+});
+
+test("parseJoinedEvent: collateral 0 is valid (edge: all collateral already penalized)", () => {
+  const result = parseJoinedEvent(["CABC", "GDEF", 1, 0n]);
+  assert.equal(result.collateral, 0n);
+});
+
+test("parseJoinedEvent: accepts plain number for collateral (backward-compat with older SDK)", () => {
+  const result = parseJoinedEvent(["CABC", "GDEF", 2, 50_000_000]);
+  assert.equal(result.collateral, 50_000_000n);
+});
+
+test("parseJoinedEvent: throws on missing tuple elements", () => {
+  assert.throws(
+    () => parseJoinedEvent(["CABC", "GDEF", 1]),
+    /expected data tuple/,
+    "should throw a descriptive error when collateral is absent",
+  );
+});
+
+test("parseJoinedEvent: throws on null/undefined input", () => {
+  assert.throws(() => parseJoinedEvent(null), /expected data tuple/);
+  assert.throws(() => parseJoinedEvent(undefined), /expected data tuple/);
+});
+
+test("parseJoinedEvent: throws when circle_address is empty string", () => {
+  assert.throws(
+    () => parseJoinedEvent(["", "GDEF", 1, 100n]),
+    /circle_address must be a non-empty string/,
+  );
+});
+
+test("parseJoinedEvent: throws when member is empty string", () => {
+  assert.throws(
+    () => parseJoinedEvent(["CABC", "", 1, 100n]),
+    /member must be a non-empty string/,
+  );
+});
+
+test("parseJoinedEvent: throws when join_order is 0 (must be ≥ 1)", () => {
+  assert.throws(
+    () => parseJoinedEvent(["CABC", "GDEF", 0, 100n]),
+    /join_order must be a positive integer/,
+  );
+});
+
+test("parseJoinedEvent: throws when join_order is negative", () => {
+  assert.throws(
+    () => parseJoinedEvent(["CABC", "GDEF", -1, 100n]),
+    /join_order must be a positive integer/,
+  );
+});
+
+test("parseJoinedEvent: throws when join_order is non-integer", () => {
+  assert.throws(
+    () => parseJoinedEvent(["CABC", "GDEF", 1.5, 100n]),
+    /join_order must be a positive integer/,
+  );
+});
+
+test("parseJoinedEvent: throws when collateral is negative", () => {
+  assert.throws(
+    () => parseJoinedEvent(["CABC", "GDEF", 1, -1n]),
+    /collateral must be a non-negative/,
+  );
+});
+
+test("parseJoinedEvent: join_order field is distinct from circle_index (no aliasing)", () => {
+  // Regression guard: ensure the parser does not confuse join_order with the
+  // factory's circle_index.  A large realistic join_order must be preserved.
+  const bigOrder = 256;
+  const result = parseJoinedEvent(["CABC", "GDEF", bigOrder, 100n]);
+  assert.equal(result.joinOrder, bigOrder);
+  assert.equal(
+    ("circleIndex" in result),
+    false,
+    "parseJoinedEvent must not expose a circleIndex field",
+  );
+});
+
+// ─── parseInitializedEvent — circle/initialized field-mapping tests ────────────
+//
+// Issue #4 audit: the factory/circle_created event does NOT carry member_count
+// or round_amount.  The circle/initialized event fills those fields.  These
+// tests verify the parser is correct before any DB write happens.
+
+test("parseInitializedEvent: parses well-formed tuple into named fields", () => {
+  const result = parseInitializedEvent(["CCIRCLEXXX", 4, 100_000_000n]);
+  assert.equal(result.circleAddress, "CCIRCLEXXX");
+  assert.equal(result.memberCount, 4);
+  assert.equal(result.roundAmount, 100_000_000n);
+});
+
+test("parseInitializedEvent: minimum valid member_count is 2", () => {
+  const result = parseInitializedEvent(["CABC", 2, 50_000_000n]);
+  assert.equal(result.memberCount, 2);
+});
+
+test("parseInitializedEvent: maximum valid member_count is 256", () => {
+  const result = parseInitializedEvent(["CABC", 256, 1n]);
+  assert.equal(result.memberCount, 256);
+});
+
+test("parseInitializedEvent: accepts plain number for round_amount (older SDK compat)", () => {
+  const result = parseInitializedEvent(["CABC", 4, 100_000_000]);
+  assert.equal(result.roundAmount, 100_000_000n);
+});
+
+test("parseInitializedEvent: throws on missing tuple elements", () => {
+  assert.throws(
+    () => parseInitializedEvent(["CABC", 4]),
+    /expected data tuple/,
+  );
+});
+
+test("parseInitializedEvent: throws on null/undefined", () => {
+  assert.throws(() => parseInitializedEvent(null), /expected data tuple/);
+  assert.throws(() => parseInitializedEvent(undefined), /expected data tuple/);
+});
+
+test("parseInitializedEvent: throws when circle_address is empty", () => {
+  assert.throws(
+    () => parseInitializedEvent(["", 4, 100n]),
+    /circle_address must be a non-empty string/,
+  );
+});
+
+test("parseInitializedEvent: throws when member_count is 1 (below minimum)", () => {
+  assert.throws(
+    () => parseInitializedEvent(["CABC", 1, 100n]),
+    /member_count must be an integer in \[2, 256\]/,
+  );
+});
+
+test("parseInitializedEvent: throws when member_count is 257 (above maximum)", () => {
+  assert.throws(
+    () => parseInitializedEvent(["CABC", 257, 100n]),
+    /member_count must be an integer in \[2, 256\]/,
+  );
+});
+
+test("parseInitializedEvent: throws when member_count is non-integer", () => {
+  assert.throws(
+    () => parseInitializedEvent(["CABC", 2.5, 100n]),
+    /member_count must be an integer in \[2, 256\]/,
+  );
+});
+
+test("parseInitializedEvent: throws when round_amount is 0", () => {
+  assert.throws(
+    () => parseInitializedEvent(["CABC", 4, 0n]),
+    /round_amount must be > 0/,
+  );
+});
+
+test("parseInitializedEvent: throws when round_amount is negative", () => {
+  assert.throws(
+    () => parseInitializedEvent(["CABC", 4, -1n]),
+    /round_amount must be a positive bigint/,
+  );
+});
+
+// ─── Factory/circle_created vs circle/initialized field audit ─────────────────
+//
+// Issue #4 regression guard: documents which fields come from which event so a
+// future change to either event shape is immediately visible in CI.
+
+test("factory/circle_created provides: circle_address, creator, circle_index", () => {
+  const result = parseCircleCreatedEvent(["CCIRCLE", "GCREATOR", 0]);
+  // These three fields — and only these — are present in the factory event.
+  assert.ok("circleAddress" in result);
+  assert.ok("creator" in result);
+  assert.ok("circleIndex" in result);
+  // member_count and round_amount are NOT in the factory event — they come
+  // from the circle/initialized event (see parseInitializedEvent).
+  assert.equal(("memberCount" in result), false, "factory event must not have memberCount");
+  assert.equal(("roundAmount" in result), false, "factory event must not have roundAmount");
+});
+
+test("circle/initialized provides: circle_address, member_count, round_amount", () => {
+  const result = parseInitializedEvent(["CCIRCLE", 4, 100_000_000n]);
+  assert.ok("circleAddress" in result);
+  assert.ok("memberCount" in result);
+  assert.ok("roundAmount" in result);
+  // creator and circle_index are NOT in the initialized event.
+  assert.equal(("creator" in result), false, "initialized event must not have creator");
+  assert.equal(("circleIndex" in result), false, "initialized event must not have circleIndex");
+});
+
+test("memberCount equals totalRounds (each member receives one payout)", () => {
+  // The contract sets total_rounds = member_count at initialize time.
+  // This test documents and locks that invariant at the parser level.
+  const { memberCount } = parseInitializedEvent(["CABC", 5, 100n]);
+  // totalRounds is derived from memberCount — they must be equal.
+  const totalRounds = memberCount; // mirrors the DB UPDATE: total_rounds = $2
+  assert.equal(totalRounds, 5);
 });

@@ -1,10 +1,11 @@
 #!/usr/bin/env ts-node
 /**
- * check-artifact-hashes.ts — Contract build reproducibility check (Issue #396)
+ * check-artifact-hashes.ts — Contract build reproducibility and provenance check (Issues #396, #705)
  *
  * Verifies that the compiled WASM artifacts match the expected SHA-256
- * hashes committed in contracts/expected-hashes.json.  When run with
- * --update it rebuilds the artifacts and writes fresh expected hashes.
+ * hashes committed in contracts/expected-hashes.json. Also records and verifies
+ * build provenance metadata (git revision, compiler version, toolchain, and artifact sizes)
+ * to guard against supply-chain and toolchain drift.
  *
  * Usage:
  *   # Verify existing artifacts against expected hashes
@@ -13,12 +14,15 @@
  *   # Rebuild contracts and update expected-hashes.json
  *   npx ts-node src/check-artifact-hashes.ts --update
  *
- *   # Print hashes without comparing (useful for first-time setup)
+ *   # Generate provenance metadata file (contracts/provenance.json)
+ *   npx ts-node src/check-artifact-hashes.ts --provenance
+ *
+ *   # Print hashes and provenance info without comparing
  *   npx ts-node src/check-artifact-hashes.ts --print
  *
  * Exit codes:
- *   0 — All hashes match (verify mode) or hashes written (update mode).
- *   1 — One or more hashes differ or artifacts are missing.
+ *   0 — All hashes match (verify mode) or hashes/provenance written.
+ *   1 — One or more hashes differ, artifacts are missing, or drift detected.
  *
  * This script never deploys contracts or submits transactions.
  * It is safe to run on any contributor machine.
@@ -28,21 +32,31 @@ import crypto from 'crypto';
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Directory Resolution (Compatible with both ESM and CJS) ───────────────────
 
-const ROOT         = path.resolve(__dirname, '..', '..');
-const CONTRACTS    = path.join(ROOT, 'contracts');
-const WASM_DIR     = path.join(CONTRACTS, 'target', 'wasm32-unknown-unknown', 'release');
-const HASHES_FILE  = path.join(CONTRACTS, 'expected-hashes.json');
+function resolveScriptDir(): string {
+  if (typeof __dirname !== 'undefined') {
+    return __dirname;
+  }
+  return path.dirname(fileURLToPath(import.meta.url));
+}
+
+const SCRIPT_DIR    = resolveScriptDir();
+const ROOT          = path.resolve(SCRIPT_DIR, '..', '..');
+const CONTRACTS     = path.join(ROOT, 'contracts');
+const WASM_DIR      = path.join(CONTRACTS, 'target', 'wasm32-unknown-unknown', 'release');
+const HASHES_FILE   = path.join(CONTRACTS, 'expected-hashes.json');
+const PROVENANCE_FILE = path.join(CONTRACTS, 'provenance.json');
 const TOOLCHAIN_FILE = path.join(CONTRACTS, 'rust-toolchain.toml');
 
-const WASM_NAMES = ['reputation.wasm', 'circle_factory.wasm', 'circle.wasm'] as const;
-type WasmName = typeof WASM_NAMES[number];
+export const WASM_NAMES = ['reputation.wasm', 'circle_factory.wasm', 'circle.wasm'] as const;
+export type WasmName = typeof WASM_NAMES[number];
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-interface ExpectedHashes {
+export interface ExpectedHashes {
   _comment?: string;
   _comment2?: string;
   _comment3?: string;
@@ -52,22 +66,90 @@ interface ExpectedHashes {
   artifacts: Record<WasmName, string>;
 }
 
+export interface ArtifactProvenance {
+  sha256: string;
+  sizeBytes: number;
+}
+
+export interface ProvenanceMetadata {
+  schemaVersion: string;
+  timestamp: string;
+  git: {
+    commit: string;
+    branch: string;
+    isDirty: boolean;
+    tag?: string;
+  };
+  toolchain: {
+    pinned: string;
+    active: string;
+    rustc: string;
+    cargo: string;
+    target: string;
+    profile: string;
+  };
+  artifacts: Record<WasmName, ArtifactProvenance>;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Compute SHA-256 of a file, returned as a lowercase hex string. */
-function sha256File(filePath: string): string {
+export function sha256File(filePath: string): string {
   const buf = fs.readFileSync(filePath);
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
+/** Get file size in bytes. */
+export function getFileSize(filePath: string): number {
+  const stat = fs.statSync(filePath);
+  return stat.size;
+}
+
 /** Read rust-toolchain.toml and extract the channel (e.g. "1.81.0"). */
-function readPinnedToolchain(): string {
+export function readPinnedToolchain(): string {
   if (!fs.existsSync(TOOLCHAIN_FILE)) {
     return 'unknown (rust-toolchain.toml not found)';
   }
   const content = fs.readFileSync(TOOLCHAIN_FILE, 'utf8');
   const match = content.match(/channel\s*=\s*"([^"]+)"/);
   return match ? match[1] : 'unknown (channel not found)';
+}
+
+/** Run a shell command safely, returning trimmed stdout or fallback on error. */
+function safeExec(cmd: string, fallback: string = 'unknown'): string {
+  try {
+    return execSync(cmd, { cwd: ROOT, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+  } catch {
+    return fallback;
+  }
+}
+
+/** Resolve the active toolchain via `rustup show active-toolchain`. */
+export function activeToolchain(): string {
+  const out = safeExec('rustup show active-toolchain', 'unknown');
+  return out.split(' ')[0] ?? 'unknown';
+}
+
+/** Resolve the installed rustc version string. */
+export function rustcVersion(): string {
+  return safeExec('rustc --version', 'unknown');
+}
+
+/** Resolve the installed cargo version string. */
+export function cargoVersion(): string {
+  return safeExec('cargo --version', 'unknown');
+}
+
+/** Get Git repository revision details. */
+export function getGitProvenance(): { commit: string; branch: string; isDirty: boolean; tag?: string } {
+  const commit = safeExec('git rev-parse HEAD', 'unknown');
+  const branch = safeExec('git rev-parse --abbrev-ref HEAD', 'unknown');
+  const status = safeExec('git status --porcelain', '');
+  const isDirty = status.length > 0;
+  const tagOutput = safeExec('git describe --tags --exact-match 2>/dev/null', '');
+  const tag = tagOutput.length > 0 ? tagOutput : undefined;
+
+  return { commit, branch, isDirty, ...(tag ? { tag } : {}) };
 }
 
 /** Run a shell command and return its trimmed stdout. */
@@ -78,28 +160,18 @@ function run(cmd: string, label: string): string {
   return out.trim();
 }
 
-/** Resolve the active toolchain via `rustup show active-toolchain`. */
-function activeToolchain(): string {
-  try {
-    const out = execSync('rustup show active-toolchain', { encoding: 'utf-8', stdio: 'pipe' });
-    return out.trim().split(' ')[0] ?? 'unknown';
-  } catch {
-    return 'unknown (rustup not available)';
-  }
-}
-
 // ── Build ─────────────────────────────────────────────────────────────────────
 
-function buildContracts(): void {
+export function buildContracts(): void {
   run(
     `cargo build --release --target wasm32-unknown-unknown --manifest-path ${CONTRACTS}/Cargo.toml`,
     'Building all contracts',
   );
 }
 
-// ── Compute hashes ────────────────────────────────────────────────────────────
+// ── Compute hashes & Provenance ───────────────────────────────────────────────
 
-function computeHashes(): Record<WasmName, string> {
+export function computeHashes(): Record<WasmName, string> {
   const result = {} as Record<WasmName, string>;
   for (const name of WASM_NAMES) {
     const p = path.join(WASM_DIR, name);
@@ -115,10 +187,38 @@ function computeHashes(): Record<WasmName, string> {
   return result;
 }
 
+export function generateProvenance(): ProvenanceMetadata {
+  const hashes = computeHashes();
+  const artifacts = {} as Record<WasmName, ArtifactProvenance>;
+
+  for (const name of WASM_NAMES) {
+    const p = path.join(WASM_DIR, name);
+    artifacts[name] = {
+      sha256: hashes[name],
+      sizeBytes: getFileSize(p),
+    };
+  }
+
+  return {
+    schemaVersion: '1.0.0',
+    timestamp: new Date().toISOString(),
+    git: getGitProvenance(),
+    toolchain: {
+      pinned: readPinnedToolchain(),
+      active: activeToolchain(),
+      rustc: rustcVersion(),
+      cargo: cargoVersion(),
+      target: 'wasm32-unknown-unknown',
+      profile: 'release',
+    },
+    artifacts,
+  };
+}
+
 // ── Update mode ───────────────────────────────────────────────────────────────
 
-function updateHashes(): void {
-  console.log('CircleUp — updating expected artifact hashes (Issue #396)\n');
+export function updateHashes(): void {
+  console.log('CircleUp — updating expected artifact hashes and provenance (Issues #396, #705)\n');
 
   const pinned = readPinnedToolchain();
   const active = activeToolchain();
@@ -154,21 +254,52 @@ function updateHashes(): void {
   for (const [name, hash] of Object.entries(hashes)) {
     console.log(`     ${name}: ${hash}`);
   }
+
+  // Also write provenance record
+  const provenance = generateProvenance();
+  fs.writeFileSync(PROVENANCE_FILE, JSON.stringify(provenance, null, 2) + '\n');
+  console.log(`  ✅ contracts/provenance.json written (commit: ${provenance.git.commit.substring(0, 8)})`);
   console.log(`\n  Commit contracts/expected-hashes.json and contracts/rust-toolchain.toml.`);
+}
+
+// ── Provenance mode ───────────────────────────────────────────────────────────
+
+export function writeProvenance(outputPath?: string): void {
+  console.log('CircleUp — recording contract artifact provenance (Issue #705)\n');
+
+  const targetPath = outputPath ?? PROVENANCE_FILE;
+  const provenance = generateProvenance();
+
+  fs.writeFileSync(targetPath, JSON.stringify(provenance, null, 2) + '\n');
+
+  console.log(`  WASM directory   : ${WASM_DIR}`);
+  console.log(`  Target output    : ${targetPath}`);
+  console.log(`  Git commit       : ${provenance.git.commit} (${provenance.git.branch}${provenance.git.isDirty ? ' [dirty]' : ''})`);
+  console.log(`  Rust toolchain   : ${provenance.toolchain.pinned} (active: ${provenance.toolchain.active})`);
+  console.log(`  Compiler version : ${provenance.toolchain.rustc}`);
+  console.log('\n  Artifacts provenance:');
+  for (const [name, data] of Object.entries(provenance.artifacts)) {
+    console.log(`    ${name.padEnd(22)}: ${data.sha256} (${data.sizeBytes} bytes)`);
+  }
+  console.log(`\n  ✅ Provenance successfully written to ${targetPath}`);
 }
 
 // ── Print mode ────────────────────────────────────────────────────────────────
 
-function printHashes(): void {
-  console.log('CircleUp — artifact hash report (Issue #396)\n');
-  console.log(`  Active toolchain: ${activeToolchain()}`);
-  console.log(`  Pinned toolchain: ${readPinnedToolchain()}`);
-  console.log(`  WASM directory  : ${WASM_DIR}\n`);
+export function printHashes(): void {
+  console.log('CircleUp — artifact hash & provenance report (Issues #396, #705)\n');
+  console.log(`  Active toolchain : ${activeToolchain()}`);
+  console.log(`  Pinned toolchain : ${readPinnedToolchain()}`);
+  console.log(`  Rustc version    : ${rustcVersion()}`);
+  console.log(`  Cargo version    : ${cargoVersion()}`);
+  console.log(`  WASM directory   : ${WASM_DIR}\n`);
 
   try {
-    const hashes = computeHashes();
-    for (const [name, hash] of Object.entries(hashes)) {
-      console.log(`  ${hash}  ${name}`);
+    const provenance = generateProvenance();
+    console.log(`  Git Commit       : ${provenance.git.commit}`);
+    console.log(`  Git Branch       : ${provenance.git.branch} (dirty: ${provenance.git.isDirty})\n`);
+    for (const [name, data] of Object.entries(provenance.artifacts)) {
+      console.log(`  ${data.sha256}  ${name} (${data.sizeBytes} bytes)`);
     }
   } catch (err) {
     console.error(`  Error: ${(err as Error).message}`);
@@ -178,8 +309,8 @@ function printHashes(): void {
 
 // ── Verify mode ───────────────────────────────────────────────────────────────
 
-function verifyHashes(): void {
-  console.log('CircleUp — contract build reproducibility check (Issue #396)\n');
+export function verifyHashes(): void {
+  console.log('CircleUp — contract build reproducibility check (Issues #396, #705)\n');
 
   // 1. Check that expected-hashes.json exists
   if (!fs.existsSync(HASHES_FILE)) {
@@ -208,24 +339,18 @@ function verifyHashes(): void {
     .map(([n]) => n);
 
   if (unpopulated.length > 0) {
-    console.warn(
-      `\n  ⚠  The following artifacts have no expected hash in expected-hashes.json:\n` +
+    console.error(
+      `\n  ✗ The following artifacts have no expected hash in expected-hashes.json:\n` +
       `     ${unpopulated.join(', ')}\n` +
-      `     Run --update after a clean build to populate them.`,
+      `     CI requires expected hashes to be populated. Run --update to populate them.`,
     );
-    // Not a hard failure — expected when first bootstrapping the repo
+    process.exit(1);
   }
 
   // 4. Compare file hashes
   let allMatch = true;
   const populated = (Object.entries(expected.artifacts) as [WasmName, string][])
     .filter(([, h]) => !!h);
-
-  if (populated.length === 0) {
-    console.log('\n  ℹ  No populated hashes to compare — nothing to verify.');
-    console.log('     Run: npx ts-node src/check-artifact-hashes.ts --update');
-    process.exit(0);
-  }
 
   console.log('\n  Artifact verification:\n');
 
@@ -239,15 +364,16 @@ function verifyHashes(): void {
     }
 
     const actual = sha256File(p);
+    const size = getFileSize(p);
     const match  = actual === expectedHash;
 
     if (match) {
-      console.log(`  ✅ ${name}`);
+      console.log(`  ✅ ${name} (${size} bytes)`);
       console.log(`     ${actual}`);
     } else {
       console.log(`  ✗  ${name}: HASH MISMATCH`);
       console.log(`     expected : ${expectedHash}`);
-      console.log(`     actual   : ${actual}`);
+      console.log(`     actual   : ${actual} (${size} bytes)`);
       allMatch = false;
     }
   }
@@ -267,7 +393,7 @@ function verifyHashes(): void {
     process.exit(1);
   }
 
-  console.log('  All artifact hashes match. Build is reproducible. ✅');
+  console.log('  All artifact hashes match. Build is reproducible and provenance verified. ✅');
   process.exit(0);
 }
 
@@ -277,6 +403,10 @@ const args = process.argv.slice(2);
 
 if (args.includes('--update')) {
   updateHashes();
+} else if (args.includes('--provenance')) {
+  const outIdx = args.indexOf('--output');
+  const outFile = outIdx !== -1 && args[outIdx + 1] ? args[outIdx + 1] : undefined;
+  writeProvenance(outFile);
 } else if (args.includes('--print')) {
   printHashes();
 } else {

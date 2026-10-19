@@ -14,6 +14,7 @@
 
 import {
   Account,
+  Contract,
   Keypair,
   SorobanDataBuilder,
   SorobanRpc,
@@ -90,6 +91,27 @@ export function simulationSuccess(
     transactionData: new SorobanDataBuilder(),
     result: { auth: [], retval },
     cost: { cpuInsns: "0", memBytes: "0" },
+  } as unknown as SorobanRpc.Api.SimulateTransactionSuccessResponse;
+}
+
+/**
+ * A successful simulation whose `transactionData` carries real resource
+ * figures: 1.5M instructions, 2 KiB read, 512 B written, the circle's
+ * instance entry read-only and one entry read-write.
+ */
+export function simulationSuccessWithResources(
+  overrides: Record<string, unknown> = {},
+): SorobanRpc.Api.SimulateTransactionSuccessResponse {
+  const instanceKey = new Contract(CIRCLE_ADDR).getFootprint();
+  const transactionData = new SorobanDataBuilder()
+    .setResources(1_500_000, 2_048, 512)
+    .setResourceFee("54321")
+    .setFootprint([instanceKey], [instanceKey]);
+  return {
+    ...simulationSuccess(),
+    minResourceFee: "54321",
+    transactionData,
+    ...overrides,
   } as unknown as SorobanRpc.Api.SimulateTransactionSuccessResponse;
 }
 

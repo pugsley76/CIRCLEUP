@@ -2,118 +2,19 @@
 import { memo } from "react";
 import Link from "next/link";
 import { shortAddress, formatUsdc, formatPot } from "@/lib/config";
-import { isCanonicalStellarAddress } from "@/lib/address";
 import clsx from "clsx";
+// Re-export the shared type and parser so existing imports from this file
+// continue to resolve.  The canonical definitions now live in circleTypes.ts.
+export type { Circle } from "@/lib/circleTypes";
+export { parseCircleRow } from "@/lib/circleTypes";
+import type { Circle } from "@/lib/circleTypes";
+// Shared status presentation model — single source of truth for status labels,
+// descriptions, and visual variants across list cards, the detail header, and
+// the status filter pills.  Re-exported here so existing imports keep working.
+import { getCircleStatusMeta, type CircleStatusPresentation } from "@/lib/circleStatus";
 
-/** Indexer list shape for a circle. Mirrors ApiCircleRow in sdk/src/types.ts.
- *  Keep in sync when the indexer schema changes. */
-export interface Circle {
-  address: string;
-  creator: string;
-  /** Per-member round contribution, in stroops */
-  round_amount: string;
-  member_count: number;
-  /** Canonical values from the contract's CircleStatus enum:
-   *  "Pending" | "Active" | "Completed" | "Cancelled". Kept as string
-   *  because the value arrives from the indexer/RPC untyped. */
-  status: string;
-  current_round: number;
-  total_rounds: number;
-  created_ledger: number;
-}
-
-interface StatusMeta {
-  label: string;
-  /** Plain-language explanation, surfaced as a tooltip */
-  description: string;
-  chipClasses: string;
-  dotClasses: string;
-}
-
-const STATUS_META: Record<string, StatusMeta> = {
-  pending: {
-    label: "Pending",
-    description: "Waiting for members to join",
-    chipClasses: "bg-yellow-100 text-yellow-800",
-    dotClasses: "bg-yellow-500",
-  },
-  active: {
-    label: "Active",
-    description: "Rounds in progress",
-    chipClasses: "bg-brand-100 text-brand-700",
-    dotClasses: "bg-brand-500",
-  },
-  completed: {
-    label: "Completed",
-    description: "All rounds finished",
-    chipClasses: "bg-blue-100 text-blue-800",
-    dotClasses: "bg-blue-500",
-  },
-  cancelled: {
-    label: "Cancelled",
-    description: "Closed before all rounds completed",
-    chipClasses: "bg-red-100 text-red-800",
-    dotClasses: "bg-red-400",
-  },
-};
-
-// ─── Row validation ───────────────────────────────────────────────────────────
-//
-// The indexer response consumed by page.tsx is untyped JSON. Casting it
-// straight to Circle[] would let a single malformed row — a missing field, a
-// non-canonical address, a negative count — propagate into rendering as a
-// broken link, a NaN-derived amount, or a thrown exception that takes the
-// whole list down with it. parseCircleRow is the one place raw JSON is
-// allowed to become a Circle; page.tsx drops whatever this rejects instead of
-// passing an unchecked cast across the card boundary.
-
-function isFiniteNonNegativeInt(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
-
-/** Validates and narrows an unknown JSON value to a {@link Circle}, or returns
- *  `null` for a malformed row (never throws). */
-export function parseCircleRow(raw: unknown): Circle | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const row = raw as Record<string, unknown>;
-
-  const { address, creator, round_amount, member_count, status, current_round, total_rounds, created_ledger } =
-    row;
-
-  // address / creator: circles are Soroban contracts (C…); creator may be a
-  // wallet (G…) or, for multisig-created circles, a contract (C…) — accept
-  // either canonical form so a broken/empty value never reaches a Link href.
-  if (typeof address !== "string" || !isCanonicalStellarAddress(address)) return null;
-  if (typeof creator !== "string" || !isCanonicalStellarAddress(creator)) return null;
-  if (typeof round_amount !== "string" || !/^\d+$/.test(round_amount.trim())) return null;
-  if (!isFiniteNonNegativeInt(member_count)) return null;
-  if (typeof status !== "string" || status.trim() === "") return null;
-  if (!isFiniteNonNegativeInt(current_round)) return null;
-  if (!isFiniteNonNegativeInt(total_rounds)) return null;
-  if (!isFiniteNonNegativeInt(created_ledger)) return null;
-
-  return {
-    address,
-    creator,
-    round_amount,
-    member_count,
-    status,
-    current_round,
-    total_rounds,
-    created_ledger,
-  };
-}
-
-export function getStatusMeta(status: string): StatusMeta {
-  const known = STATUS_META[status?.trim().toLowerCase()];
-  if (known) return known;
-  return {
-    label: status?.trim() || "Unknown",
-    description: "Status not recognized",
-    chipClasses: "bg-slate-100 text-slate-700",
-    dotClasses: "bg-slate-400",
-  };
-}
+export type { CircleStatusPresentation as StatusMeta } from "@/lib/circleStatus";
+export { getCircleStatusMeta as getStatusMeta } from "@/lib/circleStatus";
 
 // ─── Input guards ─────────────────────────────────────────────────────────────
 //

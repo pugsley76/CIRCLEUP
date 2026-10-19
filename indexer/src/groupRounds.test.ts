@@ -418,3 +418,115 @@ test("groupCircleRounds handles 50 completed rounds with mixed contributions and
     assert.ok(result.rounds[i].roundIndex < result.rounds[i + 1].roundIndex);
   }
 });
+
+// ─── groupCircleRounds — round status metadata (issue #529) ──────────────────
+//
+// The `status` field on every GroupedRound is what clients branch on to
+// determine lifecycle phase without inferring it from the presence/absence of
+// payout fields. These tests lock the invariants so a refactor cannot
+// accidentally drop the field or produce an invalid value.
+
+test("every completed round has status 'completed'", () => {
+  const result = groupCircleRounds(
+    { current_round: 2, status: "Active" },
+    [
+      { round_index: 0, recipient: "A", amount: "100", tx_hash: "tx0", ledger: "10" },
+      { round_index: 1, recipient: "B", amount: "100", tx_hash: "tx1", ledger: "20" },
+    ],
+    [],
+    [],
+  );
+  assert.equal(result.rounds.length, 2);
+  for (const round of result.rounds) {
+    assert.equal(round.status, "completed", `rounds[${round.roundIndex}].status must be "completed"`);
+  }
+});
+
+test("current round for an Active circle has status 'current'", () => {
+  const result = groupCircleRounds(
+    { current_round: 1, status: "Active" },
+    [{ round_index: 0, recipient: "A", amount: "100", tx_hash: "tx0", ledger: "10" }],
+    [{ round_index: 1, member_address: "M1" }],
+    [],
+  );
+  assert.ok(result.currentRound, "currentRound must be present");
+  assert.equal(result.currentRound!.status, "current");
+  assert.equal(result.currentRound!.roundIndex, 1);
+});
+
+test("current round for a Cancelled circle has status 'cancelled'", () => {
+  const result = groupCircleRounds(
+    { current_round: 0, status: "Cancelled" },
+    [],
+    [],
+    [],
+  );
+  assert.ok(result.currentRound, "currentRound must be present for Cancelled circle");
+  assert.equal(result.currentRound!.status, "cancelled");
+});
+
+test("unpaid non-current rounds have status 'open'", () => {
+  const result = groupCircleRounds(
+    { current_round: 3, status: "Active" },
+    [],
+    [
+      { round_index: 0, member_address: "M1" },
+      { round_index: 1, member_address: "M1" },
+      { round_index: 2, member_address: "M1" },
+    ],
+    [],
+  );
+  assert.equal(result.openRounds.length, 3);
+  for (const round of result.openRounds) {
+    assert.equal(round.status, "open", `openRounds[${round.roundIndex}].status must be "open"`);
+  }
+});
+
+test("status field is present and a valid RoundStatus value on every round object", () => {
+  const VALID_STATUSES = new Set(["completed", "current", "cancelled", "open"]);
+
+  const result = groupCircleRounds(
+    { current_round: 2, status: "Active" },
+    [
+      { round_index: 0, recipient: "A", amount: "10", tx_hash: "tx0", ledger: "5" },
+    ],
+    [
+      { round_index: 1, member_address: "M1" },
+      { round_index: 2, member_address: "M2" },
+    ],
+    [{ round_index: 1, member_address: "M2", penalty: "5" }],
+  );
+
+  const allRounds = [
+    ...result.rounds,
+    ...result.openRounds,
+    ...(result.currentRound ? [result.currentRound] : []),
+  ];
+
+  assert.ok(allRounds.length > 0, "at least one round must be present");
+  for (const round of allRounds) {
+    assert.ok(
+      "status" in round,
+      `round ${round.roundIndex} is missing the status field`,
+    );
+    assert.ok(
+      VALID_STATUSES.has(round.status),
+      `round ${round.roundIndex} has invalid status "${round.status}"`,
+    );
+  }
+});
+
+test("payout winning over current_round cursor: paid-out current round has status 'completed' not 'current'", () => {
+  // Edge case: the payout row arrives for the same round_index as current_round.
+  // Payout presence must always win — the round is "completed", not "current".
+  const result = groupCircleRounds(
+    { current_round: 0, status: "Active" },
+    [{ round_index: 0, recipient: "R", amount: "100", tx_hash: "txPaid", ledger: "50" }],
+    [],
+    [],
+  );
+  assert.equal(result.rounds.length, 1);
+  assert.equal(result.rounds[0].status, "completed");
+  // currentRound should be null since the only candidate was promoted to completed
+  assert.equal(result.currentRound, null);
+});

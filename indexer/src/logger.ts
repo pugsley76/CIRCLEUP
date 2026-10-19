@@ -91,6 +91,7 @@ export type LogEventKey =
   | "event_ingested"
   | "event_skipped"                 // duplicate — already in ingested_events
   | "event_handler_error"           // handler threw; savepoint rolled back
+  | "event_failure_evidence_failed" // could not persist event_failures evidence
   // RPC
   | "rpc_retry"                     // transient error, retrying with backoff
   | "rpc_failed"                    // all retry attempts exhausted
@@ -108,8 +109,9 @@ export type LogEventKey =
   | "migration_failed"
   | "migration_drifted"
   // HTTP API
+  | "api_request"                   // route request completed
   | "api_request_error"             // unhandled error in a route handler
-  | "api_cors_rejected";
+  | "api_cors_rejected";            // request rejected by CORS policy
 
 // ─── Per-event context types ──────────────────────────────────────────────────
 //
@@ -146,6 +148,10 @@ export interface LedgerProcessedCtx {
   ledger: number;
   processed: number;
   failed: number;
+  /** Wall-clock time in milliseconds for the entire per-ledger transaction. */
+  latencyMs?: number;
+  /** Number of events that were skipped as duplicates (already in ingested_events). */
+  skipped?: number;
 }
 
 export interface LedgerGapCtx {
@@ -172,6 +178,10 @@ export interface EventHandlerErrorCtx {
   eventType: string;
   contractId: string;         // REDACTED before log
   txHash?: string;            // REDACTED before log
+  /** RPC event id — payload-free; matches event_failures.event_id. */
+  eventId?: string;
+  /** "transient" (ledger rolled back, will retry) or "permanent" (skipped). */
+  errorClass?: "transient" | "permanent";
   error: string;
 }
 
@@ -221,10 +231,24 @@ export interface MigrationCtx {
   summary?: string;
 }
 
+export interface ApiRequestCtx {
+  method: string;
+  path: string;
+  statusCode: number;
+  durationMs: number;
+}
+
 export interface ApiRequestErrorCtx {
   method: string;
   path: string;
+  statusCode?: number;
   error: string;
+}
+
+export interface ApiCorsRejectedCtx {
+  method: string;
+  path: string;
+  origin?: string;
 }
 
 // Generic fallback for events without a specific shape
@@ -414,8 +438,10 @@ export function logPollBackoff(ctx: PollBackoffCtx): void {
 
 /** One ledger's event batch was processed. */
 export function logLedgerProcessed(ctx: LedgerProcessedCtx): void {
+  const latencyStr = ctx.latencyMs !== undefined ? `, ${ctx.latencyMs}ms` : "";
+  const skippedStr = ctx.skipped !== undefined && ctx.skipped > 0 ? `, ${ctx.skipped} skipped` : "";
   log("debug", "ledger_processed", ctx as LogContext,
-    `Ledger ${ctx.ledger}: ${ctx.processed} processed, ${ctx.failed} failed`);
+    `Ledger ${ctx.ledger}: ${ctx.processed} processed, ${ctx.failed} failed${skippedStr}${latencyStr}`);
 }
 
 /** Ledger gaps detected in a poll range. */
@@ -438,8 +464,10 @@ export function logEventSkipped(ctx: EventSkippedCtx): void {
 
 /** An event handler threw; savepoint was rolled back. */
 export function logEventHandlerError(ctx: EventHandlerErrorCtx): void {
+  const outcome =
+    ctx.errorClass === "transient" ? " (transient — ledger will be retried)" : "";
   log("error", "event_handler_error", ctx as LogContext,
-    `Failed to process ${ctx.eventType} event at ledger ${ctx.ledger}: ${ctx.error}`);
+    `Failed to process ${ctx.eventType} event at ledger ${ctx.ledger}${outcome}: ${ctx.error}`);
 }
 
 /** A transient RPC call is being retried. */
@@ -482,3 +510,45 @@ export function logMigrationFailed(ctx: MigrationCtx): void {
   log("fatal", "migration_failed", ctx as LogContext,
     `Migration failed: ${ctx.error ?? "unknown error"}`);
 }
+
+/** A REST API request completed successfully or with a client error. */
+export function logApiRequest(ctx: ApiRequestCtx): void {
+  log(
+    ctx.statusCode >= 500 ? "error" : ctx.statusCode >= 400 ? "warn" : "info",
+    "api_request",
+    ctx as LogContext,
+    `${ctx.method} ${ctx.path} -> ${ctx.statusCode} (${ctx.durationMs}ms)`,
+  );
+}
+
+/** A REST API request failed and was converted to an HTTP error response. */
+export function logApiRequestError(ctx: ApiRequestErrorCtx): void {
+  log(
+    "error",
+    "api_request_error",
+    ctx as LogContext,
+    `${ctx.method} ${ctx.path} failed: ${ctx.error}`,
+  );
+}
+
+/** A CORS request was rejected before the route handler ran. */
+export function logApiCorsRejected(ctx: ApiCorsRejectedCtx): void {
+  log(
+    "warn",
+    "api_cors_rejected",
+    ctx as LogContext,
+    `CORS rejected for ${ctx.method} ${ctx.path}${ctx.origin ? ` from ${ctx.origin}` : ""}`,
+  );
+}
+/**
+ * Issue #463: Tests for the structured logger (indexer/src/logger.ts).
+ *
+ * Verifies that:
+ *   - Every log event produces a well-formed JSON-line entry with ts, level,
+ *     event, and msg fields.
+ *   - The minimum log level filter suppresses events below the threshold.
+ *   - Sensitive fields (contractId, txHash) are redacted before emission.
+ *   - The transport is fire-and-forget: a throwing transport never propagates.
+ *   - All named convenience wrappers emit the correct event key and level.
+ *   - configureLogger / resetLogger work correctly.
+ */

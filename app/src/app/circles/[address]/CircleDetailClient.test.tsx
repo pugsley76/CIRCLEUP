@@ -21,27 +21,38 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import React from "react";
+import ReactDOMServer from "react-dom/server";
 
+import { buildAppSnapshot, computeActionEligibility } from "@/lib/gating";
+import * as stellarMock from "@/lib/stellar";
 import {
+  CircleDetailClient,
   computeDataReadiness,
   fetchCircleData,
   MAX_DATA_AGE_MS,
+  CircleDetailClient,
   type CircleDetailData,
   type CircleRound,
   type CircleMember,
   type RefreshResult,
+  CircleDetailClient,
 } from "./CircleDetailClient";
+import { buildAppSnapshot, computeActionEligibility } from "@/lib/gating";
+import * as stellarMock from "@/lib/stellar";
+
+import { Keypair } from "@stellar/stellar-sdk";
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────────
 
-const MEMBER_A = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const MEMBER_B = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPCIB";
+const MEMBER_A = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 1)).publicKey();
+const MEMBER_B = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 2)).publicKey();
 const CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
 function makeMember(address: string, overrides: Partial<CircleMember> = {}): CircleMember {
+  const defaultOrder = address === MEMBER_B ? 1 : 0;
   return {
     member_address: address,
-    payout_order: 0,
+    payout_order: defaultOrder,
     collateral: "10000000",
     defaults: 0,
     joined_at: null,
@@ -58,6 +69,7 @@ function makeCurrentRound(contributions: { member_address: string }[] = []): Cir
     recipient: null,
     amount: null,
     txHash: null,
+    ledger: null,
     contributions: contributions.map((c) => ({
       member_address: c.member_address,
       amount: "10000000",
@@ -78,7 +90,7 @@ function makeReadyData(overrides: Partial<CircleDetailData> = {}): CircleDetailD
       member_count: 2,
       deadline_ledger: 5000,
     },
-    members: [makeMember(MEMBER_A), makeMember(MEMBER_B)],
+    members: [makeMember(MEMBER_A, 0), makeMember(MEMBER_B, 1)],
     rounds: [],
     openRounds: [],
     pendingDefaults: [],
@@ -160,10 +172,19 @@ describe("fetchCircleData", () => {
     circleResponse: { status: number; body?: unknown },
     roundsResponse?: { status: number; body?: unknown },
   ) {
-    let callCount = 0;
-    global.fetch = vi.fn(async (_url: RequestInfo, _opts?: RequestInit) => {
-      callCount += 1;
-      const resp = callCount === 1 ? circleResponse : (roundsResponse ?? { status: 200, body: { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null } });
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+          ? input.toString()
+          : (input as Request).url;
+      const resp = url.includes("/rounds")
+        ? roundsResponse ?? {
+            status: 200,
+            body: { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null },
+          }
+        : circleResponse;
       return {
         ok: resp.status >= 200 && resp.status < 300,
         status: resp.status,
@@ -182,7 +203,7 @@ describe("fetchCircleData", () => {
         member_count: 2,
         deadline_ledger: 5000,
       },
-      members: [makeMember(MEMBER_A), makeMember(MEMBER_B)],
+      members: [makeMember(MEMBER_A, 0), makeMember(MEMBER_B, 1)],
       latestLedger: 4000,
     };
     const roundsBody = {
@@ -355,6 +376,7 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
       false,
       false,
       0,
+      null, // networkCheck — none in this context
       staleMs, // ← the data was fetched more than maxAge ago
     );
 
@@ -371,12 +393,11 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
     //
     // The fix is to pass the actual data-fetch timestamp from component state,
     // which IS older than Date.now() at action-submit time.
-    const { buildAppSnapshot, computeActionEligibility } = require("@/lib/gating");
 
     // Simulate: data was fetched 60 seconds ago
     const dataFetchedAt = Date.now() - 60_000;
     // Correct behaviour: use dataFetchedAt as the snapshot timestamp
-    const correctSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, dataFetchedAt);
+    const correctSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, null, dataFetchedAt);
     const correctGate = computeActionEligibility("contribute", correctSnapshot);
     // 60 s > 30 s default → stale
     expect(correctGate.allowed).toBe(false);
@@ -385,21 +406,19 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
     }
 
     // Old (broken) behaviour: use Date.now() as the snapshot timestamp
-    const brokenSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, Date.now());
+    const brokenSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, null, Date.now());
     const brokenGate = computeActionEligibility("contribute", brokenSnapshot);
     // 0 ms < 30 s → wrongly allowed
     expect(brokenGate.allowed).toBe(true);
   });
 });
 
-// ─── Action gating with empty members ─────────────────────────────────────────
 //
 // Regression: 0 contributions >= 0 members → allowed by math, but wrong
 // semantically when member data is absent.
 
 describe("Payout gate with empty members", () => {
   test("payout gate should fail when members array is empty", () => {
-    const { buildAppSnapshot, computeActionEligibility } = require("@/lib/gating");
     const snapshot = buildAppSnapshot(
       "Active",
       0,
@@ -409,6 +428,7 @@ describe("Payout gate with empty members", () => {
       false,
       false,
       0, // 0 contributions
+      null, // networkCheck — none in this context
       Date.now(),
     );
     // 0 >= 0 is true mathematically, but the gate allows it — the fix for
@@ -440,24 +460,14 @@ vi.mock("@/lib/stellar", () => ({
   isFreighterInstalled: vi.fn().mockReturnValue(false),
 }));
 
-vi.mock("@/lib/config", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/config")>();
-  return {
-    ...actual,
-    INDEXER_URL: "http://localhost:3001",
-    ACTIVE_NETWORK: "testnet",
-    getExplorerLink: () => null,
-  };
-});
 
 describe("CircleDetailClient render — data readiness banners", () => {
-  const { CircleDetailClient } = require("./CircleDetailClient");
 
+describe("CircleDetailClient render — data readiness banners", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Default: wallet not connected
-    const stellarMock = require("@/lib/stellar");
-    stellarMock.getWalletAddress.mockResolvedValue(null);
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
   });
 
   test("shows partial data banner when members[] is empty", async () => {
@@ -491,9 +501,8 @@ describe("CircleDetailClient render — data readiness banners", () => {
   });
 
   test("action buttons are disabled while wallet state is still loading", async () => {
-    const stellarMock = require("@/lib/stellar");
     // Never resolves — simulates slow wallet check
-    stellarMock.getWalletAddress.mockImplementation(
+    (stellarMock.getWalletAddress as any).mockImplementation(
       () => new Promise(() => {}),
     );
 
@@ -665,19 +674,20 @@ describe("Refresh recovers without full reload", () => {
     };
     const secondBody = {
       circle: { status: "Active", current_round: 1, total_rounds: 4, round_amount: "10000000", member_count: 2 },
-      members: [makeMember(MEMBER_A), makeMember(MEMBER_B)],
+      members: [makeMember(MEMBER_A, 0), makeMember(MEMBER_B, 1)],
       latestLedger: 5001,
     };
     const roundsBody = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: makeCurrentRound() };
 
-    let callPair = 0;
-    global.fetch = vi.fn(async () => {
-      callPair += 1;
-      // fetch pairs: (1=circle,2=rounds) for first call, (3=circle,4=rounds) for second
-      if (callPair === 1) return { ok: true, status: 200, json: async () => firstBody } as Response;
-      if (callPair === 2) return { ok: true, status: 200, json: async () => roundsBody } as Response;
-      if (callPair === 3) return { ok: true, status: 200, json: async () => secondBody } as Response;
-      return { ok: true, status: 200, json: async () => roundsBody } as Response;
+    let circleCount = 0;
+    global.fetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.includes("/rounds")) {
+        return { ok: true, status: 200, json: async () => roundsBody } as Response;
+      }
+      circleCount += 1;
+      const body = circleCount === 1 ? firstBody : secondBody;
+      return { ok: true, status: 200, json: async () => body } as Response;
     });
 
     const first = await fetchCircleData(CONTRACT);
@@ -704,10 +714,12 @@ describe("Refresh recovers without full reload", () => {
     const roundsBody = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
 
     let attempt = 0;
-    global.fetch = vi.fn(async () => {
+    global.fetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
       attempt += 1;
       if (attempt === 1) throw new TypeError("Network error");
-      return { ok: true, status: 200, json: async () => (attempt === 2 ? goodBody : roundsBody) } as Response;
+      const body = urlStr.endsWith("/rounds") ? roundsBody : goodBody;
+      return { ok: true, status: 200, json: async () => body } as Response;
     });
 
     const firstResult = await fetchCircleData(CONTRACT);
@@ -717,5 +729,189 @@ describe("Refresh recovers without full reload", () => {
 
     const secondResult = await fetchCircleData(CONTRACT);
     expect(secondResult.ok).toBe(true);
+  });
+});
+
+// ─── Issue #480 — invite URL SSR safety ──────────────────────────────────────
+//
+// Validates that:
+//   1. inviteUrl initialises to null (not "") so SSR renders a consistent
+//      placeholder rather than an empty controlled-input value.
+//   2. The input renders with aria-busy while the URL is not yet resolved.
+//   3. The copy button is disabled while inviteUrl is null.
+//   4. window.location is never accessed synchronously during the initial
+//      render — only inside useEffect (browser-only).
+//
+// These are component-level render tests rather than pure-function tests; they
+// rely on jsdom setting window.location.origin = "http://localhost" by default.
+
+vi.mock("next/link", () => ({
+  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
+    <a href={href}>{children}</a>
+  ),
+}));
+
+// Minimal valid Props shape the component accepts
+function makeProps(circleAddress: string): { circleAddress: string; circleData: ReturnType<typeof makeReadyData> } {
+  return {
+    circleAddress,
+    circleData: makeReadyData(),
+  };
+}
+
+describe("Issue #480 — invite URL SSR-safe initialisation", () => {
+  beforeEach(() => {
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
+  });
+
+  test("invite input starts with empty value (null coalesced to '') when unresolved", async () => {
+    const { container } = render(
+      <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
+    );
+    expect(html).toContain('value=""');
+  });
+
+  test("invite input shows aria-busy=true while URL not yet resolved", async () => {
+    const { container } = render(
+      <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
+    );
+    expect(html).toContain('aria-busy="true"');
+  });
+
+  test("copy button is disabled while invite URL is not yet resolved", async () => {
+    render(<CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />);
+
+    const copyBtn = screen.getByRole("button", { name: /copy invite link/i });
+    expect(copyBtn).toBeDisabled();
+  });
+
+  test("invite input is populated with window.location.origin after effect fires", async () => {
+    const { container } = render(
+      <CircleDetailClient {...makeProps(CONTRACT)} />,
+    );
+
+    await waitFor(() => {
+      const input = container.querySelector<HTMLInputElement>(
+        'input[aria-label="Invite link for this circle"]',
+      );
+      expect(input!.value).toContain(`/circles/${CONTRACT}`);
+    });
+  });
+
+  test("invite input aria-busy becomes false after URL is resolved", async () => {
+    const { container } = render(
+      <CircleDetailClient {...makeProps(CONTRACT)} />,
+    );
+
+    await waitFor(() => {
+      const input = container.querySelector<HTMLInputElement>(
+        'input[aria-label="Invite link for this circle"]',
+      );
+      expect(input!.getAttribute("aria-busy")).not.toBe("true");
+    });
+  });
+});
+
+// ─── Screen-reader announcement tests ────────────────────────────────────────
+//
+// Verify that the sr-only progressAnnouncement live region re-announces when
+// circle status or round changes after a post-action data refresh.
+
+describe("CircleDetailClient — screen-reader status announcements", () => {
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
+  });
+
+  test("sr-only live region contains circle status on initial render", async () => {
+    const data = makeReadyData();
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl).toBeInTheDocument();
+      expect(srEl?.textContent).toMatch(/circle status: active/i);
+      expect(srEl?.textContent).toMatch(/round 0 of 4/i);
+    });
+  });
+
+  test("sr-only live region reflects updated status after data changes", async () => {
+    const initialData = makeReadyData({
+      circle: { status: "Active", current_round: 0, total_rounds: 4, round_amount: "10000000", member_count: 2 },
+    });
+
+    const { rerender } = render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={initialData} />,
+    );
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl?.textContent).toMatch(/round 0 of 4/i);
+    });
+
+    const updatedData = makeReadyData({
+      circle: { status: "Active", current_round: 1, total_rounds: 4, round_amount: "10000000", member_count: 2 },
+      currentRound: makeCurrentRound(),
+    });
+
+    rerender(
+      <CircleDetailClient key="updated" circleAddress={CONTRACT} circleData={updatedData} />,
+    );
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl?.textContent).toMatch(/round 1 of 4/i);
+    });
+  });
+
+  test("sr-only live region has aria-atomic=true for atomic announcement", async () => {
+    const data = makeReadyData();
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl).toBeInTheDocument();
+      expect(srEl).toHaveAttribute("aria-atomic", "true");
+    });
+  });
+});
+
+// ─── Duplicate submission guard ─────────────────────────────────────────────
+//
+// Retries and rapid re-clicks must never submit a duplicate wallet transaction.
+//
+// The primary guard is the button's `disabled` attribute while an action is in
+// flight — a real browser will not fire a second click on a disabled control.
+// `doAction`'s `submittingRef` is defence-in-depth against anything that can
+// bypass the attribute (programmatic dispatches, accessibility tools).
+
+describe("Duplicate submission guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (stellarMock.getWalletAddress as any).mockResolvedValue(MEMBER_A);
+    (stellarMock.invokeContract as any).mockResolvedValue({
+      success: true,
+      txHash: "0x" + "a".repeat(64),
+    });
+  });
+
+  test("a single contribute click submits one transaction and disables the button while in flight", async () => {
+    const data = makeReadyData();
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Contribute Round 0/i)).toBeInTheDocument();
+    });
+
+    const btn = screen.getByRole("button", { name: /contribute round/i });
+    expect(btn).not.toBeDisabled();
+
+    fireEvent.click(btn);
+
+    // The button disables while the action is in flight, so a real browser
+    // cannot fire a second click on it (no duplicate transaction).
+    expect(btn).toBeDisabled();
+    expect(stellarMock.invokeContract).toHaveBeenCalledTimes(1);
   });
 });

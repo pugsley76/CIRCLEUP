@@ -36,7 +36,7 @@
  *   scrub/category level rather than at the transport call level.
  */
 
-import { test, describe, beforeEach } from "node:test";
+import { test, describe, beforeEach } from "vitest";
 import assert from "node:assert/strict";
 
 import {

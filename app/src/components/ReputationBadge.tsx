@@ -193,57 +193,83 @@ export function ReputationBadge({ score, size = "md" }: ReputationBadgeProps) {
  * the score range and a plain-text description, so meaning is clear without
  * relying on colour alone.
  *
+ * Accessibility notes:
+ *   - The wrapping <section> is labelled via aria-labelledby pointing at the
+ *     visible heading — avoids duplicating the heading text in a separate
+ *     aria-label attribute.
+ *   - Column headers use scope="col" and are always visible to assistive
+ *     technology (not sr-only) so screen-reader users understand the table
+ *     structure before navigating rows.
+ *   - Each data row uses a <th scope="row"> for the tier name so assistive
+ *     technology announces "New — Score range 0, No completed rounds yet."
+ *     rather than reading three unrelated cells.
+ *   - The decorative colour badge inside each row is aria-hidden; the row
+ *     header already carries the tier name for AT.
+ *
  * Uses a <table> for semantic correctness: the relationship between tier name,
  * score range, and description is tabular data, not a definition list.
  */
 export function ReputationLegend() {
   return (
     <section
-      aria-label="Reputation badge legend"
+      aria-labelledby="rep-legend-heading"
       className="bg-white rounded-xl border border-slate-200 p-5"
     >
       <h2 className="font-semibold text-slate-800 mb-3" id="rep-legend-heading">
         Badge levels
       </h2>
       <table
-        className="w-full text-sm border-collapse"
-        aria-labelledby="rep-legend-heading"
+        className="w-full text-sm text-left border-collapse"
+        aria-describedby="rep-legend-desc"
       >
-        <thead className="sr-only">
-          <tr>
-            <th scope="col">Badge</th>
-            <th scope="col">Score range</th>
-            <th scope="col">Description</th>
+        <caption id="rep-legend-desc" className="sr-only">
+          Reputation badge levels, their score ranges, and what each level means.
+        </caption>
+        <thead>
+          <tr className="text-slate-500 border-b border-slate-200">
+            <th scope="col" className="py-2 pr-3 font-medium">
+              Level
+            </th>
+            <th scope="col" className="py-2 pr-3 font-medium">
+              Score range
+            </th>
+            <th scope="col" className="py-2 font-medium">
+              Meaning
+            </th>
           </tr>
         </thead>
         <tbody>
-          {REPUTATION_LEVELS.map((tier) => {
-            const rangeLabel =
-              tier.maxScore === Infinity
-                ? `${tier.minScore}+`
-                : `${tier.minScore}–${tier.maxScore - 1}`;
-
-            return (
-              <tr key={tier.label} className="border-t border-slate-100 first:border-0">
-                <td className="py-2 pr-3 align-middle">
-                  {/* Visual badge — aria-hidden because the row's th already names the tier */}
-                  <span
-                    className={`inline-flex items-center gap-1 rounded-full font-medium text-xs px-2 py-0.5 ${tier.color}`}
-                    aria-hidden="true"
-                  >
-                    <span className="font-mono leading-none">{tier.marker}</span>
-                    <span>{tier.label}</span>
-                  </span>
-                </td>
-                <td className="py-2 pr-3 align-middle text-slate-500 tabular-nums whitespace-nowrap">
-                  {rangeLabel}
-                </td>
-                <td className="py-2 align-middle text-slate-500">
-                  {tier.description}
-                </td>
-              </tr>
-            );
-          })}
+          {REPUTATION_LEVELS.map((level) => (
+            <tr key={level.label} className="border-b border-slate-100 last:border-0">
+              <th scope="row" className="py-2 pr-3 font-normal text-slate-700">
+                <span className="sr-only">{level.label}</span>
+                <span
+                  aria-hidden="true"
+                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${level.color}`}
+                >
+                  <span className="font-mono leading-none">{level.marker}</span>
+                  {level.label}
+                </span>
+              </th>
+              <td
+                className="py-2 pr-3 text-slate-600"
+                aria-label={`Score range: ${
+                  level.maxScore === Infinity
+                    ? `${level.minScore}+`
+                    : level.maxScore - level.minScore === 1
+                    ? `${level.minScore}`
+                    : `${level.minScore}–${level.maxScore - 1}`
+                }`}
+              >
+                {level.maxScore === Infinity
+                  ? `${level.minScore}+`
+                  : level.maxScore - level.minScore === 1
+                  ? `${level.minScore}`
+                  : `${level.minScore}–${level.maxScore - 1}`}
+              </td>
+              <td className="py-2 text-slate-600">{level.description}</td>
+            </tr>
+          ))}
         </tbody>
       </table>
     </section>

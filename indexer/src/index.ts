@@ -6,7 +6,7 @@ dotenv.config();
 // and throws a single clear error listing what's missing if any are unset —
 // deliberately before ./db/migrate and ./indexer run so a misconfigured
 // deploy fails on boot instead of partway through migrations or polling.
-import { PORT, SHUTDOWN_GRACE_PERIOD_MS } from "./config";
+import { PORT, SHUTDOWN_GRACE_PERIOD_MS, DB_CONNECT_MAX_RETRIES, DB_CONNECT_BASE_DELAY_MS } from "./config";
 import { connectWithRetry, pool } from "./db/pool";
 import { runMigrations, checkMigrationHealth } from "./db/migrate";
 import { startIndexer, stopIndexer } from "./indexer";
@@ -87,6 +87,12 @@ async function main() {
 
   // Wait for Postgres to accept connections before migrating — it's common
   // for the DB container to still be starting up at this point.
+  // Retry parameters are read from DB_CONNECT_MAX_RETRIES and
+  // DB_CONNECT_BASE_DELAY_MS env vars (defaults: 5 retries, 1000 ms base delay).
+  console.log(
+    `[circleup-indexer] Connecting to Postgres ` +
+      `(max ${DB_CONNECT_MAX_RETRIES} attempt(s), base delay ${DB_CONNECT_BASE_DELAY_MS}ms)...`,
+  );
   await connectWithRetry();
 
   // Apply DB schema and all pending additive migrations.

@@ -67,7 +67,7 @@
 mod mutation_guard_tests {
     extern crate std;
     use crate::{
-        CircleContract, CircleContractClient, CircleStatus, DataKey,
+        CircleContract, CircleContractClient, CircleStatus, CloseError, DataKey, InitError,
         PENALTY_BPS, BPS_DENOM, COLLATERAL_MULTIPLIER,
         MIN_ROUND_DEADLINE_LEDGERS,
     };
@@ -462,14 +462,18 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "circle already closed")]
     fn guard_close_double_release_prevention() {
         let t = make_setup();
         t.activate();
         t.force_status(CircleStatus::Completed);
         t.circle.close(&t.alice);
         // Guard must fire immediately — Closed flag is set
-        t.circle.close(&t.bob);
+        let result = t.circle.try_close(&t.bob);
+        assert_eq!(
+            result,
+            Err(Ok(CloseError::AlreadyClosed)),
+            "second close must return CloseError::AlreadyClosed"
+        );
     }
 
     /// After a successful close, all collateral storage keys must be zero.
@@ -584,6 +588,7 @@ mod mutation_guard_tests {
         let t = make_setup();
         // Circle is already initialized — a second call must be rejected
         t.circle.initialize(
+            &Address::generate(&t.env),
             &t.members,
             &ROUND_AMOUNT,
             &t.token_address,
@@ -603,6 +608,7 @@ mod mutation_guard_tests {
         new_members.push_back(Address::generate(&t.env));
         // Attacker tries to replace member list with their own addresses
         t.circle.initialize(
+            &Address::generate(&t.env),
             &new_members,
             &(ROUND_AMOUNT * 100),
             &t.token_address,
@@ -681,7 +687,6 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "duplicate members")]
     fn guard_duplicate_members_rejected() {
         let env = Env::default();
         env.mock_all_auths();
@@ -702,13 +707,21 @@ mod mutation_guard_tests {
         members.push_back(alice.clone()); // duplicate
 
         let circle_admin = Address::generate(&env);
-        circle.initialize(
+        let result = circle.try_initialize(
             &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_reg.address(),
             &rep_id,
             &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        let Err(Ok(sdk_err)) = result else {
+            panic!("expected contract error, got success or invoke error");
+        };
+        assert_eq!(
+            InitError::try_from(sdk_err).expect("must be a typed InitError"),
+            InitError::DuplicateMembers,
+            "duplicate members must return InitError::DuplicateMembers"
         );
     }
 
@@ -723,13 +736,17 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "not authorized to close: caller is not a circle member")]
     fn guard_close_non_member_rejected() {
         let t = make_setup();
         t.activate();
         t.force_status(CircleStatus::Completed);
         let outsider = Address::generate(&t.env);
-        t.circle.close(&outsider);
+        let result = t.circle.try_close(&outsider);
+        assert_eq!(
+            result,
+            Err(Ok(CloseError::Unauthorized)),
+            "non-member non-admin must return CloseError::Unauthorized"
+        );
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -958,7 +975,7 @@ mod mutation_guard_tests {
         t.activate();
         t.advance_past_deadline();
         // Pause the circle — only the admin can do this
-        t.circle.pause(&t.circle_admin).unwrap();
+        t.circle.pause(&t.circle_admin);
         // Must panic — guard fires before any state mutation
         t.circle.settle_round();
     }
@@ -977,14 +994,14 @@ mod mutation_guard_tests {
         t.advance_past_deadline();
 
         // Pause then immediately resume
-        t.circle.pause(&t.circle_admin).unwrap();
-        t.circle.resume(&t.circle_admin).unwrap();
+        t.circle.pause(&t.circle_admin);
+        t.circle.resume(&t.circle_admin);
         assert!(!t.circle.is_paused(), "circle must not be paused after resume");
 
         // settle_round must succeed after resume — proving the pause flag was the gate
         t.circle.settle_round(); // no panic expected
         // Circle advanced to round 1 (all defaulted → zero pot but still advances)
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         assert_eq!(round.round_index, 1, "circle must have advanced after settle_round");
     }
 
@@ -1001,9 +1018,9 @@ mod mutation_guard_tests {
             .iter()
             .map(|m| t.circle.get_collateral(m))
             .collect();
-        let round_before = t.circle.get_current_round().unwrap();
+        let round_before = t.circle.get_current_round();
 
-        t.circle.pause(&t.circle_admin).unwrap();
+        t.circle.pause(&t.circle_admin);
         let result = t.circle.try_settle_round();
         assert!(result.is_err(), "settle_round must be rejected while paused");
 
@@ -1017,7 +1034,7 @@ mod mutation_guard_tests {
         }
 
         // Round state must be identical (paid_out still false, same round_index)
-        let round_after = t.circle.get_current_round().unwrap();
+        let round_after = t.circle.get_current_round();
         assert_eq!(round_after.round_index, round_before.round_index,
             "round_index must not change on rejected settle_round");
         assert_eq!(round_after.paid_out, round_before.paid_out,
@@ -1050,7 +1067,7 @@ mod mutation_guard_tests {
     fn guard_settle_round_at_deadline_blocked() {
         let t = make_setup();
         t.activate();
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         t.env.ledger().with_mut(|l| {
             l.sequence_number = round.deadline_ledger as u32; // exactly at deadline
         });
@@ -1062,14 +1079,14 @@ mod mutation_guard_tests {
     fn guard_settle_round_one_past_deadline_succeeds() {
         let t = make_setup();
         t.activate();
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         t.env.ledger().with_mut(|l| {
             l.sequence_number = round.deadline_ledger as u32 + 1;
         });
         // Nobody contributed — settle_round must succeed (all defaulted)
         t.circle.settle_round();
         // Round advanced
-        let new_round = t.circle.get_current_round().unwrap();
+        let new_round = t.circle.get_current_round();
         assert_eq!(new_round.round_index, 1,
             "circle must have advanced to round 1 after settle_round");
     }

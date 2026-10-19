@@ -1,10 +1,17 @@
-import { Suspense, cache } from "react";
+import { Suspense } from "react";
 import Link from "next/link";
 import type { Metadata } from "next";
-import { INDEXER_URL } from "@/lib/config";
+import { unstable_cache } from "next/cache";
+import { indexerEndpoint, INDEXER_TIMEOUT_MS } from "@/lib/config";
 import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
 import { RetryableCirclesList } from "@/components/RetryableCirclesList";
+import { CircleStatusFilter as CircleStatusFilterNav } from "@/components/CircleStatusFilter";
+import {
+  isValidStatusFilter,
+  getBrowseState,
+  type CircleStatusFilter,
+} from "@/lib/circleTypes";
 
 export const metadata: Metadata = {
   title: "CircleUp — Trustless Savings Circles on Stellar",
@@ -20,110 +27,120 @@ export const metadata: Metadata = {
     url: "/",
     type: "website",
   },
+  twitter: {
+    card: "summary",
+    title: "CircleUp — Trustless Savings Circles on Stellar",
+    description:
+      "Ajo, Esusu, Tanda, and Chama on Stellar. Everyone pays in once a round, and the contract hands the whole pot to whoever's turn it is.",
+  },
 };
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-type FetchResult =
-  | { ok: true; circles: Circle[] }
-  | { ok: false; error: "network" | "parse" | "server" | "misconfigured" };
-
-// ─── URL validation ───────────────────────────────────────────────────────────
-
-/**
- * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
- * A misconfigured INDEXER_URL (empty string, relative path, placeholder text,
- * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
- * identical to a real network failure and gives no actionable guidance.
- */
-function isValidUrl(url: string): boolean {
-  if (!url || url.trim() === "") return false;
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
+import {
+  CIRCLE_STATUS_OPTIONS,
+  isValidStatusFilter,
+  isValidUrl,
+  PROTOCOL_GUARANTEES,
+  getBrowseState,
+  type CircleStatusFilter as StatusFilterType,
+  type BrowseState,
+  type FetchResult,
+} from "@/lib/homeHero";
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
 /**
- * Fetches the circle list, memoized for the lifetime of a single server render.
+ * Fetch circles from the indexer, optionally filtered by status.
  *
- * Three parts of the page need this data: the hero's secondary CTA, the count
- * beside the "Active Circles" heading, and the list itself. `cache()` collapses
- * them into one request per render, so the hero can never advertise "Browse 3
- * open circles" over a list that renders 4.
+ * The function is wrapped with `unstable_cache` per status value so that:
+ *   - The unfiltered list, the Active-only list, the Pending-only list, etc.
+ *     each get their own 10 s cache bucket.
+ *   - Multiple server components on the same page that request the same
+ *     (status, filter) combination share a single in-flight fetch.
+ *
+ * `total` comes from the indexer's pagination envelope so the heading can
+ * show the accurate filtered count without a second request.
  */
-const getCircles = cache(async function getCircles(): Promise<FetchResult> {
-  // Catch misconfiguration before attempting the network request so that
-  // developers get a targeted error message rather than a cryptic network failure.
-  if (!isValidUrl(INDEXER_URL)) {
-    return { ok: false, error: "misconfigured" };
-  }
+function makeGetCircles(status: StatusFilterType | undefined) {
+  const cacheKey = status ? `circles-homepage-${status}` : "circles-homepage";
 
-  let res: Response;
-  try {
-    // `cache: "no-store"` rather than `next: { revalidate: 10 }`. When the
-    // indexer refuses the connection, Next's revalidate-cache wrapper leaves a
-    // rejected promise nobody awaits; the dev server reports it as an
-    // unhandledRejection and tears the render stream down with "failed to pipe
-    // response", so the page 500s after a 60s hang and the "network" branch
-    // below never reaches the user. `cache()` above already collapses this to
-    // one request per render, so the only cost is the 10s cross-request cache.
-    res = await fetch(`${INDEXER_URL}/circles`, {
-      cache: "no-store",
-    });
-  } catch {
-    return { ok: false, error: "network" };
-  }
+  return unstable_cache(
+    async function fetchCircles(): Promise<FetchResult> {
+      // Build the URL: encode the status param when present so a crafted value
+      // can never inject additional query-string segments.
+      const segments: string[] = ["circles"];
+      const base = indexerEndpoint(segments);
+      if (base === null) {
+        return { ok: false, error: "misconfigured" };
+      }
+      const url = status
+        ? `${base}?${new URLSearchParams({ status }).toString()}`
+        : base;
 
-  if (!res.ok) {
-    return { ok: false, error: "server" };
-  }
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          cache: "no-store",
+          signal: AbortSignal.timeout(INDEXER_TIMEOUT_MS),
+        });
+      } catch {
+        return { ok: false, error: "network" };
+      }
 
-  let data: unknown;
-  try {
-    data = await res.json();
-  } catch {
-    return { ok: false, error: "parse" };
-  }
+      if (!res.ok) {
+        if (res.status === 503) return { ok: false, error: "indexer_outage" };
+        return { ok: false, error: "server" };
+      }
 
-  if (
-    typeof data !== "object" ||
-    data === null ||
-    !Array.isArray((data as Record<string, unknown>).circles)
-  ) {
-    return { ok: false, error: "parse" };
-  }
+      let data: unknown;
+      try {
+        data = await res.json();
+      } catch {
+        return { ok: false, error: "parse" };
+      }
 
-  const rawCircles = (data as { circles: unknown[] }).circles;
+      if (
+        typeof data !== "object" ||
+        data === null ||
+        !Array.isArray((data as Record<string, unknown>).circles)
+      ) {
+        return { ok: false, error: "parse" };
+      }
 
-  // Each row is validated independently via parseCircleRow — a single
-  // malformed row (a missing field, a non-canonical address, a negative
-  // count) is dropped rather than crashing the render, and no unchecked cast
-  // crosses into CircleCard. Deduplicate by address afterwards: the indexer
-  // should never return duplicates, but guard here so a transient bug never
-  // causes a React key collision or a misleading count in the heading.
-  const seen = new Set<string>();
-  const circles: Circle[] = [];
-  for (const rawCircle of rawCircles) {
-    const circle = parseCircleRow(rawCircle);
-    if (!circle || seen.has(circle.address)) continue;
-    seen.add(circle.address);
-    circles.push(circle);
-  }
+      const rawCircles = (data as { circles: unknown[]; pagination?: { total?: unknown } }).circles;
+      const rawTotal = (data as { pagination?: { total?: unknown } }).pagination?.total;
+      // `total` from the pagination envelope is the authoritative filtered count.
+      // Fall back to the length of the validated list when the field is absent
+      // (e.g. older indexer versions that don't return the envelope yet).
+      let total = typeof rawTotal === "number" && rawTotal >= 0 ? rawTotal : -1;
 
-  return { ok: true, circles };
-});
+      // Each row is validated independently — a single malformed row is dropped
+      // rather than crashing the render.  Deduplicate by address: the indexer
+      // should never return duplicates, but guard here so a transient bug never
+      // causes a React key collision or a misleading count in the heading.
+      const seen = new Set<string>();
+      const circles: Circle[] = [];
+      for (const rawCircle of rawCircles) {
+        const circle = parseCircleRow(rawCircle);
+        if (!circle || seen.has(circle.address)) continue;
+        seen.add(circle.address);
+        circles.push(circle);
+      }
+
+      if (total < 0) total = circles.length;
+
+      return { ok: true, circles, total };
+    },
+    [cacheKey],
+    { revalidate: 10 },
+  );
+}
 
 // ─── Error banner ─────────────────────────────────────────────────────────────
 
 function IndexerErrorBanner({
   error,
 }: {
-  error: "network" | "parse" | "server" | "misconfigured";
+  error: "network" | "parse" | "server" | "misconfigured" | "indexer_outage";
 }) {
   const messages: Record<string, string> = {
     misconfigured:
@@ -135,6 +152,9 @@ function IndexerErrorBanner({
       "The indexer returned an unexpected error. Circles cannot be loaded at the moment.",
     parse:
       "The indexer response was malformed. This is likely a temporary issue — try refreshing.",
+    indexer_outage:
+      "The indexer is running but currently degraded (it may be catching up with the chain or experiencing a service disruption). " +
+      "Circle data may be incomplete or temporarily unavailable. Try refreshing in a few minutes.",
   };
 
   return (
@@ -142,7 +162,7 @@ function IndexerErrorBanner({
       role="alert"
       className="bg-amber-50 border border-amber-300 rounded-xl px-5 py-4 mb-6 flex items-start gap-3"
     >
-      <span className="text-xl mt-0.5" aria-hidden="true">⚠️</span>
+      <span className="text-xl mt-0.5" aria-hidden="true">!</span>
       <div>
         <p className="font-semibold text-amber-800 text-sm">
           Circles list unavailable
@@ -192,22 +212,16 @@ function CircleListSkeleton() {
 }
 
 // ─── Circles list (async server component) ────────────────────────────────────
-//
-// Extracted into its own async component so it can be wrapped in Suspense.
-// The hero section renders immediately while this component fetches data.
-//
-// The error kind is forwarded to RetryableCirclesList via a data attribute on
-// the wrapping element so the client shell can show the retry banner and
-// drive re-fetches without a separate server round-trip per attempt.
 
-async function CirclesList() {
+async function CirclesList({
+  status,
+}: {
+  status: StatusFilterType | undefined;
+}) {
+  const getCircles = makeGetCircles(status);
   const result = await getCircles();
 
   if (!result.ok) {
-    // Render an empty fragment as the "content" slot — the error banner and
-    // retry controls are owned by the client shell (RetryableCirclesList).
-    // We use a data attribute on a hidden span to pass the error kind to the
-    // client without a separate fetch or a prop drilling chain.
     return (
       <>
         <span
@@ -223,13 +237,19 @@ async function CirclesList() {
   if (result.circles.length === 0) {
     return (
       <div className="text-center py-16 text-slate-500">
-        <div className="text-4xl mb-3">🌱</div>
-        <p className="font-medium">No circles yet.</p>
-        <p className="text-sm mt-1">
-          <Link href="/create" className="text-brand-600 underline">
-            Create the first one
-          </Link>
+        <div className="text-4xl mb-3">NEW</div>
+        <p className="font-medium">
+          {status
+            ? `No ${status.toLowerCase()} circles found.`
+            : "No circles yet."}
         </p>
+        {!status && (
+          <p className="text-sm mt-1">
+            <Link href="/create" className="text-brand-600 underline">
+              Create the first one
+            </Link>
+          </p>
+        )}
       </div>
     );
   }
@@ -244,68 +264,79 @@ async function CirclesList() {
 }
 
 // ─── Error-aware list wrapper (server component) ──────────────────────────────
-//
-// Fetches the circle data once more (collapsed to the same request by cache())
-// so it can pass `initialError` to the client shell without prop-drilling
-// through the page component.  When the fetch succeeds, `initialError` is null
-// and RetryableCirclesList is a transparent pass-through.
 
-async function CirclesListWithRetry() {
+async function CirclesListWithRetry({
+  status,
+}: {
+  status: StatusFilterType | undefined;
+}) {
+  const getCircles = makeGetCircles(status);
   const result = await getCircles().catch(() => null);
   const initialError =
     !result || !result.ok ? (result?.error ?? "network") : null;
 
   return (
     <RetryableCirclesList initialError={initialError}>
-      <CirclesList />
+      <CirclesList status={status} />
     </RetryableCirclesList>
   );
 }
-/**
- * Count beside the "Active Circles" heading. Omitted entirely when the fetch
- * failed, so a stale or missing number is never presented as fact — the error
- * banner rendered by `CirclesList` explains why the list is empty.
- */
-async function CircleCount() {
+
+// ─── Circle count badge ───────────────────────────────────────────────────────
+//
+// Shows the filtered total beside the section heading. Omitted entirely when the
+// fetch failed — a stale or missing number is never presented as fact.
+
+async function CircleCount({
+  status,
+}: {
+  status: StatusFilterType | undefined;
+}) {
+  const getCircles = makeGetCircles(status);
   const result = await getCircles().catch(() => null);
   if (!result || !result.ok) return null;
 
   return (
     <span className="ml-2 text-sm font-normal text-slate-400">
-      ({result.circles.length})
+      ({result.total})
     </span>
   );
 }
 
-// ─── Hero call-to-action ──────────────────────────────────────────────────────
-
-type BrowseState =
-  | { kind: "browse"; count: number }
-  | { kind: "empty" }
-  | { kind: "unavailable" };
-
-/**
- * Decides what the hero's secondary call-to-action should offer.
- *
- * "Browse open circles" jumps to the list further down this page, so it may
- * only render when there is a list to jump to. Offering it when the indexer
- * returned nothing (or could not be reached at all) sends the reader to an
- * empty state or an error banner and reads as a broken button. Each case gets
- * its own explicit message instead.
- *
- * @param result The circles fetch, or `null` if it threw unexpectedly.
- */
-function getBrowseState(result: FetchResult | null): BrowseState {
-  if (!result || !result.ok) return { kind: "unavailable" };
-  if (result.circles.length === 0) return { kind: "empty" };
-  return { kind: "browse", count: result.circles.length };
+interface ProtocolGuarantee {
+  emoji: string;
+  title: string;
+  desc: string;
 }
 
+const PROTOCOL_GUARANTEES: readonly ProtocolGuarantee[] = [
+  {
+    emoji: "🔒",
+    title: "No rug-pulls",
+    desc: "The smart contract holds all funds until payout. No single member or organizer can withdraw money prematurely.",
+  },
+  {
+    emoji: "🔄",
+    title: "Deterministic rotation",
+    desc: "Payout order and rotation schedule are fixed on-chain upon circle creation and cannot be tampered with.",
+  },
+  {
+    emoji: "🛡️",
+    title: "Collateral-backed defaults",
+    desc: "Members lock collateral upfront. If anyone defaults on a round, their collateral compensates affected members.",
+  },
+  {
+    emoji: "⭐",
+    title: "On-chain reputation",
+    desc: "Successful contributions build an immutable reputation score across circles on the Stellar network.",
+  },
+] as const;
+
+
+
+
 /**
- * Shared button geometry so the two CTAs line up and share focus styling. Both
- * carry the border: on the solid primary it matches the fill and is invisible,
- * on the outlined secondary it is the outline. Keeping it on both is what makes
- * the two the same height when they sit side by side.
+ * Shared button geometry so the two CTAs line up and share focus styling.
  */
 const CTA_BASE =
   "inline-block px-6 py-3 rounded-xl font-semibold text-lg transition-colors " +
@@ -313,13 +344,9 @@ const CTA_BASE =
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-600 " +
   "focus-visible:ring-offset-2 focus-visible:ring-offset-slate-50";
 
-/**
- * The one part of the hero that depends on the indexer: either a "Browse N open
- * circles" button, or a line explaining why there is nothing to browse. Wrapped
- * in its own Suspense boundary by the page so the headline and the primary
- * "Create a circle" button paint without waiting on the network.
- */
 async function HeroSecondaryCta() {
+  // Always use the unfiltered count for the hero CTA.
+  const getCircles = makeGetCircles(undefined);
   const result = await getCircles().catch(() => null);
   const browse = getBrowseState(result);
 
@@ -350,10 +377,6 @@ async function HeroSecondaryCta() {
   );
 }
 
-/**
- * Invisible stand-in with the same box as the secondary CTA, so the hint line
- * underneath does not jump once the indexer responds.
- */
 function HeroSecondaryCtaFallback() {
   return (
     <span className={`${CTA_BASE} invisible`} aria-hidden="true">
@@ -364,7 +387,24 @@ function HeroSecondaryCtaFallback() {
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
-export default function HomePage() {
+interface HomePageProps {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}
+
+export default async function HomePage({ searchParams }: HomePageProps) {
+  // Resolve the async searchParams (Next.js 15 dynamic API)
+  const params = await searchParams;
+  const rawStatus = Array.isArray(params.status) ? params.status[0] : params.status;
+  // Guard the raw query-string value: only pass it through when it matches a
+  // known status so a crafted URL can never inject an arbitrary string into the
+  // fetch URL or the heading label.
+  const activeStatus: StatusFilterType | undefined = isValidStatusFilter(rawStatus)
+    ? rawStatus
+    : undefined;
+
+  // Label for the list section heading.
+  const sectionLabel = activeStatus ? `${activeStatus} Circles` : "All Circles";
+
   return (
     <div>
       {/* Hero */}
@@ -395,9 +435,6 @@ export default function HomePage() {
           </Suspense>
         </div>
 
-        {/* Sets expectations for the primary CTA. Without this the wallet
-            requirement only surfaces as an error after the create form is
-            filled in and submitted. */}
         <p className="text-slate-500 text-sm mt-4">
           Setting one up takes about a minute. You will need a Freighter wallet
           and the Stellar addresses of 2 to 20 members.
@@ -440,28 +477,7 @@ export default function HomePage() {
           🔐 Protocol Guarantees
         </h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {[
-            {
-              emoji: "🚫",
-              title: "No rug-pulls",
-              desc: "The organizer cannot withdraw funds early. All money is locked in the Soroban smart contract until the scheduled payout.",
-            },
-            {
-              emoji: "🔄",
-              title: "Deterministic rotation",
-              desc: "Payout order is set on-chain at join time. The contract enforces it — no one can skip the queue or pay themselves twice.",
-            },
-            {
-              emoji: "⚠️",
-              title: "Collateral-backed defaults",
-              desc: "Every member locks 1× the round amount as collateral. A missed contribution triggers an automatic penalty deducted from that collateral.",
-            },
-            {
-              emoji: "🌐",
-              title: "On-chain reputation",
-              desc: "Contribution and default history is recorded on-chain. Your reputation score is public, portable, and unforgeable.",
-            },
-          ].map((g) => (
+          {PROTOCOL_GUARANTEES.map((g) => (
             <div
               key={g.title}
               className="bg-white rounded-xl border border-slate-200 p-5 flex gap-4 items-start"
@@ -478,31 +494,38 @@ export default function HomePage() {
         </div>
       </div>
 
-      {/* Circles list — `id` is the target of the hero's "Browse" CTA, and
-          scroll-mt keeps the heading clear of the top of the viewport. */}
+      {/* Circles list ─────────────────────────────────────────────────────────
+          `id="circles"` is the anchor target of the hero's "Browse" CTA.
+          `scroll-mt-6` keeps the heading clear of the viewport top.         */}
       <div
         id="circles"
-        className="flex items-center justify-between mb-5 scroll-mt-6"
+        className="scroll-mt-6 mb-5"
       >
-        <h2 className="text-xl font-bold text-slate-800">
-          Active Circles
-          <Suspense fallback={null}>
-            <CircleCount />
-          </Suspense>
-        </h2>
-        <Link
-          href="/create"
-          className="text-brand-600 text-sm font-medium hover:underline"
-        >
-          + New circle
-        </Link>
+        {/* Heading row: label + count on the left, New circle link on the right */}
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-xl font-bold text-slate-800">
+            {sectionLabel}
+            <Suspense fallback={null}>
+              <CircleCount status={activeStatus} />
+            </Suspense>
+          </h2>
+          <Link
+            href="/create"
+            className="text-brand-600 text-sm font-medium hover:underline"
+          >
+            + New circle
+          </Link>
+        </div>
+
+        {/* Status filter tabs — client component so selection updates the URL
+            without a full page reload. The active value is read back from
+            searchParams on the server so the correct circles are streamed
+            immediately, even on a direct URL visit or a hard refresh.        */}
+        <CircleStatusFilter activeStatus={activeStatus} />
       </div>
 
-      {/* Suspense boundary: hero + heading render immediately; list streams in.
-          CirclesListWithRetry passes initialError to the client shell so the
-          retry button appears immediately on error without a client round-trip. */}
       <Suspense fallback={<CircleListSkeleton />}>
-        <CirclesListWithRetry />
+        <CirclesListWithRetry status={activeStatus} />
       </Suspense>
     </div>
   );

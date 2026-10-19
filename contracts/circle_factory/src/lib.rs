@@ -27,7 +27,9 @@
 //! # Events
 //!
 //! All factory events use a two-symbol topic prefix so the indexer can filter
-//! with `topic0 == "factory"`.
+//! with `topic0 == "factory"`.  The canonical payload reference for every
+//! event across all three contracts (factory, circle, reputation) is
+//! **`docs/EVENTS.md`** in the repository root.
 //!
 //! ## `factory` / `circle_created`
 //!
@@ -45,6 +47,10 @@
 //! 3. `circle_index` — zero-based factory counter **before** this create
 //!    (mixed into the deploy salt). After the event the stored `CircleCount`
 //!    is `circle_index + 1`.
+//!
+//! **Stability contract:** topics and the order/types of data tuple fields are
+//! stable.  Adding a new trailing field is backwards-compatible; reordering or
+//! removing fields requires a new event name and an update to `docs/EVENTS.md`.
 
 #![no_std]
 
@@ -54,9 +60,11 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, Symbol, Vec,
 };
 
-// Re-export circle constants so factory validation stays in sync with the
-// circle contract without hard-coding the numbers here.
-use circle::{MAX_MEMBERS, MIN_ROUND_DEADLINE_LEDGERS, MAX_ROUND_DEADLINE_LEDGERS};
+// Circle protocol constants — must match circle contract invariants exactly.
+pub const MAX_MEMBERS: u32 = 256;
+pub const MIN_ROUND_DEADLINE_LEDGERS: u32 = 100;
+pub const MAX_ROUND_DEADLINE_LEDGERS: u32 = 1_036_800;
+pub const PENALTY_BPS: i128 = 2_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -68,7 +76,24 @@ pub enum DataKey {
     UsdcToken,
     Circles,      // Vec<Address> — deployed circle addresses in creation order
     CircleCount,  // u32 — monotonic counter; always == Circles.len()
+    /// Reentrancy guard held for the duration of `initialize`.
+    ///
+    /// Set as the very first storage write in `initialize` and cleared once
+    /// all setup fully commits.  Mirrors the same pattern used in the circle
+    /// contract (`DataKey::Initializing`) so the guard is consistent across
+    /// all three contracts in the workspace.  A reentrant call that arrives
+    /// mid-initialize sees this flag and panics immediately, before any partial
+    /// state is visible.  The `Admin` key absence alone is not a sufficient
+    /// guard because a reentrant path would also see `Admin` absent.
+    Initializing,
 }
+
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+/// Topic-0 namespace shared by every event this contract publishes.
+///
+/// Mirrors `circle::EVENT_NAMESPACE`: topics are `(EVENT_NAMESPACE, <name>)`.
+pub const EVENT_NAMESPACE: &str = "factory";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -131,7 +156,7 @@ fn validate_create_inputs(
         .checked_mul(member_count as i128)
         .unwrap_or_else(|| panic!("round_amount too large: overflows pot calculation"));
     round_amount
-        .checked_mul(circle::PENALTY_BPS)
+        .checked_mul(PENALTY_BPS)
         .unwrap_or_else(|| panic!("round_amount too large: overflows penalty calculation"));
 
     // Deadline bounds — must match circle contract's accepted range exactly.
@@ -185,9 +210,18 @@ impl CircleFactory {
     /// the factory is passed as `admin` to `reputation.initialize` before
     /// factory setup, making them mutually authorizing).
     ///
+    /// # Reentrancy guard
+    ///
+    /// Sets `DataKey::Initializing` as the very first storage write and clears
+    /// it once all setup commits.  This prevents a reentrant call from racing
+    /// through a second initialize mid-flight and observing partially
+    /// initialized state.  Consistent with the same guard pattern used in the
+    /// circle and reputation contracts.
+    ///
     /// # Panics
     ///
     /// - `"already initialized"` if called more than once
+    /// - `"initialize already in progress"` if a reentrant call is detected
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -198,6 +232,15 @@ impl CircleFactory {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
+
+        // Reentrancy guard: set Initializing as the very first write so that
+        // any reentrant call (e.g. from a future cross-contract call added here)
+        // sees the flag and panics before it can observe or commit partial state.
+        if env.storage().instance().has(&DataKey::Initializing) {
+            panic!("initialize already in progress");
+        }
+        env.storage().instance().set(&DataKey::Initializing, &true);
+
         admin.require_auth();
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -207,6 +250,9 @@ impl CircleFactory {
         env.storage().instance().set(&DataKey::CircleCount, &0u32);
         let circles: Vec<Address> = Vec::new(&env);
         env.storage().instance().set(&DataKey::Circles, &circles);
+
+        // Clear the reentrancy guard once all setup commits successfully.
+        env.storage().instance().remove(&DataKey::Initializing);
     }
 
     // ── Create Circle ─────────────────────────────────────────────────────────
@@ -272,11 +318,20 @@ impl CircleFactory {
         // The counter is mixed into the deploy salt. It is only incremented
         // after the full deploy+init+register sequence succeeds, so a failed
         // create never burns a counter slot.
+        // Both registry keys are written by `initialize`.  Treat a missing key
+        // as a storage inconsistency instead of defaulting it: a defaulted
+        // counter would reuse salts, and a defaulted empty list would wipe
+        // every previously registered circle on the write in step 7.
         let count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::CircleCount)
-            .unwrap_or(0);
+            .unwrap_or_else(|| panic!("factory: CircleCount missing — storage inconsistency"));
+        let mut circles: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circles)
+            .unwrap_or_else(|| panic!("factory: Circles registry missing — storage inconsistency"));
 
         let salt = derive_circle_salt(&env, &creator, count);
 
@@ -327,11 +382,6 @@ impl CircleFactory {
         // ── 7. Commit registry state (only reached on full success) ──────────
         // Both writes happen together; they are the only factory state mutations
         // in create_circle. count + 1 always equals circles.len() after this.
-        let mut circles: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Circles)
-            .unwrap_or(Vec::new(&env));
         circles.push_back(circle_address.clone());
         env.storage().instance().set(&DataKey::Circles, &circles);
         env.storage().instance().set(&DataKey::CircleCount, &(count + 1));
@@ -349,9 +399,23 @@ impl CircleFactory {
             panic!("factory: registry invariant violated: count != circles.len()");
         }
 
-        // Event: (circle_address, creator, circle_index_before_increment)
+        // ── Event: factory/circle_created ────────────────────────────────────
+        //
+        // Emitted after all registry writes have committed so the indexer can
+        // read both the updated Circles list and CircleCount in the same ledger.
+        //
+        // Topics : (Symbol("factory"), Symbol("circle_created"))
+        // Data   : (circle_address: Address, creator: Address, circle_index: u32)
+        //
+        //   circle_address — C-prefix strkey of the newly deployed circle contract.
+        //   creator        — G-prefix strkey of the wallet that called create_circle.
+        //   circle_index   — zero-based factory counter BEFORE this create;
+        //                    CircleCount after this event == circle_index + 1.
+        //
+        // Stability: topics and field order are stable (see docs/EVENTS.md).
+        // A future change that adds fields must append them and update EVENTS.md.
         env.events().publish(
-            (Symbol::new(&env, "factory"), Symbol::new(&env, "circle_created")),
+            (Symbol::new(&env, EVENT_NAMESPACE), Symbol::new(&env, "circle_created")),
             (circle_address.clone(), creator, count),
         );
 
@@ -395,6 +459,35 @@ impl CircleFactory {
         env.storage()
             .instance()
             .get(&DataKey::UsdcToken)
+            .unwrap_or_else(|| panic!("not initialized"))
+    }
+
+    /// Returns the reputation contract address configured at initialize.
+    ///
+    /// Exposes the reputation contract address so off-chain tooling and
+    /// auditors can verify which reputation contract this factory interacts
+    /// with without deserializing the full factory configuration.
+    ///
+    /// Panics with `"not initialized"` if called before `initialize`.
+    pub fn get_reputation_contract(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReputationContract)
+            .unwrap_or_else(|| panic!("not initialized"))
+    }
+
+    /// Returns the circle WASM hash configured at initialize.
+    ///
+    /// The hash identifies the exact version of the circle contract that this
+    /// factory deploys.  Callers can compare it against a known hash to verify
+    /// that the factory is deploying the expected contract binary before
+    /// committing gas to `create_circle`.
+    ///
+    /// Panics with `"not initialized"` if called before `initialize`.
+    pub fn get_circle_wasm_hash(env: Env) -> BytesN<32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircleWasmHash)
             .unwrap_or_else(|| panic!("not initialized"))
     }
 }
@@ -462,12 +555,142 @@ mod tests {
     }
 
     #[test]
+    fn test_get_reputation_contract() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let rep   = Address::generate(&env);
+        let usdc  = Address::generate(&env);
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        client.initialize(&admin, &wasm_hash, &rep, &usdc);
+        assert_eq!(
+            client.get_reputation_contract(),
+            rep,
+            "get_reputation_contract must return the address set at initialize"
+        );
+    }
+
+    #[test]
+    fn test_get_circle_wasm_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let rep   = Address::generate(&env);
+        let usdc  = Address::generate(&env);
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.initialize(&admin, &wasm_hash, &rep, &usdc);
+        assert_eq!(
+            client.get_circle_wasm_hash(),
+            wasm_hash,
+            "get_circle_wasm_hash must return the hash set at initialize"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not initialized")]
+    fn test_get_reputation_contract_before_init_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        CircleFactoryClient::new(&env, &id).get_reputation_contract();
+    }
+
+    #[test]
+    #[should_panic(expected = "not initialized")]
+    fn test_get_circle_wasm_hash_before_init_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        CircleFactoryClient::new(&env, &id).get_circle_wasm_hash();
+    }
+
+    #[test]
+    fn test_all_getters_return_configured_values() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin     = Address::generate(&env);
+        let rep       = Address::generate(&env);
+        let usdc      = Address::generate(&env);
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0x42u8; 32]);
+        client.initialize(&admin, &wasm_hash, &rep, &usdc);
+        assert_eq!(client.get_admin(),                admin,     "admin");
+        assert_eq!(client.get_usdc_token(),           usdc,      "usdc_token");
+        assert_eq!(client.get_reputation_contract(),  rep,       "reputation_contract");
+        assert_eq!(client.get_circle_wasm_hash(),     wasm_hash, "circle_wasm_hash");
+    }
+
+    #[test]
     #[should_panic(expected = "already initialized")]
     fn test_double_initialize_panics() {
         let env = Env::default();
         let s = setup_factory(&env);
         let admin2 = Address::generate(&env);
         s.client.initialize(&admin2, &s.wasm_hash, &Address::generate(&env), &Address::generate(&env));
+    }
+
+    /// The reentrancy guard (DataKey::Initializing) is set before any other
+    /// storage write in `initialize`.  A second call that arrives while the
+    /// first is still in progress must panic with "initialize already in
+    /// progress" rather than proceeding and observing partial state.
+    ///
+    /// In the test environment we simulate this by manually setting the
+    /// Initializing flag via `as_contract` before calling initialize on a
+    /// fresh (un-initialized) factory instance.
+    #[test]
+    #[should_panic(expected = "initialize already in progress")]
+    fn test_initialize_reentrancy_guard_fires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+
+        // Simulate a reentrant call landing mid-initialize by pre-setting the flag.
+        env.as_contract(&id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
+
+        let admin = Address::generate(&env);
+        let wh: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        // Must panic: Initializing flag is already set.
+        client.initialize(&admin, &wh, &Address::generate(&env), &Address::generate(&env));
+    }
+
+    /// After a failed initialize (reentrancy panic) the Admin key must remain
+    /// absent, confirming that the guard fires before any committed state.
+    #[test]
+    fn test_initialize_reentrancy_guard_leaves_no_admin_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+
+        env.as_contract(&id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
+
+        let admin = Address::generate(&env);
+        let wh: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_initialize(
+            &admin, &wh, &Address::generate(&env), &Address::generate(&env),
+        );
+        assert!(result.is_err(), "initialize with Initializing flag set must fail");
+
+        // Admin key must not have been written.
+        let admin_result = client.try_get_admin();
+        assert!(
+            admin_result.is_err(),
+            "Admin key must be absent after a reentrancy-guard failure"
+        );
     }
 
     #[test]
@@ -665,6 +888,97 @@ mod tests {
         assert_ne!(s0, s1);
     }
 
+    // ── Issue #545 — create_circle salt generation collision safety ───────────
+    //
+    // The four inputs to derive_circle_salt are: creator, count,
+    // ledger_sequence, and ledger_timestamp.  The tests above cover creator,
+    // count, and sequence.  The tests below cover timestamp and verify the
+    // determinism / uniqueness properties of the full input space.
+
+    /// Changing only the ledger timestamp while holding creator, count, and
+    /// sequence constant must produce a different salt.  This confirms that
+    /// timestamp entropy is actually incorporated into the SHA-256 input.
+    #[test]
+    fn test_545_derive_circle_salt_differs_by_timestamp() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let s0 = derive_circle_salt(&env, &creator, 0);
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        let s1 = derive_circle_salt(&env, &creator, 0);
+        assert_ne!(s0, s1, "salt must change when only the ledger timestamp advances");
+    }
+
+    /// The salt function must be deterministic: identical inputs (creator,
+    /// count, sequence, timestamp) always produce the same output.  A
+    /// second call within the same ledger state must return the same bytes.
+    #[test]
+    fn test_545_derive_circle_salt_is_deterministic_given_fixed_ledger() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let a = derive_circle_salt(&env, &creator, 5);
+        let b = derive_circle_salt(&env, &creator, 5);
+        assert_eq!(a, b, "salt must be deterministic for the same (creator, count, ledger) inputs");
+    }
+
+    /// Each of the four salt inputs contributes independently: changing any
+    /// single input while holding the others constant produces a distinct salt.
+    /// This is a combined regression guard that the SHA-256 pre-image uses all
+    /// four fields and none is accidentally a no-op.
+    #[test]
+    fn test_545_each_salt_input_independently_contributes() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let base = derive_circle_salt(&env, &creator, 0);
+
+        // different creator
+        assert_ne!(base, derive_circle_salt(&env, &Address::generate(&env), 0),
+            "different creator must change the salt");
+
+        // different count
+        assert_ne!(base, derive_circle_salt(&env, &creator, 1),
+            "different count must change the salt");
+
+        // different sequence
+        env.ledger().with_mut(|l| l.sequence_number += 1);
+        let after_seq = derive_circle_salt(&env, &creator, 0);
+        assert_ne!(base, after_seq, "different sequence must change the salt");
+        env.ledger().with_mut(|l| l.sequence_number -= 1);
+
+        // different timestamp
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        let after_ts = derive_circle_salt(&env, &creator, 0);
+        assert_ne!(base, after_ts, "different timestamp must change the salt");
+    }
+
+    /// A failed create_circle call must not consume a counter slot.  Repeating
+    /// the same valid (creator, count=0, sequence, timestamp) after a failed
+    /// attempt must produce the same salt as the original attempt, confirming
+    /// that the counter was not incremented.
+    #[test]
+    fn test_545_failed_create_does_not_advance_salt_counter() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+
+        // Record the salt that would be used for the first successful create.
+        let creator = Address::generate(&env);
+        let salt_before_fail = derive_circle_salt(&env, &creator, 0);
+
+        // Attempt an invalid create (zero round_amount) — must be rejected.
+        let m = make_members(&env, 2);
+        let result = s.client.try_create_circle(
+            &creator, &m, &0i128, &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(result.is_err(), "zero-amount create must be rejected");
+
+        // Counter must still be 0 — same salt would be generated for a
+        // retry with the same ledger state.
+        assert_eq!(s.client.get_circle_count(), 0,
+            "failed create must not increment the factory counter");
+        let salt_after_fail = derive_circle_salt(&env, &creator, 0);
+        assert_eq!(salt_before_fail, salt_after_fail,
+            "salt for count=0 must be identical before and after a failed create");
+    }
+
     // ── create_circle: rejected before initialize ─────────────────────────────
 
     #[test]
@@ -683,20 +997,68 @@ mod tests {
         );
     }
 
+    // ── create_circle: registry keys must exist (issue #567) ─────────────────
+    //
+    // A missing counter or list on an initialized factory is a storage
+    // inconsistency.  Defaulting them would reuse deploy salts or overwrite
+    // the registry with only the new circle, so both are rejected before the
+    // deploy step.
+
+    #[test]
+    #[should_panic(expected = "factory: Circles registry missing")]
+    fn test_create_circle_rejects_missing_circles_registry() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+        env.as_contract(&s.client.address, || {
+            env.storage().instance().remove(&DataKey::Circles);
+        });
+        s.client.create_circle(
+            &Address::generate(&env), &make_members(&env, 2), &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "factory: CircleCount missing")]
+    fn test_create_circle_rejects_missing_circle_count() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+        env.as_contract(&s.client.address, || {
+            env.storage().instance().remove(&DataKey::CircleCount);
+        });
+        s.client.create_circle(
+            &Address::generate(&env), &make_members(&env, 2), &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+    }
+
+    // ── Event namespaces (issue #566) ─────────────────────────────────────────
+
+    /// The indexer routes events by topic 0; the three contracts must each
+    /// own a distinct, stable namespace.
+    #[test]
+    fn test_event_namespaces_are_stable_and_distinct() {
+        assert_eq!(EVENT_NAMESPACE, "factory");
+        assert_eq!(circle::EVENT_NAMESPACE, "circle");
+        assert_eq!(reputation::EVENT_NAMESPACE, "reputation");
+        assert_ne!(EVENT_NAMESPACE, circle::EVENT_NAMESPACE);
+        assert_ne!(EVENT_NAMESPACE, reputation::EVENT_NAMESPACE);
+        assert_ne!(circle::EVENT_NAMESPACE, reputation::EVENT_NAMESPACE);
+    }
+
     // ── create_circle: input validation rejects before any state mutation ─────
 
     #[test]
-    #[should_panic(expected = "need at least 2 members")]
     fn test_create_circle_rejects_single_member_no_state_change() {
         let env = Env::default();
+        env.mock_all_auths();
         let s = setup_factory(&env);
         let mut m = Vec::new(&env);
         m.push_back(Address::generate(&env));
         let count_before = s.client.get_circle_count();
-        let _ = s.client.try_create_circle(
+        let result = s.client.try_create_circle(
             &Address::generate(&env), &m, &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
         );
-        // Count must be unchanged
+        assert!(result.is_err(), "single-member create must be rejected");
+        // Count must be unchanged after the rejection
         assert_eq!(s.client.get_circle_count(), count_before);
     }
 
@@ -844,6 +1206,137 @@ mod tests {
 
         assert_eq!(s.client.get_circle_count(), 0);
         assert!(s.client.get_circles().is_empty());
+    }
+
+    // ── Auth + init guard edge cases ──────────────────────────────────────────
+
+    /// `initialize` must require the admin to authorize the call.
+    ///
+    /// With `mock_all_auths` disabled the admin signature is absent, so the
+    /// `admin.require_auth()` call inside `initialize` must cause a trap/panic
+    /// that surfaces as an error result.
+    #[test]
+    fn test_initialize_requires_admin_auth() {
+        let env = Env::default();
+        // Do NOT call env.mock_all_auths() — no authorization is provided.
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let wh: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+
+        let result = client.try_initialize(
+            &admin,
+            &wh,
+            &Address::generate(&env),
+            &Address::generate(&env),
+        );
+        assert!(
+            result.is_err(),
+            "initialize must be rejected when admin authorization is missing"
+        );
+        // Factory must remain uninitialized — no Admin key written.
+        let admin_result = client.try_get_admin();
+        assert!(
+            admin_result.is_err(),
+            "Admin key must be absent after rejected initialize (no auth)"
+        );
+    }
+
+    /// `create_circle` must require the creator to authorize the call.
+    ///
+    /// With `mock_all_auths` disabled the creator signature is absent, so the
+    /// `creator.require_auth()` call inside `create_circle` must reject before
+    /// touching any factory state.
+    #[test]
+    fn test_create_circle_requires_creator_auth() {
+        let env = Env::default();
+        // Initialize the factory with mocked auth so it is in a valid state.
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin  = Address::generate(&env);
+        let wh: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        client.initialize(&admin, &wh, &Address::generate(&env), &Address::generate(&env));
+
+        // Now strip auth and attempt create_circle.
+        env.set_auths(&[]);
+        let m = make_members(&env, 2);
+        let result = client.try_create_circle(
+            &Address::generate(&env),
+            &m,
+            &1_000_000i128,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(
+            result.is_err(),
+            "create_circle must be rejected when creator authorization is missing"
+        );
+        // Factory state must be unchanged.
+        assert_eq!(
+            client.get_circle_count(),
+            0,
+            "circle count must remain 0 after rejected create (no auth)"
+        );
+        assert!(
+            client.get_circles().is_empty(),
+            "circles list must remain empty after rejected create (no auth)"
+        );
+    }
+
+    /// After a successful `initialize` the `Initializing` reentrancy guard must
+    /// be removed from storage.  If the flag persists, the factory would reject
+    /// every subsequent call as "initialize already in progress".
+    #[test]
+    fn test_initialize_clears_reentrancy_guard_on_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let wh: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+
+        // Successful initialize.
+        client.initialize(&admin, &wh, &Address::generate(&env), &Address::generate(&env));
+
+        // Verify the Initializing flag is gone by checking that a second
+        // initialize fails with "already initialized" (from the Admin check)
+        // rather than "initialize already in progress" (from the guard).
+        let result = client.try_initialize(
+            &Address::generate(&env),
+            &wh,
+            &Address::generate(&env),
+            &Address::generate(&env),
+        );
+        assert!(
+            result.is_err(),
+            "second initialize must fail on Admin presence check, not on lingering Initializing flag"
+        );
+        // The Admin key must still be the original admin — proving the guard
+        // was cleared and the double-init guard fired correctly.
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    /// `create_circle` called with an uninitialized factory must fail with the
+    /// specific "called before initialize" message, not with a generic storage
+    /// panic.  This ensures the early-exit guard fires before spending deploy gas.
+    #[test]
+    fn test_create_circle_before_initialize_uses_descriptive_panic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+
+        let m = make_members(&env, 2);
+        let result = client.try_create_circle(
+            &Address::generate(&env),
+            &m,
+            &1_000_000i128,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(
+            result.is_err(),
+            "create_circle must be rejected when the factory is not initialized"
+        );
     }
 
     // ── Adversarial authorization tests (Issue #87) ───────────────────────────

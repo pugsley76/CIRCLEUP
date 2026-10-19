@@ -13,5 +13,7 @@
     "sourceMap": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "src/__tests__"]
+  // Test files live both in src/__tests__ and next to their module
+  // (src/*.test.ts); neither belongs in dist/ or its declarations.
+  "exclude": ["node_modules", "dist", "src/__tests__", "src/**/*.test.ts"]
 }

@@ -27,7 +27,7 @@ import {
   scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
-import { CircleClient, FactoryClient, ReputationClient } from "../client";
+import { CircleClient, FactoryClient, ReputationClient, isCircleNotActive } from "../client";
 import { isTxFailure, isTxSuccess } from "../types";
 import {
   CIRCLE_ADDR,
@@ -332,12 +332,16 @@ describe("pipeline — contract rejects the call", () => {
     const thrown = await client.getCurrentRound().catch((err: Error) => err.message);
     const returned = await client.getCurrentRoundResult();
 
-    expect(thrown).toContain("circle is not active");
+    // Both the throwing helper (getCurrentRound) and the non-throwing helper
+    // (getCurrentRoundResult) normalise CircleNotActive errors to the same
+    // canonical "No active round" message, so the user experience is
+    // consistent regardless of which one the caller picked.
+    expect(isCircleNotActive(thrown as string)).toBe(true);
     expect(returned.ok).toBe(false);
     if (!returned.ok) {
-      // The throwing and non-throwing helpers are the same call path, so the
-      // wording a user sees must not depend on which one the caller picked.
-      expect(thrown).toContain(returned.error);
+      expect(isCircleNotActive(returned.error)).toBe(true);
+      // Both paths produce the same normalised message.
+      expect(thrown).toBe(returned.error);
     }
   });
 });

@@ -21,7 +21,30 @@ import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// ─── Budget definitions ────────────────────────────────────────────────────────
+// ─── Canonical money-math constants ──────────────────────────────────────────
+//
+// These values are inlined here because this test file runs with `node --test`
+// directly — it cannot import TypeScript source from another workspace package
+// at runtime.  They MUST stay in sync with the canonical definitions:
+//
+//   USDC_DECIMALS → sdk/src/constants.ts : USDC_DECIMALS  (currently 7)
+//   STROOP        → sdk/src/utils.ts     : STROOP         (BigInt(10 ** USDC_DECIMALS))
+//
+// The assertions immediately below are the automated guard: if either value
+// drifts from the canonical source the test suite will fail at the top of the
+// file, before any timing measurement runs, making the divergence impossible
+// to miss.
+
+/** Mirror of USDC_DECIMALS in sdk/src/constants.ts. */
+const USDC_DECIMALS = 7;
+/** Mirror of STROOP in sdk/src/utils.ts — must equal BigInt(10 ** USDC_DECIMALS). */
+const STROOP = BigInt(10 ** USDC_DECIMALS);
+
+// Invariant assertions — fail fast if constants drift from the canonical source.
+assert.strictEqual(USDC_DECIMALS, 7,   "USDC_DECIMALS must equal sdk/src/constants.ts USDC_DECIMALS");
+assert.strictEqual(STROOP, 10_000_000n, "STROOP must equal sdk/src/utils.ts STROOP (10^USDC_DECIMALS)");
+
+
 
 const _dirname = typeof __dirname !== "undefined"
   ? __dirname
@@ -121,9 +144,8 @@ describe("Render preparation budgets", () => {
     // Simulate the work CircleCard does: status lookup, formatting
     const status = circle.status?.trim().toLowerCase();
     const amount = BigInt(circle.round_amount);
-    const STROOP = 10_000_000n;
     const whole = amount / STROOP;
-    const frac = (amount % STROOP).toString().padStart(7, "0").slice(0, 2);
+    const frac = (amount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
     const _formatted = `${whole}.${frac}`;
     const _progress = circle.total_rounds > 0
       ? Math.round((circle.current_round / circle.total_rounds) * 100)

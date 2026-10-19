@@ -4,7 +4,7 @@ import { useState, useTransition, Suspense } from "react";
 
 // ─── Types (mirrored from page.tsx to keep the bundle self-contained) ─────────
 
-type FetchError = "network" | "parse" | "server" | "misconfigured";
+type FetchError = "network" | "parse" | "server" | "misconfigured" | "indexer_outage";
 
 // ─── Retry banner ─────────────────────────────────────────────────────────────
 
@@ -19,6 +19,9 @@ const ERROR_MESSAGES: Record<FetchError, string> = {
     "The indexer returned an unexpected error. Circles cannot be loaded at the moment.",
   parse:
     "The indexer response was malformed. This is likely a temporary issue.",
+  indexer_outage:
+    "The indexer is running but currently degraded. It may be catching up with the chain or experiencing a service disruption. " +
+    "Circle data may be incomplete or temporarily unavailable.",
 };
 
 interface RetryBannerProps {
@@ -29,9 +32,9 @@ interface RetryBannerProps {
 }
 
 function RetryBanner({ error, attempt, onRetry, isPending }: RetryBannerProps) {
-  // Misconfiguration is an operator error that a page-level refresh cannot
-  // fix — hide the retry button so users don't hammer a broken endpoint.
-  const canRetry = error !== "misconfigured";
+  // Misconfiguration and outage are operator/service errors that a page-level
+  // refresh cannot fix — hide the retry button so users don't hammer a broken endpoint.
+  const canRetry = error !== "misconfigured" && error !== "indexer_outage";
 
   return (
     <div

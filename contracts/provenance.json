@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "1.0.0",
+  "timestamp": "2026-10-18T23:30:30.741Z",
+  "git": {
+    "commit": "728afbd4ca96176937f96d190bad4bca5246f169",
+    "branch": "main",
+    "isDirty": true
+  },
+  "toolchain": {
+    "pinned": "1.81.0",
+    "active": "stable-aarch64-apple-darwin",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "target": "wasm32-unknown-unknown",
+    "profile": "release"
+  },
+  "artifacts": {
+    "reputation.wasm": {
+      "sha256": "c8919f9828b4da157d278779c2a024ded0565b7dfec7066eb76e891d8bd349e4",
+      "sizeBytes": 15461
+    },
+    "circle_factory.wasm": {
+      "sha256": "89610a8735da34d9bebe4e0b6459dede6f95016a17ab08f595d779b44d3a394a",
+      "sizeBytes": 23240
+    },
+    "circle.wasm": {
+      "sha256": "1de343ae6804f1cc09623fb7846fa030c3f7f3a03e1b81251ba07f3306a52d6c",
+      "sizeBytes": 65558
+    }
+  }
+}

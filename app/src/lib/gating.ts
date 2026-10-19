@@ -179,6 +179,8 @@ function gateJoin(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateRe
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before joining.`,
     );
   }
+  const netGate = checkNetworkGate(snap);
+  if (netGate) return netGate;
   if (!isPendingStatus(snap.status)) {
     return blocked(
       "wrong_status",
@@ -201,6 +203,8 @@ function gateContribute(snap: AppStateSnapshot, nowMs: number, maxAge: number): 
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before contributing.`,
     );
   }
+  const netGate = checkNetworkGate(snap);
+  if (netGate) return netGate;
   if (!isActiveStatus(snap.status)) {
     return blocked(
       "wrong_status",
@@ -233,6 +237,8 @@ function gatePayout(snap: AppStateSnapshot, nowMs: number, maxAge: number): Gate
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before triggering payout.`,
     );
   }
+  const netGate = checkNetworkGate(snap);
+  if (netGate) return netGate;
   if (!isActiveStatus(snap.status)) {
     return blocked(
       "wrong_status",
@@ -256,6 +262,8 @@ function gateDefault(snap: AppStateSnapshot, nowMs: number, maxAge: number): Gat
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before marking a default.`,
     );
   }
+  const netGate = checkNetworkGate(snap);
+  if (netGate) return netGate;
   if (!isActiveStatus(snap.status)) {
     return blocked(
       "wrong_status",
@@ -295,6 +303,8 @@ function gateClose(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateR
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before closing.`,
     );
   }
+  const netGate = checkNetworkGate(snap);
+  if (netGate) return netGate;
   if (!isTerminalStatus(snap.status) && snap.status !== "Closed") {
     return blocked(
       "wrong_status",
@@ -334,6 +344,11 @@ export function computeActionEligibility(
 ): GateResult {
   const nowMs  = opts.nowMs  ?? Date.now();
   const maxAge = opts.maxSnapshotAgeMs ?? DEFAULT_MAX_SNAPSHOT_AGE_MS;
+  const networkGate = checkNetworkGate(snapshot);
+  if (networkGate) return networkGate;
+
+  const netGate = checkNetworkGate(snapshot);
+  if (netGate) return netGate;
 
   switch (action) {
     case "join":       return gateJoin(snapshot, nowMs, maxAge);

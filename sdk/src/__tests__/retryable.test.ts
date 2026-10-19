@@ -73,6 +73,16 @@ describe("isRetryable: in-flight ambiguity (not automatically retryable)", () =>
 
 // ── Unknown ───────────────────────────────────────────────────────────────────
 
+describe("isRetryable: unsettled or expired writes", () => {
+  it("outcome_unknown is NOT retryable — the write may already be applied", () => {
+    expect(isRetryable(failure("outcome_unknown", "a".repeat(64)))).toBe(false);
+  });
+
+  it("tx_expired is retryable — the envelope can no longer be included", () => {
+    expect(isRetryable(failure("tx_expired", "b".repeat(64)))).toBe(true);
+  });
+});
+
 describe("isRetryable: unknown code", () => {
   it("unknown is not retryable — conservative default", () => {
     expect(isRetryable(failure("unknown"))).toBe(false);
@@ -82,7 +92,12 @@ describe("isRetryable: unknown code", () => {
 // ── Exhaustive coverage ───────────────────────────────────────────────────────
 
 describe("isRetryable: exhaustive coverage of all TxErrorCode values", () => {
-  const retryable: TxErrorCode[] = ["network_error", "try_again_later", "tx_rejected"];
+  const retryable: TxErrorCode[] = [
+    "network_error",
+    "try_again_later",
+    "tx_rejected",
+    "tx_expired",
+  ];
   const notRetryable: TxErrorCode[] = [
     "invalid_argument",
     "account_not_found",
@@ -90,6 +105,8 @@ describe("isRetryable: exhaustive coverage of all TxErrorCode values", () => {
     "tx_failed",
     "timeout",
     "stale_rpc",
+    "stale_state",
+    "outcome_unknown",
     "unknown",
   ];
 
@@ -117,8 +134,11 @@ describe("isRetryable: exhaustive coverage of all TxErrorCode values", () => {
       "try_again_later",
       "tx_rejected",
       "tx_failed",
+      "tx_expired",
       "stale_rpc",
+      "stale_state",
       "timeout",
+      "outcome_unknown",
       "unknown",
     ];
     for (const code of defined) {

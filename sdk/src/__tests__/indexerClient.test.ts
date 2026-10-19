@@ -7,8 +7,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { IndexerClient, IndexerError } from "../client";
+import { DEFAULT_INDEXER_TIMEOUT_MS, IndexerClient, IndexerError } from "../client";
 import type { CircleUpConfig } from "../types";
+import { CIRCLE_ADDR, MEMBER_A_ADDR } from "./fixtures";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -23,8 +24,15 @@ const BASE_CONFIG: CircleUpConfig = {
   indexerUrl: "http://localhost:3001",
 };
 
-const CIRCLE_ADDR = "CTEST_CIRCLE_ADDRESS";
-const MEMBER_ADDR = "GABC123";
+const MEMBER_ADDR = MEMBER_A_ADDR;
+
+/** A well-formed GET /circles page envelope. */
+function circlesPage(circles: unknown[] = [], page = 1, limit = 20, total = circles.length) {
+  return {
+    circles,
+    pagination: { page, limit, total, totalPages: total === 0 ? 0 : Math.ceil(total / limit) },
+  };
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -79,9 +87,38 @@ describe("IndexerClient construction", () => {
     );
   });
 
+  it.each([
+    ["no scheme", "localhost:3001"],
+    ["bare host", "indexer.example.com"],
+    ["relative path", "/api/indexer"],
+    ["non-HTTP scheme", "ftp://indexer.example.com"],
+    ["query string", "http://localhost:3001?token=x"],
+    ["fragment", "http://localhost:3001#circles"],
+  ])("throws at construction for a misconfigured indexerUrl (%s)", (_label, indexerUrl) => {
+    const cfg: CircleUpConfig = { ...BASE_CONFIG, indexerUrl };
+    expect(() => new IndexerClient(cfg)).toThrow("is not a valid absolute HTTP(S) URL");
+  });
+
+  it("normalises trailing slashes and keeps a base path", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(circlesPage()), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const client = new IndexerClient({
+        ...BASE_CONFIG,
+        indexerUrl: " https://api.example.com/indexer// ",
+      });
+      await client.getCircles();
+      expect(fetchMock.mock.calls[0][0]).toBe("https://api.example.com/indexer/circles");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("strips trailing slash from indexerUrl", async () => {
     const cfg: CircleUpConfig = { ...BASE_CONFIG, indexerUrl: "http://localhost:3001/" };
-    const mockFetch = mockOk({ circles: [] });
+    const mockFetch = mockOk(circlesPage());
     vi.stubGlobal("fetch", mockFetch);
 
     const client = new IndexerClient(cfg);
@@ -100,7 +137,7 @@ describe("IndexerClient.getCircles", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("returns parsed circles list", async () => {
-    const payload = { circles: [{ address: CIRCLE_ADDR, status: "Active" }] };
+    const payload = circlesPage([{ address: CIRCLE_ADDR, status: "Active" }]);
     vi.stubGlobal("fetch", mockOk(payload));
 
     const client = new IndexerClient(BASE_CONFIG);
@@ -111,7 +148,7 @@ describe("IndexerClient.getCircles", () => {
   });
 
   it("calls the correct endpoint", async () => {
-    const mockFetch = mockOk({ circles: [] });
+    const mockFetch = mockOk(circlesPage());
     vi.stubGlobal("fetch", mockFetch);
 
     await new IndexerClient(BASE_CONFIG).getCircles();
@@ -403,5 +440,191 @@ describe("IndexerError", () => {
     expect(err.url).toBe("http://localhost:3001/circles/X");
     expect(err.message).toBe("something went wrong");
     expect(err).toBeInstanceOf(Error);
+  });
+});
+
+// ─── Transport: timeouts, cancellation, failure categories (issue #659) ──────
+
+describe("IndexerClient transport", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** A fetch that never settles unless its AbortSignal fires. */
+  function hangingFetch() {
+    return vi.fn((_url: string, init?: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted")));
+      }),
+    );
+  }
+
+  it("defaults to a bounded timeout", () => {
+    expect(DEFAULT_INDEXER_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(Number.isFinite(DEFAULT_INDEXER_TIMEOUT_MS)).toBe(true);
+  });
+
+  it("passes an AbortSignal to fetch", async () => {
+    const mockFetch = mockOk({ circles: [] });
+    vi.stubGlobal("fetch", mockFetch);
+
+    await new IndexerClient(BASE_CONFIG).getCircles();
+
+    const init = mockFetch.mock.calls[0][1] as { signal?: AbortSignal };
+    expect(init.signal).toBeDefined();
+  });
+
+  it("rejects with kind 'timeout' when the indexer stalls", async () => {
+    vi.stubGlobal("fetch", hangingFetch());
+
+    const err = await new IndexerClient(BASE_CONFIG, { timeoutMs: 20 })
+      .getCircles()
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(IndexerError);
+    expect((err as IndexerError).kind).toBe("timeout");
+    expect((err as IndexerError).status).toBe(0);
+    expect((err as IndexerError).retryable).toBe(true);
+    expect((err as IndexerError).message).toContain("timed out after 20 ms");
+  });
+
+  it("times out even if fetch ignores the abort signal", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+
+    const err = await new IndexerClient(BASE_CONFIG)
+      .health({ timeoutMs: 20 })
+      .catch((e) => e);
+
+    expect((err as IndexerError).kind).toBe("timeout");
+  });
+
+  it("times out while reading a stalled response body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200, json: () => new Promise(() => {}) }),
+    );
+
+    const err = await new IndexerClient(BASE_CONFIG, { timeoutMs: 20 })
+      .getMembers(CIRCLE_ADDR)
+      .catch((e) => e);
+
+    expect((err as IndexerError).kind).toBe("timeout");
+  });
+
+  it("rejects with kind 'aborted' when the caller's signal fires", async () => {
+    vi.stubGlobal("fetch", hangingFetch());
+    const controller = new AbortController();
+
+    const pending = new IndexerClient(BASE_CONFIG)
+      .getCircleDetail(CIRCLE_ADDR, { signal: controller.signal })
+      .catch((e) => e);
+    controller.abort();
+    const err = await pending;
+
+    expect(err).toBeInstanceOf(IndexerError);
+    expect((err as IndexerError).kind).toBe("aborted");
+    expect((err as IndexerError).retryable).toBe(false);
+  });
+
+  it("does not call fetch when the caller's signal is already aborted", async () => {
+    const mockFetch = mockOk({ circles: [] });
+    vi.stubGlobal("fetch", mockFetch);
+    const controller = new AbortController();
+    controller.abort();
+
+    const err = await new IndexerClient(BASE_CONFIG)
+      .getCircles(undefined, { signal: controller.signal })
+      .catch((e) => e);
+
+    expect((err as IndexerError).kind).toBe("aborted");
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("classifies a rejected fetch as kind 'network'", async () => {
+    vi.stubGlobal("fetch", mockNetworkFailure("ECONNREFUSED"));
+
+    const err = await new IndexerClient(BASE_CONFIG).getCircles().catch((e) => e);
+
+    expect((err as IndexerError).kind).toBe("network");
+    expect((err as IndexerError).retryable).toBe(true);
+  });
+
+  it.each([
+    [404, false],
+    [429, true],
+    [500, true],
+    [503, true],
+  ])("classifies HTTP %i as kind 'http' (retryable: %s)", async (status, retryable) => {
+    vi.stubGlobal("fetch", mockError(status));
+
+    const err = await new IndexerClient(BASE_CONFIG).getCircles().catch((e) => e);
+
+    expect((err as IndexerError).kind).toBe("http");
+    expect((err as IndexerError).status).toBe(status);
+    expect((err as IndexerError).retryable).toBe(retryable);
+  });
+
+  it("keeps HTTP classification when the error body is not JSON", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("<html>Bad Gateway</html>", { status: 502 })),
+    );
+
+    const err = await new IndexerClient(BASE_CONFIG).getCircles().catch((e) => e);
+
+    expect((err as IndexerError).kind).toBe("http");
+    expect((err as IndexerError).status).toBe(502);
+    expect((err as IndexerError).message).not.toContain("<html>");
+  });
+
+  it("truncates a long indexer error string", async () => {
+    vi.stubGlobal("fetch", mockError(500, { error: "x".repeat(5_000) }));
+
+    const err = await new IndexerClient(BASE_CONFIG).getCircles().catch((e) => e);
+
+    expect((err as IndexerError).message.length).toBeLessThan(500);
+  });
+
+  it("classifies an invalid JSON success body as kind 'json' without echoing it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("<html>maintenance page</html>", { status: 200 })),
+    );
+
+    const err = await new IndexerClient(BASE_CONFIG).getCircles().catch((e) => e);
+
+    expect(err).toBeInstanceOf(IndexerError);
+    expect((err as IndexerError).kind).toBe("json");
+    expect((err as IndexerError).status).toBe(200);
+    expect((err as IndexerError).retryable).toBe(false);
+    expect((err as IndexerError).message).not.toContain("maintenance page");
+  });
+
+  it.each([
+    ["getCircles", (c: IndexerClient) => c.getCircles(), { circle: [] }],
+    ["getCircleDetail", (c: IndexerClient) => c.getCircleDetail(CIRCLE_ADDR), { circle: null, members: [] }],
+    ["getMembers", (c: IndexerClient) => c.getMembers(CIRCLE_ADDR), { members: {} }],
+    ["getRounds", (c: IndexerClient) => c.getRounds(CIRCLE_ADDR), { rounds: [] }],
+    ["getReputation", (c: IndexerClient) => c.getReputation(MEMBER_ADDR), { score: 1 }],
+    ["getMemberContributions", (c: IndexerClient) => c.getMemberContributions(MEMBER_ADDR), {}],
+    ["getCircleAuditEvents", (c: IndexerClient) => c.getCircleAuditEvents(CIRCLE_ADDR), { events: null }],
+    ["health", (c: IndexerClient) => c.health(), { ok: true }],
+    ["any method given a JSON array", (c: IndexerClient) => c.getCircles(), []],
+  ])("classifies a malformed %s payload as kind 'schema'", async (_name, call, payload) => {
+    vi.stubGlobal("fetch", mockOk(payload));
+
+    const err = await call(new IndexerClient(BASE_CONFIG)).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(IndexerError);
+    expect((err as IndexerError).kind).toBe("schema");
+    expect((err as IndexerError).status).toBe(200);
+  });
+
+  it("rejects a non-positive timeout at construction", () => {
+    expect(() => new IndexerClient(BASE_CONFIG, { timeoutMs: 0 })).toThrow("timeoutMs");
+    expect(() => new IndexerClient(BASE_CONFIG, { timeoutMs: Number.NaN })).toThrow("timeoutMs");
+  });
+
+  it("infers kind from status for errors constructed without one", () => {
+    expect(new IndexerError("x", 0, "u").kind).toBe("network");
+    expect(new IndexerError("x", 500, "u").kind).toBe("http");
   });
 });

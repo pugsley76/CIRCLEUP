@@ -1,4 +1,4 @@
-# CircleUp Operational Runbook
+﻿# CircleUp Operational Runbook
 
 This document is the primary operational and contributor reference for the full CircleUp stack. It covers architecture, local development, deployment, environment configuration, data flow, troubleshooting, and common failure recovery procedures.
 
@@ -32,10 +32,11 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger)
 - [Database Backup and Restore](#database-backup-and-restore)
   - [Backup](#backup)
-  - [Restore](#restore)
+  - [Restore drill — isolated target](#restore-drill--isolated-target)
   - [Post-restore verification](#post-restore-verification)
   - [Applying migrations after restore](#applying-migrations-after-restore)
-  - [When to use chain replay instead of restore](#when-to-use-chain-replay-instead-of-restore)
+  - [Restore vs. chain replay — decision criteria](#restore-vs-chain-replay--decision-criteria)
+  - [Promoting the restore target to production](#promoting-the-restore-target-to-production)
   - [Rollback guidance](#rollback-guidance)
 - [Health Checks and Monitoring](#health-checks-and-monitoring)
   - [Indexer Health Endpoint](#indexer-health-endpoint)
@@ -94,36 +95,36 @@ The contracts are the source of truth. The indexer is a derived read-model. The 
 ## Architecture Diagram
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                      Stellar Testnet                            │
-│                                                                 │
-│  ┌──────────────────┐  deploys  ┌─────────────────────────┐   │
-│  │  circle_factory  │──────────▶│  circle (per instance)  │   │
-│  └──────────────────┘           └─────────────────────────┘   │
-│           │                               │                     │
-│     registers caller               calls increment              │
-│           │                               │                     │
-│           ▼                               ▼                     │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │                     reputation                            │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────┘
-           ▲ Soroban events                  ▲ RPC simulation calls
-           │                                 │
-┌──────────┴──────────┐          ┌───────────┴──────────┐
-│      indexer        │          │         sdk           │
-│  Node + Postgres    │          │  TypeScript client    │
-│  REST API :3001     │          └──────────────────────┘
-└──────────┬──────────┘                    ▲
-           │ HTTP JSON                     │ imported by
-           ▼                               │
-┌──────────────────────────────────────────────────────────────┐
-│                    app (Next.js 14)                            │
-│  /                 → circle list (fetches from indexer)        │
-│  /create           → deploy circle (Freighter + SDK)          │
-│  /circles/[addr]   → detail + contribute/payout actions        │
-│  /reputation/[m]   → on-chain score + participation history    │
-└──────────────────────────────────────────────────────────────┘
+ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
+Γöé                      Stellar Testnet                            Γöé
+Γöé                                                                 Γöé
+Γöé  ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ  deploys  ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ   Γöé
+Γöé  Γöé  circle_factory  ΓöéΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓû╢Γöé  circle (per instance)  Γöé   Γöé
+Γöé  ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ           ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ   Γöé
+Γöé           Γöé                               Γöé                     Γöé
+Γöé     registers caller               calls increment              Γöé
+Γöé           Γöé                               Γöé                     Γöé
+Γöé           Γû╝                               Γû╝                     Γöé
+Γöé  ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ  Γöé
+Γöé  Γöé                     reputation                            Γöé  Γöé
+Γöé  ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ  Γöé
+ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+           Γû▓ Soroban events                  Γû▓ RPC simulation calls
+           Γöé                                 Γöé
+ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ          ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
+Γöé      indexer        Γöé          Γöé         sdk           Γöé
+Γöé  Node + Postgres    Γöé          Γöé  TypeScript client    Γöé
+Γöé  REST API :3001     Γöé          ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ                    Γû▓
+           Γöé HTTP JSON                     Γöé imported by
+           Γû╝                               Γöé
+ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
+Γöé                    app (Next.js 14)                            Γöé
+Γöé  /                 ΓåÆ circle list (fetches from indexer)        Γöé
+Γöé  /create           ΓåÆ deploy circle (Freighter + SDK)          Γöé
+Γöé  /circles/[addr]   ΓåÆ detail + contribute/payout actions        Γöé
+Γöé  /reputation/[m]   ΓåÆ on-chain score + participation history    Γöé
+ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
 ```
 
 ---
@@ -136,13 +137,13 @@ Located in `contracts/`. Three contracts, each with a single responsibility:
 
 **`circle_factory`** (`contracts/circle_factory/src/lib.rs`)
 - Stores the circle WASM hash, the reputation contract address, and the USDC token address.
-- `create_circle` deploys a new circle contract, initializes it, registers it as an authorized reputation caller, and records its address — all atomically in one transaction.
+- `create_circle` deploys a new circle contract, initializes it, registers it as an authorized reputation caller, and records its address ΓÇö all atomically in one transaction.
 - Maintains `Circles: Vec<Address>` and `CircleCount: u32` which always satisfy `count == circles.len()`.
 
 **`circle`** (`contracts/circle/src/lib.rs`)
 - Core ROSCA logic: join, contribute, payout, mark_default, cancel, close.
-- Status transitions: `Pending → Active → Completed` or `Pending → Cancelled`.
-- Every member must lock `round_amount × COLLATERAL_MULTIPLIER` USDC (currently 1×) to join.
+- Status transitions: `Pending ΓåÆ Active ΓåÆ Completed` or `Pending ΓåÆ Cancelled`.
+- Every member must lock `round_amount ├ù COLLATERAL_MULTIPLIER` USDC (currently 1├ù) to join.
 - Round deadline is `round_deadline_ledgers` ledgers after the circle goes Active (last member joins).
 - 20% collateral penalty (`PENALTY_BPS = 2000`, `BPS_DENOM = 10000`) for a missed round.
 - Calls `reputation.increment(circle_address, member)` after each successful payout.
@@ -157,10 +158,10 @@ Located in `contracts/`. Three contracts, each with a single responsibility:
 
 Located in `sdk/`. Published as `@circleup/sdk` within the npm workspace.
 
-- `FactoryClient` — wraps `create_circle` and `get_circles` factory calls.
-- `CircleClient` — wraps `join`, `contribute`, `payout`, `mark_default`, `cancel`, `close`, and all read views for a single circle.
-- `ReputationClient` — wraps `score` and other reputation views.
-- `getNetworkConfig` / `isValidNetwork` — typed network config with RPC URL and passphrase.
+- `FactoryClient` ΓÇö wraps `create_circle` and `get_circles` factory calls.
+- `CircleClient` ΓÇö wraps `join`, `contribute`, `payout`, `mark_default`, `cancel`, `close`, and all read views for a single circle.
+- `ReputationClient` ΓÇö wraps `score` and other reputation views.
+- `getNetworkConfig` / `isValidNetwork` ΓÇö typed network config with RPC URL and passphrase.
 - Utility helpers: `usdcToStroops`, `stroopsToUsdc`, `formatUsdc`, `formatPot`, `daysToLedgers`, `shortAddress`.
 
 The app package (`app/`) uses the SDK indirectly through `app/src/lib/stellar.ts` rather than importing `@circleup/sdk` directly. The `scripts/` package uses the SDK directly for deployment and seeding.
@@ -182,7 +183,7 @@ Located in `app/`. Next.js 14 App Router with Server Components for data fetchin
 Key patterns:
 - Server Components fetch from the indexer at render time with `cache: "no-store"`. The `cache()` wrapper in `app/src/app/page.tsx` collapses multiple calls within one render into a single request.
 - All contract interactions go through `app/src/lib/stellar.ts` which wraps Freighter and the Soroban RPC.
-- Wallet state is read on the client inside `useEffect` — never on the server — to avoid SSR/hydration mismatches.
+- Wallet state is read on the client inside `useEffect` ΓÇö never on the server ΓÇö to avoid SSR/hydration mismatches.
 - The `WalletRepLink` component in the nav reads the connected wallet address and links to `/reputation/[address]`.
 
 ---
@@ -193,52 +194,52 @@ Key patterns:
 
 ```
 User fills /create form
-  → CreateClient.tsx collects members, amount, deadline
-  → invokeContract("create_circle", ...) in stellar.ts
-  → Freighter signs the transaction
-  → circle_factory.create_circle() on Soroban RPC:
-      ├─ deploys circle WASM at deterministic address
-      ├─ calls circle.initialize(...)
-      └─ calls reputation.add_authorized_caller(circle_address)
-  → Soroban emits factory/circle_created event
-  → indexer polls event → writes row to circles table
-  → /circles page fetches from indexer REST API → renders CircleCard
+  ΓåÆ CreateClient.tsx collects members, amount, deadline
+  ΓåÆ invokeContract("create_circle", ...) in stellar.ts
+  ΓåÆ Freighter signs the transaction
+  ΓåÆ circle_factory.create_circle() on Soroban RPC:
+      Γö£ΓöÇ deploys circle WASM at deterministic address
+      Γö£ΓöÇ calls circle.initialize(...)
+      ΓööΓöÇ calls reputation.add_authorized_caller(circle_address)
+  ΓåÆ Soroban emits factory/circle_created event
+  ΓåÆ indexer polls event ΓåÆ writes row to circles table
+  ΓåÆ /circles page fetches from indexer REST API ΓåÆ renders CircleCard
 ```
 
 ### Contributing and triggering payout (write path)
 
 ```
 Member clicks "Contribute Round N"
-  → CircleDetailClient invokes circle.contribute(member) via Freighter
-  → circle stores Contributed(member, round_index) in persistent storage
-  → Soroban emits circle/contributed event
-  → (once all members contributed) anyone clicks "Trigger Payout"
-  → circle.payout() transfers pot to recipient, calls reputation.increment
-  → Soroban emits circle/payout and reputation/score_updated events
-  → indexer processes events → updates contributions, payouts, reputation tables
-  → page refetches from indexer → UI reflects new state
+  ΓåÆ CircleDetailClient invokes circle.contribute(member) via Freighter
+  ΓåÆ circle stores Contributed(member, round_index) in persistent storage
+  ΓåÆ Soroban emits circle/contributed event
+  ΓåÆ (once all members contributed) anyone clicks "Trigger Payout"
+  ΓåÆ circle.payout() transfers pot to recipient, calls reputation.increment
+  ΓåÆ Soroban emits circle/payout and reputation/score_updated events
+  ΓåÆ indexer processes events ΓåÆ updates contributions, payouts, reputation tables
+  ΓåÆ page refetches from indexer ΓåÆ UI reflects new state
 ```
 
 ### Reading circle state (read path)
 
 ```
 Browser navigates to /circles/[address]
-  → CircleDetailPage (Server Component) fetches:
-      GET /circles/:address          → circle row + members + latest ledger
-      GET /circles/:address/rounds   → payouts + contributions + pending defaults
-  → If indexer returns 404 → Next.js notFound() → not-found.tsx rendered
-  → If fetch succeeds → CircleDetailClient (Client Component) hydrated with data
-  → Client-side effects read wallet address from Freighter for action gating
+  ΓåÆ CircleDetailPage (Server Component) fetches:
+      GET /circles/:address          ΓåÆ circle row + members + latest ledger
+      GET /circles/:address/rounds   ΓåÆ payouts + contributions + pending defaults
+  ΓåÆ If indexer returns 404 ΓåÆ Next.js notFound() ΓåÆ not-found.tsx rendered
+  ΓåÆ If fetch succeeds ΓåÆ CircleDetailClient (Client Component) hydrated with data
+  ΓåÆ Client-side effects read wallet address from Freighter for action gating
 ```
 
 ### Reputation lookup (read path)
 
 ```
 User navigates to /reputation/[address]
-  → ReputationPage (Server Component) passes address to ReputationClient
-  → ReputationClient (Client Component) fetches:
-      GET /reputation/:member → score + per-circle contributions + defaults
-  → Renders score card, participation table, defaults table
+  ΓåÆ ReputationPage (Server Component) passes address to ReputationClient
+  ΓåÆ ReputationClient (Client Component) fetches:
+      GET /reputation/:member ΓåÆ score + per-circle contributions + defaults
+  ΓåÆ Renders score card, participation table, defaults table
 ```
 
 ---
@@ -282,7 +283,7 @@ docker compose up -d
 
 ```bash
 cp indexer/.env.example indexer/.env
-# Edit indexer/.env — fill in CIRCLE_FACTORY_ADDRESS, REPUTATION_ADDRESS, USDC_ADDRESS
+# Edit indexer/.env ΓÇö fill in CIRCLE_FACTORY_ADDRESS, REPUTATION_ADDRESS, USDC_ADDRESS
 # Leave DATABASE_URL as-is if you are using docker compose defaults
 ```
 
@@ -298,8 +299,8 @@ npm run migrate
 
 ```bash
 cp app/.env.example app/.env.local
-# Edit app/.env.local — paste the same contract addresses with NEXT_PUBLIC_ prefix
-# NEXT_PUBLIC_INDEXER_URL defaults to http://localhost:3001 — leave as-is for local dev
+# Edit app/.env.local ΓÇö paste the same contract addresses with NEXT_PUBLIC_ prefix
+# NEXT_PUBLIC_INDEXER_URL defaults to http://localhost:3001 ΓÇö leave as-is for local dev
 ```
 
 **6. Start the indexer**
@@ -323,7 +324,7 @@ npm run dev:app
 ```bash
 npm run seed:demo
 # Creates a 4-member $100/round testnet circle
-# Runs through Round 1 (all contribute → Alice receives $400)
+# Runs through Round 1 (all contribute ΓåÆ Alice receives $400)
 # Simulates Round 2 default for Dave
 ```
 
@@ -343,11 +344,11 @@ npm run dev
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | Yes | — | Postgres connection string, e.g. `postgresql://postgres:password@localhost:5432/circleup` |
-| `STELLAR_RPC_URL` | Yes | — | Soroban RPC endpoint, e.g. `https://soroban-testnet.stellar.org` |
-| `CIRCLE_FACTORY_ADDRESS` | Yes | — | Deployed factory contract ID (`C...`) |
-| `REPUTATION_ADDRESS` | Yes | — | Deployed reputation contract ID (`C...`) |
-| `USDC_ADDRESS` | Yes | — | USDC token contract ID (`C...`) |
+| `DATABASE_URL` | Yes | ΓÇö | Postgres connection string, e.g. `postgresql://postgres:password@localhost:5432/circleup` |
+| `STELLAR_RPC_URL` | Yes | ΓÇö | Soroban RPC endpoint, e.g. `https://soroban-testnet.stellar.org` |
+| `CIRCLE_FACTORY_ADDRESS` | Yes | ΓÇö | Deployed factory contract ID (`C...`) |
+| `REPUTATION_ADDRESS` | Yes | ΓÇö | Deployed reputation contract ID (`C...`) |
+| `USDC_ADDRESS` | Yes | ΓÇö | USDC token contract ID (`C...`) |
 | `NETWORK_PASSPHRASE` | No | `Test SDF Network ; September 2015` | Stellar network passphrase |
 | `PORT` | No | `3001` | API server port |
 | `START_LEDGER` | No | `0` | Ledger to start indexing from. Set to your deployment ledger to skip testnet genesis |
@@ -370,7 +371,7 @@ All required variables are validated at boot time. The indexer will exit with a 
 | `NEXT_PUBLIC_USDC_ADDRESS` | Yes (prod) | *(empty)* | USDC token contract ID |
 | `NEXT_PUBLIC_INDEXER_URL` | Yes | `http://localhost:3001` | Indexer base URL |
 
-In development, the contract address variables may be left blank — the app will start but contract interactions will fail gracefully. In production (`NODE_ENV=production`) they are required and the server will throw at boot time if they are missing.
+In development, the contract address variables may be left blank ΓÇö the app will start but contract interactions will fail gracefully. In production (`NODE_ENV=production`) they are required and the server will throw at boot time if they are missing.
 
 ---
 
@@ -381,8 +382,8 @@ In development, the contract address variables may be left blank — the app wil
 Contracts must be deployed in this exact order due to cross-contract dependencies:
 
 ```
-1. reputation   — no dependencies; stores admin address
-2. circle_factory — depends on reputation address and circle WASM hash
+1. reputation   ΓÇö no dependencies; stores admin address
+2. circle_factory ΓÇö depends on reputation address and circle WASM hash
 3. (circle instances are deployed by the factory; never manually)
 ```
 
@@ -433,7 +434,7 @@ START_LEDGER=12345678   # replace with the actual deployment ledger
 
 ### Updating the App and Indexer
 
-The app and indexer are stateless services — update them by restarting with the new code. No special migration is needed unless the indexer schema changed.
+The app and indexer are stateless services ΓÇö update them by restarting with the new code. No special migration is needed unless the indexer schema changed.
 
 If the indexer schema changed (new migration file added):
 
@@ -473,7 +474,7 @@ Schema states:
 |---|---|---|
 | `clean` | All migrations applied, no drift | None needed |
 | `pending` | New migration files not yet applied | Run `npm run migrate` |
-| `drifted` | Applied migrations no longer match files on disk | Investigate — do not re-run blindly |
+| `drifted` | Applied migrations no longer match files on disk | Investigate ΓÇö do not re-run blindly |
 | `partial` | Some migration files are missing from disk | Restore missing files before continuing |
 | `uninitialized` | No `schema_migrations` table at all | Run `npm run migrate` from scratch |
 
@@ -481,7 +482,7 @@ The indexer logs a `SCHEMA WARNING` on boot for `drifted` or `partial` states. T
 
 ### Re-indexing from a Given Ledger
 
-Use the replay CLI when you need to rebuild the indexer database from a specific ledger — for example after a schema migration that adds new derived columns, or after discovering a bug in the event processing logic.
+Use the replay CLI when you need to rebuild the indexer database from a specific ledger ΓÇö for example after a schema migration that adds new derived columns, or after discovering a bug in the event processing logic.
 
 ```bash
 # Dry-run first to see what would happen
@@ -504,120 +505,266 @@ Replay is atomic: it wraps the wipe and cursor reset in a single transaction. If
 
 Although the indexer database is a derived read-model that can be fully reconstructed by replaying Soroban events from the deployment ledger, a tested backup and restore path reduces outage time and protects checkpoint correctness.
 
+The procedure below is deliberately structured as an **isolated drill**, not a direct production overwrite. Every step targets a separate restore database (`circleup_restore`) so the production database remains untouched until you have verified the backup is coherent and the schema is clean. Only after passing all verification steps should you decide whether to promote the restore target or fall back to a chain replay.
+
+---
+
 ### Backup
 
-**Frequency:** Daily backups are recommended for production. The indexer's `last_ledger` cursor is stored in the `indexer_state` table — losing it forces a full replay from `START_LEDGER`, which can take minutes to hours depending on chain history.
+**Frequency:** Daily backups are recommended for production. The indexer's `last_ledger` cursor is stored in the `indexer_state` table — losing it forces a full replay from `START_LEDGER`, which can take minutes to hours depending on chain history. The `ledger_checkpoints` table records per-ledger processing state; losing it means crash recovery falls back to `indexer_state` alone.
 
 **Docker Compose (default local setup):**
 
 ```bash
-# Dump the full database to a timestamped file
+mkdir -p backups
 docker compose exec -T postgres \
-  pg_dump -U postgres circleup \
-  > backups/circleup_$(date +%Y%m%d_%H%M%S).sql
+  pg_dump -U postgres --format=custom circleup \
+  > backups/circleup_$(date +%Y%m%d_%H%M%S).dump
 ```
+
+Using `--format=custom` (not plain SQL) enables `pg_restore --list` for integrity pre-checks and is faster to restore for large databases. If you need a plain SQL dump for inspection, omit `--format=custom`.
 
 **External Postgres:**
 
 ```bash
-pg_dump "$DATABASE_URL" > backups/circleup_$(date +%Y%m%d_%H%M%S).sql
+pg_dump "$DATABASE_URL" --format=custom \
+  > backups/circleup_$(date +%Y%m%d_%H%M%S).dump
 ```
 
 Store backups off-host (S3, GCS, etc.). Retain at least 7 daily snapshots.
 
-### Restore
+---
 
-**Stop the indexer before restoring** to prevent it from writing to a partially restored database:
+### Restore drill — isolated target
+
+This procedure restores to `circleup_restore`, a throwaway database, so production data cannot be overwritten by following it.
+
+**Step 1 — Verify backup file integrity before use**
+
+Never skip this step. A corrupt or incomplete backup file discovered mid-restore causes more downtime than not restoring at all.
 
 ```bash
-# 1. Stop the indexer
+# Check the archive is readable and list its contents
+pg_restore --list backups/circleup_<timestamp>.dump | head -40
+
+# Confirm the file is non-zero and was written recently
+ls -lh backups/circleup_<timestamp>.dump
+```
+
+Expected: `pg_restore --list` should print table and index entries without errors. A file that is 0 bytes or that `pg_restore --list` refuses to parse is not usable.
+
+**Step 2 — Create an isolated restore target**
+
+```bash
+# Docker Compose
+docker compose exec -T postgres \
+  psql -U postgres -c "CREATE DATABASE circleup_restore;"
+
+# External Postgres
+psql "$DATABASE_URL" -c "CREATE DATABASE circleup_restore;"
+```
+
+The restore target is explicitly named to avoid any chance of accidentally targeting the production database. Do not use the production database name (`circleup`) for any step in this drill.
+
+**Step 3 — Stop the indexer**
+
+The indexer must not be writing while you verify the restore. If you are drilling on a separate host this step may be optional, but in a single-host setup stop it first.
+
+```bash
 npm run stop:indexer   # or kill the process
-
-# 2. Drop and recreate the database (Docker Compose)
-docker compose exec -T postgres \
-  psql -U postgres -c "DROP DATABASE IF EXISTS circleup; CREATE DATABASE circleup;"
-
-# 3. Restore from backup
-docker compose exec -T postgres \
-  psql -U postgres circleup < backups/circleup_<timestamp>.sql
-
-# 4. Verify migrations are clean
-npm run migrate:check --workspace=indexer
-# Expected output: Health state: clean
-
-# 5. Restart the indexer
-npm run dev:indexer
 ```
 
-**External Postgres:**
+**Step 4 — Restore into the isolated target**
 
 ```bash
-psql "$DATABASE_URL" < backups/circleup_<timestamp>.sql
-npm run migrate:check --workspace=indexer
+# Docker Compose
+docker compose exec -T postgres \
+  pg_restore -U postgres -d circleup_restore --no-owner --no-acl \
+  < backups/circleup_<timestamp>.dump
+
+# External Postgres — construct a URL pointing at the restore database
+RESTORE_URL="${DATABASE_URL%/*}/circleup_restore"
+pg_restore "$RESTORE_URL" --no-owner --no-acl \
+  < backups/circleup_<timestamp>.dump
 ```
+
+`pg_restore` will print warnings for objects it skips (e.g. extensions owned by a superuser). These are normal. Errors that cause table creation or data load to fail should be investigated before proceeding.
+
+---
 
 ### Post-restore verification
 
-Run these queries to confirm the restore is consistent:
+Run every check in this section against `circleup_restore`, not production. Partial passes mean the backup is not fit for promotion.
 
-```sql
--- Confirm the indexer cursor was restored
-SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1;
-
--- Confirm circle and member counts are non-zero (for a non-empty deployment)
-SELECT COUNT(*) FROM circles;
-SELECT COUNT(*) FROM circle_members;
-
--- Confirm the dedup table is present and non-empty
-SELECT COUNT(*) FROM ingested_events;
-```
-
-Also check the API:
+**Migration health — must be `clean` before the indexer can start safely:**
 
 ```bash
-curl http://localhost:3001/health
-# Expected: { "status": "ok", ... }
-
-curl http://localhost:3001/indexer/state
-# Confirm lastLedger matches the value from indexer_state above
+# Point the check at the restore database
+DATABASE_URL="${DATABASE_URL%/*}/circleup_restore" \
+  npm run migrate:check --workspace=indexer
+# Expected output: Health state: clean
 ```
+
+If the result is `pending`, the backup predates a migration. Apply pending migrations to the restore target before continuing (see [Applying migrations after restore](#applying-migrations-after-restore)). Do not proceed with a `drifted` or `partial` result — investigate first.
+
+**Cursor and checkpoint integrity:**
+
+```sql
+-- Connect to circleup_restore for these queries
+
+-- 1. Confirm the indexer cursor row exists and is non-zero
+SELECT last_ledger, updated_at
+FROM indexer_state
+WHERE id = 1;
+-- Expected: last_ledger > 0; updated_at matches the backup window
+
+-- 2. Confirm checkpoints are present and contiguous near the cursor
+SELECT ledger, events_count, failed_count, processed_at
+FROM ledger_checkpoints
+ORDER BY ledger DESC
+LIMIT 10;
+-- Expected: rows exist; most-recent ledger ≈ last_ledger from indexer_state
+-- A gap between last_ledger and the most recent checkpoint ledger > ~100
+-- suggests the cursor was updated without writing checkpoints (replay interrupted)
+
+-- 3. Confirm core tables are non-empty (for a non-empty deployment)
+SELECT
+  (SELECT COUNT(*) FROM circles)         AS circles,
+  (SELECT COUNT(*) FROM circle_members)  AS members,
+  (SELECT COUNT(*) FROM contributions)   AS contributions,
+  (SELECT COUNT(*) FROM payouts)         AS payouts,
+  (SELECT COUNT(*) FROM ingested_events) AS ingested_events;
+-- Expected: all counts > 0 for a production backup
+-- Zero rows in ingested_events is a red flag — the dedup table should always
+-- have at least as many rows as contributions + payouts + join events
+
+-- 4. Confirm schema_migrations is present and non-empty
+SELECT filename, applied_at
+FROM schema_migrations
+ORDER BY filename;
+-- Expected: all migration files that exist on disk are listed here
+```
+
+**API smoke reads against the restore target:**
+
+Start the indexer pointed at `circleup_restore` to confirm the restored data is coherent end-to-end through the API layer:
+
+```bash
+# Temporarily point the indexer at the restore database
+DATABASE_URL="${DATABASE_URL%/*}/circleup_restore" \
+  npm run dev:indexer
+
+# In another terminal — wait for "Indexer API listening" then:
+
+# Health check — confirms DB is reachable and schema is clean
+curl -s http://localhost:3001/health | jq .
+# Expected: { "status": "ok", "db": { "status": "ok" }, ... }
+
+# Indexer state — confirm lastLedger matches the cursor value from the SQL check above
+curl -s http://localhost:3001/indexer/state | jq .
+# Expected: { "lastLedger": <matches last_ledger above>, "totalEvents": <> }
+
+# Circle list — confirm circles are visible
+curl -s "http://localhost:3001/circles?limit=5" | jq '.circles | length'
+# Expected: > 0 for a non-empty deployment
+
+# Spot-check one circle's detail and rounds
+ADDR=$(curl -s "http://localhost:3001/circles?limit=1" | jq -r '.circles[0].address')
+curl -s "http://localhost:3001/circles/${ADDR}" | jq '.circle.status'
+curl -s "http://localhost:3001/circles/${ADDR}/rounds" | jq '.rounds | length'
+```
+
+Stop the indexer when you are done (`Ctrl+C`).
+
+---
 
 ### Applying migrations after restore
 
-If the backup predates a schema migration, apply pending migrations before restarting the indexer:
+If `migrate:check` reports `pending`, apply the missing migrations to the restore target before running the API checks above:
 
 ```bash
-npm run migrate --workspace=indexer
-npm run migrate:check --workspace=indexer
+DATABASE_URL="${DATABASE_URL%/*}/circleup_restore" \
+  npm run migrate --workspace=indexer
+
+DATABASE_URL="${DATABASE_URL%/*}/circleup_restore" \
+  npm run migrate:check --workspace=indexer
 # Expected: Health state: clean
 ```
 
-### When to use chain replay instead of restore
+Do not apply migrations to production until you have verified the same migrations succeed cleanly on the restore target first. This gives you a dry-run of the migration against real data without touching production.
 
-Prefer **chain replay** over a backup restore when:
+---
 
-- No recent backup is available.
-- The backup predates a schema migration that changes how events are processed (not just adds columns).
-- You suspect the backup contains corrupt or duplicate rows from a failed replay.
+### Restore vs. chain replay — decision criteria
 
-To replay from the deployment ledger:
+Use this table to decide whether to restore from backup or replay from the chain. Replay is always safe (it rebuilds from the canonical chain state); restore is faster but only if the backup is coherent.
+
+| Situation | Recommendation |
+|---|---|
+| Backup is recent (< 24 h), all post-restore checks pass | **Restore** — fastest recovery |
+| Backup is 1–7 days old, schema is clean, cursor lag is acceptable | **Restore**, then let the indexer catch up by replaying from `last_ledger` |
+| Backup predates a migration that changes event *processing* logic (not just schema) | **Replay** — snapshot data was computed under old logic |
+| Post-restore `migrate:check` reports `drifted` or `partial` | **Replay** — backup schema state is not trustworthy |
+| `ingested_events` count is zero or the checkpoint/cursor gap is > 500 ledgers | **Replay** — dedup table or checkpoints may be incomplete |
+| No recent backup exists | **Replay** from deployment ledger |
+| Backup is suspected to contain duplicate rows from a failed replay | **Replay** |
+
+When replaying, use the cursor value from the last healthy backup as the `--from` argument rather than replaying all the way from genesis:
 
 ```bash
-# Full replay — wipes all derived rows from START_LEDGER onward
-npm run replay --workspace=indexer -- --from=<deployment_ledger>
+# Use the last_ledger from the most recent healthy backup as the replay start
+npm run replay --workspace=indexer -- --from=<last_ledger_from_backup>
 ```
 
 See [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger) for dry-run and partial replay options.
+
+---
+
+### Promoting the restore target to production
+
+Only proceed here after every check in [Post-restore verification](#post-restore-verification) passes.
+
+```bash
+# 1. Confirm the indexer is stopped
+# 2. Rename the databases atomically
+docker compose exec -T postgres psql -U postgres <<'SQL'
+  ALTER DATABASE circleup RENAME TO circleup_old;
+  ALTER DATABASE circleup_restore RENAME TO circleup;
+SQL
+
+# External Postgres: same two ALTER DATABASE statements
+```
+
+`circleup_old` is kept as a fallback. Do not drop it until the indexer has been running against the promoted database for at least one polling cycle and `GET /health` returns `"status": "ok"`.
+
+```bash
+# 3. Restart the indexer (now targeting circleup)
+npm run dev:indexer
+
+# 4. Confirm health immediately after start
+sleep 5 && curl -s http://localhost:3001/health | jq .status
+# Expected: "ok"
+```
+
+Once you are confident, drop the old database:
+
+```bash
+docker compose exec -T postgres \
+  psql -U postgres -c "DROP DATABASE circleup_old;"
+```
+
+---
 
 ### Rollback guidance
 
 If a migration or deploy causes data corruption:
 
 1. Stop the indexer immediately.
-2. Restore the most recent pre-migration backup (see [Restore](#restore) above).
-3. Verify the schema state with `npm run migrate:check`.
-4. If the backup is too old, replay from the last known-good ledger using `npm run replay -- --from=<ledger>`.
-5. Do **not** re-run a failed migration without first reverting the migration file — the runner will attempt to re-apply it and may produce duplicate or conflicting schema changes.
+2. If the rename in [Promoting the restore target to production](#promoting-the-restore-target-to-production) was not yet done, production data is still intact — the restore drill ran on `circleup_restore` only.
+3. If the rename was done, reverse it: `ALTER DATABASE circleup RENAME TO circleup_bad; ALTER DATABASE circleup_old RENAME TO circleup;`
+4. Run `npm run migrate:check` to confirm the schema state before restarting.
+5. If no safe backup exists, replay from the last known-good ledger: `npm run replay -- --from=<ledger>`.
+6. Do **not** re-run a failed migration without first reverting the migration file — the runner will attempt to re-apply it and may produce duplicate or conflicting schema changes.
 
 ---
 
@@ -668,7 +815,7 @@ Reports indexing progress independent of connectivity:
 }
 ```
 
-Alert when `lastLedger` stops advancing — this indicates the polling loop has stalled (RPC connection lost, process OOM, etc.).
+Alert when `lastLedger` stops advancing ΓÇö this indicates the polling loop has stalled (RPC connection lost, process OOM, etc.).
 
 ### Useful Monitoring Queries
 
@@ -718,7 +865,7 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 
 **Diagnosis:**
 1. Check the indexer process is running: `curl http://localhost:3001/health`
-2. Check `NEXT_PUBLIC_INDEXER_URL` in `app/.env.local` — must be a valid absolute URL (`http://` or `https://`).
+2. Check `NEXT_PUBLIC_INDEXER_URL` in `app/.env.local` ΓÇö must be a valid absolute URL (`http://` or `https://`).
 3. Check for CORS issues if the app and indexer are on different origins in production: ensure `ALLOWED_ORIGINS` in `indexer/.env` includes the app's origin.
 
 **Resolution:**
@@ -733,9 +880,9 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 **Symptom:** No circles appear in the app but you can see them via stellar-cli or stellar.expert.
 
 **Diagnosis:**
-1. Check indexer state: `curl http://localhost:3001/indexer/state` — is `lastLedger` advancing?
-2. Check `START_LEDGER` in `indexer/.env` — if it is set to a ledger *after* the factory deployment, those events were skipped.
-3. Check `CIRCLE_FACTORY_ADDRESS` in `indexer/.env` — a wrong or empty address means `getEvents` returns nothing silently.
+1. Check indexer state: `curl http://localhost:3001/indexer/state` ΓÇö is `lastLedger` advancing?
+2. Check `START_LEDGER` in `indexer/.env` ΓÇö if it is set to a ledger *after* the factory deployment, those events were skipped.
+3. Check `CIRCLE_FACTORY_ADDRESS` in `indexer/.env` ΓÇö a wrong or empty address means `getEvents` returns nothing silently.
 
 **Resolution:**
 - Set `START_LEDGER` to the ledger at or before the factory was deployed and restart.
@@ -751,7 +898,7 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 
 **Resolution:**
 - Wait a few seconds and refresh. The indexer will process the event on the next poll.
-- If the 404 persists after 60 seconds, check `GET /indexer/state` to confirm the indexer is advancing. Also verify the circle address is correct — copy it from the transaction receipt in stellar.expert.
+- If the 404 persists after 60 seconds, check `GET /indexer/state` to confirm the indexer is advancing. Also verify the circle address is correct ΓÇö copy it from the transaction receipt in stellar.expert.
 
 ---
 
@@ -791,7 +938,7 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 |---|---|---|
 | `join collateral deposit` | Member's USDC balance is less than `round_amount` | Fund the wallet with testnet USDC via Friendbot or a faucet |
 | `round contribution` | Member's balance dropped below `round_amount` since joining | Same as above |
-| `round payout` | Circle contract's USDC balance is insufficient (should not happen normally) | Check for missing contributions — call `get_current_round` to verify `contributions_received` |
+| `round payout` | Circle contract's USDC balance is insufficient (should not happen normally) | Check for missing contributions ΓÇö call `get_current_round` to verify `contributions_received` |
 | `collateral release` | Token frozen, deauthorized, or missing trustline | Check the member's USDC trustline on stellar.expert |
 
 ---
@@ -803,7 +950,7 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 **Resolution:**
 1. Check that `indexer/.env` exists: `cp indexer/.env.example indexer/.env`
 2. Open `indexer/.env` and fill in every variable listed in the error message.
-3. Confirm no trailing spaces or quotes around values — the validator trims but does not strip quotes.
+3. Confirm no trailing spaces or quotes around values ΓÇö the validator trims but does not strip quotes.
 
 ---
 
@@ -811,13 +958,13 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 
 **Symptom:** The indexer log shows a `SCHEMA WARNING` line after startup.
 
-**Meaning:** The database schema is in a `drifted` or `partial` state — either a migration was applied but the file is missing, or the SQL content does not match what was applied.
+**Meaning:** The database schema is in a `drifted` or `partial` state ΓÇö either a migration was applied but the file is missing, or the SQL content does not match what was applied.
 
 **Resolution:**
 1. Run `npm run migrate:check --workspace=indexer` to see the full diff.
 2. For `pending`: run `npm run migrate` to apply the new files.
 3. For `drifted`: restore the original migration files from git history and investigate whether the schema was modified out-of-band.
-4. For `partial`: locate the missing migration files. Do not re-run the runner blindly — it will try to apply files it thinks are pending and may duplicate or conflict.
+4. For `partial`: locate the missing migration files. Do not re-run the runner blindly ΓÇö it will try to apply files it thinks are pending and may duplicate or conflict.
 
 The indexer continues serving data in a `drifted` or `partial` state; the warning is surfaced so it is not missed before the next deploy.
 
@@ -834,7 +981,7 @@ The indexer continues serving data in a `drifted` or `partial` state; the warnin
 **Resolution:**
 - Confirm the circle was deployed through the factory (check `factory/circle_created` event for this circle address).
 - If deploying a circle manually for testing, call `reputation.add_authorized_caller(factory_address, circle_address)` from the factory admin account before attempting a payout.
-- Check `GET /reputation/:member` includes the circle in `contributions` — if the indexer has no contribution records, the payout was never reached.
+- Check `GET /reputation/:member` includes the circle in `contributions` ΓÇö if the indexer has no contribution records, the payout was never reached.
 
 ---
 
@@ -842,13 +989,13 @@ The indexer continues serving data in a `drifted` or `partial` state; the warnin
 
 **Symptom:** Calling `mark_default` returns `"round deadline not yet passed"`.
 
-**Cause:** The current ledger sequence is ≤ `deadline_ledger` of the current round. The contract enforces `ledger.sequence > deadline_ledger` strictly; the deadline ledger itself is not in the default window.
+**Cause:** The current ledger sequence is Γëñ `deadline_ledger` of the current round. The contract enforces `ledger.sequence > deadline_ledger` strictly; the deadline ledger itself is not in the default window.
 
 **Resolution:**
 - Check the current ledger: `stellar network status --network testnet` shows the latest ledger.
 - Check the deadline: `GET /circles/:address` returns `circle.deadline_ledger`.
 - Wait until the network ledger advances past the deadline ledger.
-- On testnet, ledgers advance approximately every 5 seconds. `(deadline_ledger - current_ledger) × 5` seconds is the remaining wait time.
+- On testnet, ledgers advance approximately every 5 seconds. `(deadline_ledger - current_ledger) ├ù 5` seconds is the remaining wait time.
 
 ---
 
@@ -875,7 +1022,7 @@ The indexer continues serving data in a `drifted` or `partial` state; the warnin
 1. Install the [Freighter browser extension](https://www.freighter.app/).
 2. Make sure the extension is enabled and the site origin is not blocked.
 3. On localhost, Freighter may require switching to testnet manually in the extension settings.
-4. Try a hard refresh (`Ctrl+Shift+R`) — some Freighter versions inject the API asynchronously.
+4. Try a hard refresh (`Ctrl+Shift+R`) ΓÇö some Freighter versions inject the API asynchronously.
 
 ---
 
@@ -885,11 +1032,11 @@ The indexer continues serving data in a `drifted` or `partial` state; the warnin
 
 ```
            join (all members)
-Pending ──────────────────────▶ Active ──(all rounds paid)──▶ Completed
-   │                                                                │
-   │ cancel()                                                       │
-   ▼                                                                │
-Cancelled ◀─────────────────────────────────────────────────────── ┘
+Pending ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓû╢ Active ΓöÇΓöÇ(all rounds paid)ΓöÇΓöÇΓû╢ Completed
+   Γöé                                                                Γöé
+   Γöé cancel()                                                       Γöé
+   Γû╝                                                                Γöé
+Cancelled ΓùÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ Γöÿ
                                                          close() allowed from
                                                          both terminal states
 ```
@@ -904,17 +1051,17 @@ Within an Active circle, each round follows this sequence:
 
 ```
 Round starts (deadline clock set)
-    │
-    ├─ Members call contribute() before deadline_ledger
-    │
-    ├─ Anyone may call mark_default(member) AFTER deadline_ledger
-    │   for any member who did not contribute
-    │
-    └─ Anyone calls payout() once all members have contributed
-           │
-           ├─ Transfers round_amount × member_count USDC to recipient
-           ├─ Calls reputation.increment(recipient)
-           └─ Advances to next round (or sets status = Completed)
+    Γöé
+    Γö£ΓöÇ Members call contribute() before deadline_ledger
+    Γöé
+    Γö£ΓöÇ Anyone may call mark_default(member) AFTER deadline_ledger
+    Γöé   for any member who did not contribute
+    Γöé
+    ΓööΓöÇ Anyone calls payout() once all members have contributed
+           Γöé
+           Γö£ΓöÇ Transfers round_amount ├ù member_count USDC to recipient
+           Γö£ΓöÇ Calls reputation.increment(recipient)
+           ΓööΓöÇ Advances to next round (or sets status = Completed)
 ```
 
 Deadline boundary: `contribute` is rejected when `ledger.sequence > deadline_ledger`. `mark_default` is rejected when `ledger.sequence <= deadline_ledger`. The deadline ledger itself is part of the contribution window (last accepted ledger for `contribute`).
@@ -926,19 +1073,19 @@ Deploy:
   reputation.initialize(admin = deployer_wallet)
   circle_factory.initialize(admin = deployer_wallet,
                             reputation_contract = reputation_address, ...)
-  reputation — transfer admin to factory_address
+  reputation ΓÇö transfer admin to factory_address
     (so factory can call add_authorized_caller)
 
 Per circle creation:
   circle_factory.create_circle(...)
-    ├─ deploys circle contract
-    ├─ calls circle.initialize(...)
-    └─ calls reputation.add_authorized_caller(factory_address, circle_address)
+    Γö£ΓöÇ deploys circle contract
+    Γö£ΓöÇ calls circle.initialize(...)
+    ΓööΓöÇ calls reputation.add_authorized_caller(factory_address, circle_address)
          (factory is admin; Contract Invoker rule auto-grants auth)
 
 Per payout:
   circle.payout()
-    └─ calls reputation.increment(circle_address, recipient)
+    ΓööΓöÇ calls reputation.increment(circle_address, recipient)
          (circle address is authorized caller; Contract Invoker auto-grants auth)
 ```
 
@@ -954,7 +1101,7 @@ A revoked circle can never call `increment` again, even if the factory re-deploy
 
 ### Secure local injection
 
-Store secrets in the untracked `scripts/.env` file (copied from `scripts/.env.example`). The deploy script loads this file automatically via `dotenv`. Never commit `scripts/.env` — it is listed in `.gitignore`.
+Store secrets in the untracked `scripts/.env` file (copied from `scripts/.env.example`). The deploy script loads this file automatically via `dotenv`. Never commit `scripts/.env` ΓÇö it is listed in `.gitignore`.
 
 ```bash
 cp scripts/.env.example scripts/.env
@@ -967,7 +1114,7 @@ The deployer private key is managed entirely by `stellar-cli`. The deploy script
 
 ### CI injection (GitHub Actions)
 
-Store secrets in the repository's encrypted secret store (**Settings → Secrets and variables → Actions**). Inject them as environment variables in the workflow step, not as inline values in the YAML file:
+Store secrets in the repository's encrypted secret store (**Settings ΓåÆ Secrets and variables ΓåÆ Actions**). Inject them as environment variables in the workflow step, not as inline values in the YAML file:
 
 ```yaml
 - name: Deploy contracts
@@ -982,7 +1129,7 @@ Never print secrets with `echo` or `run: env` steps. GitHub Actions automaticall
 
 ### Failing fast on missing secrets
 
-The deploy script validates that `NETWORK`, `NETWORK_PASSPHRASE`, and `RPC_URL` are set before any write transaction. If a required value is absent the script exits with code 1 and a clear error message listing the missing variable — it never falls through to a deployment with an empty or default value. Run `npm run validate-env --workspace=scripts` before deploying to check the profile independently.
+The deploy script validates that `NETWORK`, `NETWORK_PASSPHRASE`, and `RPC_URL` are set before any write transaction. If a required value is absent the script exits with code 1 and a clear error message listing the missing variable ΓÇö it never falls through to a deployment with an empty or default value. Run `npm run validate-env --workspace=scripts` before deploying to check the profile independently.
 
 ---
 
@@ -1010,58 +1157,58 @@ Use the fixtures to reproduce an incident class locally without needing a live n
 |---|---|---|
 | `StaleIndexerData` | Indexer cursor freezes; DB status/round lag behind chain | [Circle list is empty but circles exist on-chain](#circle-list-is-empty-but-circles-exist-on-chain) |
 | `DuplicateEvents` | Same Soroban event delivered twice; dedup guard verified | [Circle list is empty but circles exist on-chain](#circle-list-is-empty-but-circles-exist-on-chain) |
-| `WalletRejection` | Freighter not installed / permission denied / unknown error | [Freighter not detected](#freighter-not-detected) · [Transaction fails with "USDC transfer failed"](#transaction-fails-with-usdc-transfer-failed) |
-| `RpcTimeout` | simulate / send / poll timeout; health endpoint 503 | [Transaction fails with "USDC transfer failed"](#transaction-fails-with-usdc-transfer-failed) · [App shows "indexer unreachable" banner](#app-shows-indexer-unreachable-banner) |
+| `WalletRejection` | Freighter not installed / permission denied / unknown error | [Freighter not detected](#freighter-not-detected) ┬╖ [Transaction fails with "USDC transfer failed"](#transaction-fails-with-usdc-transfer-failed) |
+| `RpcTimeout` | simulate / send / poll timeout; health endpoint 503 | [Transaction fails with "USDC transfer failed"](#transaction-fails-with-usdc-transfer-failed) ┬╖ [App shows "indexer unreachable" banner](#app-shows-indexer-unreachable-banner) |
 | `SchemaDrift` | Migration file renamed after apply; ghost entry in `schema_migrations` | [Indexer boot: "SCHEMA WARNING"](#indexer-boot-schema-warning) |
 
 ### Running the Incident Tests
 
 ```bash
-# Run all incident reproduction tests (offline — no DB or RPC required):
+# Run all incident reproduction tests (offline ΓÇö no DB or RPC required):
 npm run test:incidents --workspace=indexer
 
 # Run the full indexer test suite (includes incidents + integration tests):
 npm test --workspace=indexer
 ```
 
-The `test:incidents` script targets only `src/fixtures/incident.test.ts` so it passes in any offline environment — CI runners without Postgres, developer laptops without a running indexer, or during an active incident when the network is degraded.
+The `test:incidents` script targets only `src/fixtures/incident.test.ts` so it passes in any offline environment ΓÇö CI runners without Postgres, developer laptops without a running indexer, or during an active incident when the network is degraded.
 
 ### StaleIndexerData fixture
 
-**File:** `indexer/src/fixtures/incident-fixtures.ts` — `StaleIndexerData` namespace
+**File:** `indexer/src/fixtures/incident-fixtures.ts` ΓÇö `StaleIndexerData` namespace
 
 **Encodes:**
-- `seedIndexerState()` — indexer `last_ledger = 1_220_000` while chain tip is `1_280_000` (60 000 ledger lag ≈ 83 hours)
-- `seedCircle()` — circle row frozen at `status = "Active"`, `current_round = 0` while on-chain the circle is `Completed`
-- `seedOnChainState()` — the actual on-chain truth for cross-checking lag
+- `seedIndexerState()` ΓÇö indexer `last_ledger = 1_220_000` while chain tip is `1_280_000` (60 000 ledger lag Γëê 83 hours)
+- `seedCircle()` ΓÇö circle row frozen at `status = "Active"`, `current_round = 0` while on-chain the circle is `Completed`
+- `seedOnChainState()` ΓÇö the actual on-chain truth for cross-checking lag
 
 **Reproduction steps:**
 1. Insert `seedIndexerState()` into `indexer_state` and `seedCircle()` into `circles`.
-2. Query `GET /circles/:address` — response shows stale `status` and `current_round`.
-3. Query `GET /indexer/state` — `lastLedger` is behind by `lagLedgers`.
+2. Query `GET /circles/:address` ΓÇö response shows stale `status` and `current_round`.
+3. Query `GET /indexer/state` ΓÇö `lastLedger` is behind by `lagLedgers`.
 4. Compare against `seedOnChainState()` to verify the delta matches `expectedBehaviour.lagLedgers`.
 
 **Resolution:** set `START_LEDGER` to `LEDGER.STALE` and replay: `npm run replay -- --from=1220000`
 
 ### DuplicateEvents fixture
 
-**File:** `indexer/src/fixtures/incident-fixtures.ts` — `DuplicateEvents` namespace
+**File:** `indexer/src/fixtures/incident-fixtures.ts` ΓÇö `DuplicateEvents` namespace
 
 **Encodes:**
-- `seedIngestedEvent()` / `seedDuplicateIngestedEvent()` — two rows with the same `event_key` (`tx_hash:event_index`)
-- `seedContribution()` / `seedPayout()` — the corresponding derived rows
+- `seedIngestedEvent()` / `seedDuplicateIngestedEvent()` ΓÇö two rows with the same `event_key` (`tx_hash:event_index`)
+- `seedContribution()` / `seedPayout()` ΓÇö the corresponding derived rows
 
 **Reproduction steps:**
-1. Insert `seedIngestedEvent()` into `ingested_events` — succeeds.
-2. Attempt to insert `seedDuplicateIngestedEvent()` — `event_key` PRIMARY KEY conflict rejects it.
+1. Insert `seedIngestedEvent()` into `ingested_events` ΓÇö succeeds.
+2. Attempt to insert `seedDuplicateIngestedEvent()` ΓÇö `event_key` PRIMARY KEY conflict rejects it.
 3. Confirm `ingested_events` contains exactly one row for this event (`expectedBehaviour.ingestedEventsRows = 1`).
 4. Confirm the `contributions` and `payouts` tables each contain exactly one row per UNIQUE constraint.
 
-**What to check if duplicate rows appear:** the dedup `INSERT … ON CONFLICT DO NOTHING` in `indexer.ts` was bypassed (e.g. a direct SQL insert during a failed replay).  Re-run `npm run replay -- --from=<ledger>` to reconcile.
+**What to check if duplicate rows appear:** the dedup `INSERT ΓÇª ON CONFLICT DO NOTHING` in `indexer.ts` was bypassed (e.g. a direct SQL insert during a failed replay).  Re-run `npm run replay -- --from=<ledger>` to reconcile.
 
 ### WalletRejection fixture
 
-**File:** `indexer/src/fixtures/incident-fixtures.ts` — `WalletRejection` namespace
+**File:** `indexer/src/fixtures/incident-fixtures.ts` ΓÇö `WalletRejection` namespace
 
 **Encodes three sub-cases:**
 
@@ -1072,15 +1219,15 @@ The `test:incidents` script targets only `src/fixtures/incident.test.ts` so it p
 | `unknownError` | Extension throws `"Extension context invalidated."` | `{ success: false, txHash: "", error: "Extension context invalidated." }` |
 
 **Reproduction steps:**
-1. In a browser test environment, mock `isFreighterInstalled` to return `false` and call `connectWallet()` — should throw `WalletError` with `reason = "not_installed"`.
-2. Mock `signTransaction` to throw one of `permissionDenied.rawErrorVariants` — `invokeContract` must return `expectedResult`.
-3. Mock `signTransaction` to throw `unknownError.rawError` — formatted error must equal `unknownError.expectedResult.error`.
+1. In a browser test environment, mock `isFreighterInstalled` to return `false` and call `connectWallet()` ΓÇö should throw `WalletError` with `reason = "not_installed"`.
+2. Mock `signTransaction` to throw one of `permissionDenied.rawErrorVariants` ΓÇö `invokeContract` must return `expectedResult`.
+3. Mock `signTransaction` to throw `unknownError.rawError` ΓÇö formatted error must equal `unknownError.expectedResult.error`.
 
 **Runbook resolution:** see [Freighter not detected](#freighter-not-detected) for install and permission steps.
 
 ### RpcTimeout fixture
 
-**File:** `indexer/src/fixtures/incident-fixtures.ts` — `RpcTimeout` namespace
+**File:** `indexer/src/fixtures/incident-fixtures.ts` ΓÇö `RpcTimeout` namespace
 
 **Encodes four sub-cases:**
 
@@ -1092,26 +1239,26 @@ The `test:incidents` script targets only `src/fixtures/incident.test.ts` so it p
 | `healthCheckTimeout` | DB + RPC both exceed 5 000 ms | HTTP 503, `status: "degraded"` |
 
 **Reproduction steps:**
-1. Inject `RpcTimeout.seedMockRpcThatTimesOut(10)` as the RPC client and call `invokeContract` — should return `success: false` within ~10 ms (not after the full 60 s poll budget).
-2. For `pollExhausted`: stub `getTransaction` to always return `{ status: "NOT_FOUND" }` — after 30 attempts `invokeContract` returns the timeout message with the `txHash` preserved.
-3. For health timeout: stub `pool.query` and RPC latency checks to resolve after 6 000 ms — `GET /health` must return 503 with `"status": "degraded"`.
+1. Inject `RpcTimeout.seedMockRpcThatTimesOut(10)` as the RPC client and call `invokeContract` ΓÇö should return `success: false` within ~10 ms (not after the full 60 s poll budget).
+2. For `pollExhausted`: stub `getTransaction` to always return `{ status: "NOT_FOUND" }` ΓÇö after 30 attempts `invokeContract` returns the timeout message with the `txHash` preserved.
+3. For health timeout: stub `pool.query` and RPC latency checks to resolve after 6 000 ms ΓÇö `GET /health` must return 503 with `"status": "degraded"`.
 
 **Runbook resolution:** see [App shows "indexer unreachable" banner](#app-shows-indexer-unreachable-banner) and [Transaction fails with "USDC transfer failed"](#transaction-fails-with-usdc-transfer-failed).
 
 ### SchemaDrift fixture
 
-**File:** `indexer/src/fixtures/incident-fixtures.ts` — `SchemaDrift` namespace
+**File:** `indexer/src/fixtures/incident-fixtures.ts` ΓÇö `SchemaDrift` namespace
 
 **Encodes:**
-- `seedAppliedInDb()` — `["001_add_round_deadline_ledgers.sql"]` (original name, still in `schema_migrations`)
-- `seedFilesOnDisk()` — `["001_add_round_deadline_ledgers_renamed.sql", "002_ledger_checkpoints.sql"]` (original gone, renamed version present)
-- `seedAppliedRow()` — the `schema_migrations` row with the original filename
+- `seedAppliedInDb()` ΓÇö `["001_add_round_deadline_ledgers.sql"]` (original name, still in `schema_migrations`)
+- `seedFilesOnDisk()` ΓÇö `["001_add_round_deadline_ledgers_renamed.sql", "002_ledger_checkpoints.sql"]` (original gone, renamed version present)
+- `seedAppliedRow()` ΓÇö the `schema_migrations` row with the original filename
 
 **Reproduction steps:**
 1. Insert `seedAppliedRow()` into `schema_migrations`.
 2. Temporarily rename `indexer/src/db/migrations/001_add_round_deadline_ledgers.sql` to the `RENAMED_FILENAME`.
-3. Run `npm run migrate:check --workspace=indexer` — output must show `Health state: drifted`.
-4. Restore the original filename; re-run the check — output must show `Health state: pending` (renamed file now pending).
+3. Run `npm run migrate:check --workspace=indexer` ΓÇö output must show `Health state: drifted`.
+4. Restore the original filename; re-run the check ΓÇö output must show `Health state: pending` (renamed file now pending).
 
 **Runbook resolution:** see [Indexer boot: "SCHEMA WARNING"](#indexer-boot-schema-warning) for drift recovery steps.
 
@@ -1121,7 +1268,7 @@ The `test:incidents` script targets only `src/fixtures/incident.test.ts` so it p
 
 ### Why Mutation Testing
 
-A test that passes when a critical guard is removed is not testing that guard — it is testing something else.  Mutation testing detects this by explicitly removing each guard and verifying that at least one test fails.
+A test that passes when a critical guard is removed is not testing that guard ΓÇö it is testing something else.  Mutation testing detects this by explicitly removing each guard and verifying that at least one test fails.
 
 CircleUp uses an **explicit guard-removal** strategy rather than a fully automated mutation framework (e.g. `cargo-mutants`):
 
@@ -1143,21 +1290,21 @@ Fifteen guards are tested across the `circle` and `reputation` contracts:
 
 | Guard | Risk if removed | Test |
 |---|---|---|
-| `already joined` (`has` check, not balance) | Double-collateral pull | `guard_join_double_collateral_pull` · `guard_join_has_check_not_balance_check` |
-| `not all members have contributed yet` | Payout before all deposits | `guard_payout_requires_full_contribution_counter` · `guard_payout_one_missing_contribution_blocks` |
-| `round contribution tally mismatch` | Forged counter bypasses payout | `guard_payout_tally_mismatch_forged_counter` · `guard_payout_forged_keys_without_counter_blocked` |
-| `round deadline not yet passed` (strict `>`) | Premature default; collateral stolen early | `guard_mark_default_deadline_strict_boundary` · `guard_mark_default_one_before_deadline_blocked` |
-| `member did contribute` | Contributor penalised despite fulfilling obligation | `guard_mark_default_contributor_cannot_be_penalised` · `guard_contribution_key_persists_after_deadline_for_guard_correctness` |
-| `already marked default this round` | Double penalty (36% instead of 20%) | `guard_mark_default_idempotency` · `guard_mark_default_single_penalty_amount_is_correct` |
-| `circle already closed` (Closed flag) | Double-release of collateral | `guard_close_double_release_prevention` · `guard_close_collateral_zeroed_before_transfer_cei` |
+| `already joined` (`has` check, not balance) | Double-collateral pull | `guard_join_double_collateral_pull` ┬╖ `guard_join_has_check_not_balance_check` |
+| `not all members have contributed yet` | Payout before all deposits | `guard_payout_requires_full_contribution_counter` ┬╖ `guard_payout_one_missing_contribution_blocks` |
+| `round contribution tally mismatch` | Forged counter bypasses payout | `guard_payout_tally_mismatch_forged_counter` ┬╖ `guard_payout_forged_keys_without_counter_blocked` |
+| `round deadline not yet passed` (strict `>`) | Premature default; collateral stolen early | `guard_mark_default_deadline_strict_boundary` ┬╖ `guard_mark_default_one_before_deadline_blocked` |
+| `member did contribute` | Contributor penalised despite fulfilling obligation | `guard_mark_default_contributor_cannot_be_penalised` ┬╖ `guard_contribution_key_persists_after_deadline_for_guard_correctness` |
+| `already marked default this round` | Double penalty (36% instead of 20%) | `guard_mark_default_idempotency` ┬╖ `guard_mark_default_single_penalty_amount_is_correct` |
+| `circle already closed` (Closed flag) | Double-release of collateral | `guard_close_double_release_prevention` ┬╖ `guard_close_collateral_zeroed_before_transfer_cei` |
 | `overflows penalty calculation` | Silent i128 wrap; penalty becomes 0 | `guard_initialize_overflow_penalty_arithmetic` |
 | `overflows pot calculation` | Silent i128 wrap; recipient receives wrong amount | `guard_initialize_overflow_pot_arithmetic` |
-| `already initialized` | Member list overwrite mid-lifecycle | `guard_reinitialize_blocked` · `guard_reinitialize_blocked_with_different_params` |
+| `already initialized` | Member list overwrite mid-lifecycle | `guard_reinitialize_blocked` ┬╖ `guard_reinitialize_blocked_with_different_params` |
 | Reputation unauthorized caller | Self-awarded reputation points | `guard_reputation_unauthorized_caller_blocked` |
 | Reputation revocation permanent | Revived circle awards points | `guard_reputation_revocation_is_permanent` |
 | `duplicate members` | One wallet gets two rotation slots | `guard_duplicate_members_rejected` |
 | Non-member cannot close | Outsider triggers collateral settlement | `guard_close_non_member_rejected` |
-| Status gate for contribute/close | Contributions/closes on wrong lifecycle phase | `guard_contribute_blocked_while_pending` · `guard_contribute_blocked_while_completed` · `guard_contribute_rejected_one_past_deadline` |
+| Status gate for contribute/close | Contributions/closes on wrong lifecycle phase | `guard_contribute_blocked_while_pending` ┬╖ `guard_contribute_blocked_while_completed` ┬╖ `guard_contribute_rejected_one_past_deadline` |
 
 Each guard test follows one of two forms:
 
@@ -1178,7 +1325,7 @@ Eight guards are tested in `computeActionEligibility`:
 
 | Guard | Action | Risk if removed | Mutant proof |
 |---|---|---|---|
-| `stale_snapshot` (age ≥ maxAge) | all | Stale UI state submits on-chain write | `mutantNoStalenessCheck` allows stale snapshots |
+| `stale_snapshot` (age ΓëÑ maxAge) | all | Stale UI state submits on-chain write | `mutantNoStalenessCheck` allows stale snapshots |
 | `wrong_status` (Pending for join) | join | `join` on Active/Completed circle | `mutantNoStatusCheckJoin` allows join on Active |
 | `wrong_status` (Active for contribute) | contribute | `contribute` on Pending/Completed circle | `mutantNoStatusCheckContribute` allows on Pending |
 | `deadline_passed` (latestLedger > deadlineLedger) | contribute | Late contribution submitted after deadline | `mutantNoDeadlineCheckContribute` allows late contributions |
@@ -1190,18 +1337,18 @@ Eight guards are tested in `computeActionEligibility`:
 Each test follows the **production vs. mutant** pattern:
 1. Assert the production function **blocks** the action for the given input.
 2. Call the local mutant (guard removed) with the same input.
-3. Assert the mutant **allows** it — proving the production guard is the discriminating factor.
+3. Assert the mutant **allows** it ΓÇö proving the production guard is the discriminating factor.
 
 Guard ordering invariants are also tested: `stale_snapshot` is checked before `wrong_status` which is checked before action-specific guards, for all four actions.
 
 ### CI Budget and Excluded Mutations
 
-**Budget:** All mutation guard tests run as part of the existing CI commands — no separate mutation runner or additional CI step is required.
+**Budget:** All mutation guard tests run as part of the existing CI commands ΓÇö no separate mutation runner or additional CI step is required.
 
 ```
-cargo test -p circle          # includes mutation_guards.rs — ~5 s
-npm test --workspace=indexer  # includes incident.test.ts — ~1 s (offline)
-npx tsc --noEmit              # type-checks gating.mutation.test.ts — ~3 s
+cargo test -p circle          # includes mutation_guards.rs ΓÇö ~5 s
+npm test --workspace=indexer  # includes incident.test.ts ΓÇö ~1 s (offline)
+npx tsc --noEmit              # type-checks gating.mutation.test.ts ΓÇö ~3 s
 ```
 
 Total added CI time: < 10 seconds.
@@ -1224,7 +1371,7 @@ Any future change to a guard listed in either test file requires updating the co
 **Contract changes**
 - Run `cargo test` in `contracts/` before committing. All 15+ unit tests must pass.
 - Use `stellar contract invoke --cost -- <function>` to estimate fees before broadcasting.
-- Any change to `PENALTY_BPS`, `BPS_DENOM`, `COLLATERAL_MULTIPLIER`, `MIN/MAX_ROUND_DEADLINE_LEDGERS`, or `MAX_MEMBERS` is a breaking change — update the README protocol constants table, the SDK constants file, and the app's gating logic.
+- Any change to `PENALTY_BPS`, `BPS_DENOM`, `COLLATERAL_MULTIPLIER`, `MIN/MAX_ROUND_DEADLINE_LEDGERS`, or `MAX_MEMBERS` is a breaking change ΓÇö update the README protocol constants table, the SDK constants file, and the app's gating logic.
 - After changing contract entry-points, regenerate the TypeScript bindings if the SDK uses them, and update the type interfaces in `app/src/app/circles/[address]/CircleDetailClient.tsx`.
 
 **Indexer changes**
@@ -1234,16 +1381,16 @@ Any future change to a guard listed in either test file requires updating the co
 
 **App changes**
 - Keep `"use client"` boundaries minimal. Data fetching belongs in Server Components; interactivity belongs in Client Components.
-- When adding a new page route, export a `generateMetadata` function to provide a title and description — all routes should have meaningful metadata.
+- When adding a new page route, export a `generateMetadata` function to provide a title and description ΓÇö all routes should have meaningful metadata.
 - Run `npm run lint --workspace=app` and `npx tsc --noEmit` in `app/` before opening a PR.
-- The `app/src/lib/gating.ts` action-eligibility logic is the single source of truth for which wallet actions are allowed given the current circle state. Update it — not ad-hoc UI conditions — when adding new state transitions.
+- The `app/src/lib/gating.ts` action-eligibility logic is the single source of truth for which wallet actions are allowed given the current circle state. Update it ΓÇö not ad-hoc UI conditions ΓÇö when adding new state transitions.
 
 **Testing**
 - Rust: `cd contracts && cargo test` runs all unit, property-based, and mutation guard tests.
 - TypeScript: `npm test --workspace=indexer` runs all indexer unit, integration, and incident reproduction tests.
 - App gating mutation tests: `node --require ts-node/register --test app/src/lib/gating.mutation.test.ts`
 - Incident reproduction (offline): `npm run test:incidents --workspace=indexer`
-- Integration tests gated on `DATABASE_URL` are skipped automatically in CI environments without Postgres — run them locally before landing schema changes.
+- Integration tests gated on `DATABASE_URL` are skipped automatically in CI environments without Postgres ΓÇö run them locally before landing schema changes.
 - When modifying a financial guard in `contracts/circle/src/lib.rs` or `app/src/lib/gating.ts`, update the corresponding mutation guard test in `mutation_guards.rs` or `gating.mutation.test.ts`. If the guard is intentionally excluded from mutation testing, add a rationale to the [CI Budget and Excluded Mutations](#ci-budget-and-excluded-mutations) table.
 
 **Branching and commits**

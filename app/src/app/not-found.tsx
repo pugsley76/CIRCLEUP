@@ -10,7 +10,7 @@ import Link from "next/link";
 export const metadata: Metadata = {
   title: "Page Not Found — CircleUp",
   description:
-    "The page or circle you are looking for does not exist or may have moved. " +
+    "The page, circle, or reputation record you are looking for does not exist or may have moved. " +
     "Check the address and try again, or browse all circles on CircleUp.",
 };
 
@@ -19,7 +19,7 @@ export const metadata: Metadata = {
 // This component is rendered whenever any route in the app calls notFound().
 // The most common triggers are:
 //   • /circles/[address]   — unknown or un-indexed circle address
-//   • /reputation/[member] — if a member-specific 404 path is added later
+//   • /reputation/[member] — unknown reputation member (no recorded activity)
 //   • Any typo'd URL
 //
 // The copy is deliberately broad so it reads well for all three cases while
@@ -37,7 +37,8 @@ export default function NotFound() {
       </p>
       <p className="text-slate-500 mb-8">
         If you followed a circle or reputation link, double-check the address —
-        it may be incorrect, or the circle may not have been indexed yet.
+        it may be incorrect, the circle may not have been indexed yet, or the
+        member may have no recorded activity on CircleUp yet.
       </p>
 
       {/* Suggestions */}

@@ -100,6 +100,14 @@ export type ContractErrorCode =
   | "NETWORK_ERROR"
   | "NETWORK_TIMEOUT"
   | "NETWORK_RPC_UNAVAILABLE"
+  // ── Transaction execution (appended for Issue #479) ──────────────────────
+  // XDR `TransactionResult` failures observed after submission — i.e. the
+  // transaction reached the network and was rejected on-chain.  These give
+  // failed contract transactions specific user-facing feedback instead of
+  // falling through to the generic UNKNOWN message.
+  | "TX_FAILED_ON_CHAIN"
+  | "TX_BAD_SEQ"
+  | "TX_INSUFFICIENT_FEE"
   // ── Fallback ──────────────────────────────────────────────────────────────
   | "UNKNOWN";
 
@@ -120,6 +128,7 @@ export type ContractAppError =
   | TokenError
   | WalletError
   | NetworkError
+  | ExecutionError
   | UnknownError;
 
 export interface ValidationError {
@@ -209,6 +218,24 @@ export interface NetworkError {
     | "NETWORK_ERROR"
     | "NETWORK_TIMEOUT"
     | "NETWORK_RPC_UNAVAILABLE"
+  >;
+  readonly message: string;
+  readonly raw?: string;
+}
+
+/**
+ * A transaction that reached the network and was rejected on-chain (or at
+ * submission time) — as opposed to a wallet, network, or validation failure.
+ * Added for Issue #479 so failed contract transactions surface specific
+ * feedback (contract rule violation, sequence mismatch, low fee) instead of
+ * the generic UNKNOWN fallback.
+ */
+export interface ExecutionError {
+  readonly kind: "execution";
+  readonly code: Extract<ContractErrorCode,
+    | "TX_FAILED_ON_CHAIN"
+    | "TX_BAD_SEQ"
+    | "TX_INSUFFICIENT_FEE"
   >;
   readonly message: string;
   readonly raw?: string;
@@ -313,11 +340,22 @@ const USER_MESSAGES: Record<ContractErrorCode, string> = {
 
   // Network
   NETWORK_ERROR:
-    "A network error occurred. Check your connection and try again.",
+    "A network error occurred. Check your internet connection and try again.",
   NETWORK_TIMEOUT:
-    "The transaction timed out waiting for confirmation. Check Stellar Expert for your transaction status before retrying.",
+    "The transaction timed out waiting for confirmation. If you don't see the transaction on Stellar Expert, please try again.",
   NETWORK_RPC_UNAVAILABLE:
-    "The Stellar RPC is temporarily unavailable. Please try again in a moment.",
+    "The Stellar RPC is temporarily unavailable. Please try again in a moment. If the problem persists, contact support.",
+
+  // Transaction execution (Issue #479)
+  TX_FAILED_ON_CHAIN:
+    "The transaction was rejected on-chain. This may be due to a contract rule violation, " +
+    "insufficient balance, or an expired transaction. " +
+    "Check Stellar Expert for the full error detail.",
+  TX_BAD_SEQ:
+    "Your wallet's sequence number is out of sync with the network. " +
+    "Refresh the page and try again.",
+  TX_INSUFFICIENT_FEE:
+    "The network fee was too low. Please try again — the fee will be recalculated automatically.",
 
   // Unknown
   UNKNOWN:
@@ -399,6 +437,33 @@ export function parseContractError(
     return { kind: "wallet", code: "WALLET_PERMISSION_DENIED", message: USER_MESSAGES.WALLET_PERMISSION_DENIED, raw: str };
   }
 
+  // ── 2.5. Transaction execution / envelope failures (Issue #479) ─────────────
+  //
+  // These match the canonical "transaction failed" marker used by the
+  // submission polling loop as well as the XDR result-code names extracted
+  // from `xdr.TransactionResult` (e.g. "txFailed", "txBadSeq",
+  // "txInsufficientFee").  They are checked before the generic network
+  // patterns so an on-chain rejection never degrades to the UNKNOWN
+  // fallback ("An unexpected error occurred").
+  if (
+    lower === "transaction failed" ||
+    lower === "tx_failed" ||
+    lower.includes("txfailed")
+  ) {
+    return { kind: "execution", code: "TX_FAILED_ON_CHAIN", message: USER_MESSAGES.TX_FAILED_ON_CHAIN, raw: str };
+  }
+
+  if (lower.includes("txbadseq")) {
+    return { kind: "execution", code: "TX_BAD_SEQ", message: USER_MESSAGES.TX_BAD_SEQ, raw: str };
+  }
+
+  if (
+    lower.includes("txinsufficientfee") ||
+    (lower.includes("insufficient") && lower.includes("fee"))
+  ) {
+    return { kind: "execution", code: "TX_INSUFFICIENT_FEE", message: USER_MESSAGES.TX_INSUFFICIENT_FEE, raw: str };
+  }
+
   // ── 3. Network / RPC errors ───────────────────────────────────────────────
   if (
     lower === "timeout" ||
@@ -478,11 +543,26 @@ export function parseContractError(
     }
     return { kind: "token", code: "TOKEN_TRANSFER_FAILED", message: USER_MESSAGES.TOKEN_TRANSFER_FAILED, raw: str };
   }
-  if (lower.includes("deadline has passed") || lower.includes("past the round deadline")) {
+  if (
+    lower.includes("deadline has passed") ||
+    lower.includes("past the round deadline") ||
+    lower.includes("deadline passed")
+  ) {
     return { kind: "deadline", code: "DEADLINE_PASSED", message: USER_MESSAGES.DEADLINE_PASSED, raw: str };
   }
   if (lower.includes("deadline has not passed") || lower.includes("deadline not passed")) {
     return { kind: "deadline", code: "DEADLINE_NOT_PASSED", message: USER_MESSAGES.DEADLINE_NOT_PASSED, raw: str };
+  }
+  if (lower.includes("not all members have contributed")) {
+    // Contract panic from `payout` when the on-chain contribution counter is
+    // behind the app's snapshot (e.g. indexer lag) — tell the user precisely
+    // why the payout was rejected instead of the UNKNOWN fallback (#479).
+    return { kind: "state", code: "STATE_ROUND_NOT_COMPLETE", message: USER_MESSAGES.STATE_ROUND_NOT_COMPLETE, raw: str };
+  }
+  if (lower.includes("already paid out")) {
+    // Contract panic from `contribute`/`payout` after the round settled —
+    // the circle state has moved on since the user's screen was rendered.
+    return { kind: "state", code: "STATE_WRONG_STATUS", message: USER_MESSAGES.STATE_WRONG_STATUS, raw: str };
   }
   if (lower.includes("circle is not active") || lower.includes("wrong status") || lower.includes("circle still active")) {
     return { kind: "state", code: "STATE_WRONG_STATUS", message: USER_MESSAGES.STATE_WRONG_STATUS, raw: str };
@@ -557,6 +637,9 @@ export function isWalletError(e: ContractAppError): e is WalletError {
 }
 export function isNetworkError(e: ContractAppError): e is NetworkError {
   return e.kind === "network";
+}
+export function isExecutionError(e: ContractAppError): e is ExecutionError {
+  return e.kind === "execution";
 }
 export function isUnknownError(e: ContractAppError): e is UnknownError {
   return e.kind === "unknown";

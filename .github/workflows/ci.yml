@@ -55,6 +55,12 @@ jobs:
       - name: Contract fixture tests (Issue #464)
         run: npm run test --workspace=sdk -- contractFixtures.test.ts contractFixtures.extended.test.ts --run
 
+      # Clean build, then compile examples/ against dist/ and verify that every
+      # documented symbol imports from the package root, no internal helper or
+      # test file is published, and nothing in the repo uses a deep import.
+      - name: Public API check
+        run: npm run check:api --workspace=sdk
+
   # ── Indexer ─────────────────────────────────────────────────────────────────
   indexer:
     name: Indexer

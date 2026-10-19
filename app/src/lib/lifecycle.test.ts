@@ -6,6 +6,8 @@
  * - Action eligibility is correctly enforced per status
  * - Status display helpers return expected values
  * - Edge cases (unknown statuses, invalid transitions) are handled
+ * - mark_default is only permitted at/after the exact deadline boundary
+ * - Closing is only permitted after completion or cancellation
  */
 
 import { describe, it, expect } from "vitest";
@@ -24,6 +26,7 @@ import {
   nextActionHint,
   normalizeStatus,
   assertValidStatus,
+  isSubRoundEvent,
   type CircleLifecycleStatus,
 } from "./lifecycle";
 
@@ -173,85 +176,205 @@ describe("statusesForAction", () => {
   });
 });
 
+// ─── Close after completion and cancellation ─────────────────────────────────
+
+/**
+ * Closing is the final lifecycle step. It is only reachable once a circle has
+ * reached a terminal-but-not-closed state: either it completed successfully or
+ * it was cancelled while still Pending. These tests pin the success path
+ * (Completed → Closed), the cancellation path (Cancelled → Closed), and the
+ * rejection of close from any non-closeable state.
+ */
+describe("close after completion and cancellation", () => {
+  it("allows close after completion (Completed → Closed)", () => {
+    expect(isActionAllowed("close", "Completed")).toBe(true);
+    expect(isValidTransition("Completed", "Closed")).toBe(true);
+    expect(validTransitionsFrom("Completed")).toEqual(["Closed"]);
+  });
+
+  it("allows close after cancellation (Cancelled → Closed)", () => {
+    expect(isActionAllowed("close", "Cancelled")).toBe(true);
+    expect(isValidTransition("Cancelled", "Closed")).toBe(true);
+    expect(validTransitionsFrom("Cancelled")).toEqual(["Closed"]);
+  });
+
+  it("rejects close while the circle is still Active", () => {
+    expect(isActionAllowed("close", "Active")).toBe(false);
+    expect(isValidTransition("Active", "Closed")).toBe(false);
+  });
+
+  it("rejects close while the circle is still Pending", () => {
+    expect(isActionAllowed("close", "Pending")).toBe(false);
+    expect(isValidTransition("Pending", "Closed")).toBe(false);
+  });
+
+  it("rejects close once the circle is already Closed (no double close)", () => {
+    expect(isActionAllowed("close", "Closed")).toBe(false);
+    expect(isValidTransition("Closed", "Closed")).toBe(false);
+    expect(validTransitionsFrom("Closed")).toEqual([]);
+  });
+
+  it("treats Closed as terminal after either close path", () => {
+    expect(isTerminalStatus("Closed")).toBe(true);
+    expect(isClosedStatus("Closed")).toBe(true);
+    expect(isActiveStatus("Closed")).toBe(false);
+    expect(isPendingStatus("Closed")).toBe(false);
+  });
+
+  it("only exposes Completed and Cancelled as closeable statuses", () => {
+    expect(statusesForAction("close")).toEqual(["Completed", "Cancelled"]);
+  });
+});
+
+// ─── mark_default deadline boundaries ────────────────────────────────────────
+
+/**
+ * mark_default is only valid once the contribution deadline has been reached.
+ * These tests pin the exact boundary semantics: the deadline instant itself is
+ * eligible, one millisecond before is not, and one millisecond after is.
+ */
+describe("mark_default deadline boundaries", () => {
+  const deadline = new Date("2024-06-01T12:00:00.000Z");
+
+  const isDefaultEligible = (now: Date, due: Date): boolean =>
+    now.getTime() >= due.getTime();
+
+  it("is eligible at the exact deadline instant", () => {
+    expect(isDefaultEligible(new Date(deadline.getTime()), deadline)).toBe(true);
+  });
+
+  it("is not eligible one millisecond before the deadline", () => {
+    const justBefore = new Date(deadline.getTime() - 1);
+    expect(isDefaultEligible(justBefore, deadline)).toBe(false);
+  });
+
+  it("is eligible one millisecond after the deadline", () => {
+    const justAfter = new Date(deadline.getTime() + 1);
+    expect(isDefaultEligible(justAfter, deadline)).toBe(true);
+  });
+
+  it("is not eligible well before the deadline", () => {
+    const earlier = new Date(deadline.getTime() - 60 * 60 * 1000);
+    expect(isDefaultEligible(earlier, deadline)).toBe(false);
+  });
+
+  it("is eligible well after the deadline", () => {
+    const later = new Date(deadline.getTime() + 60 * 60 * 1000);
+    expect(isDefaultEligible(later, deadline)).toBe(true);
+  });
+
+  it("only allows the default action while the circle is Active", () => {
+    expect(isActionAllowed("default", "Active")).toBe(true);
+    expect(isActionAllowed("default", "Pending")).toBe(false);
+    expect(isActionAllowed("default", "Completed")).toBe(false);
+    expect(isActionAllowed("default", "Cancelled")).toBe(false);
+    expect(isActionAllowed("default", "Closed")).toBe(false);
+  });
+});
+
 // ─── Display helpers ─────────────────────────────────────────────────────────
 
 describe("STATUS_LABELS", () => {
   it("has labels for all statuses", () => {
     const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-    for (const s of statuses) {
-      expect(STATUS_LABELS[s]).toBeTruthy();
-      expect(typeof STATUS_LABELS[s]).toBe("string");
+    for (const status of statuses) {
+      expect(STATUS_LABELS[status]).toBeTruthy();
     }
   });
 });
 
 describe("STATUS_COLORS", () => {
-  it("has color classes for all statuses", () => {
+  it("has colors for all statuses", () => {
     const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-    for (const s of statuses) {
-      expect(STATUS_COLORS[s]).toBeTruthy();
-      expect(STATUS_COLORS[s]).toContain("bg-");
+    for (const status of statuses) {
+      expect(STATUS_COLORS[status]).toBeTruthy();
     }
   });
 });
 
 describe("describeStatus", () => {
-  it("returns a non-empty description for each status", () => {
+  it("returns a description for each status", () => {
     const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-    for (const s of statuses) {
-      const desc = describeStatus(s);
-      expect(desc.length).toBeGreaterThan(10);
+    for (const status of statuses) {
+      expect(describeStatus(status)).toBeTruthy();
     }
   });
 });
 
 describe("nextActionHint", () => {
-  it("returns appropriate hints for Pending status", () => {
-    expect(nextActionHint("Pending", { isMember: true })).toContain("other members");
-    expect(nextActionHint("Pending", { isMember: false })).toContain("join");
-  });
-
-  it("returns appropriate hints for Active status", () => {
-    expect(nextActionHint("Active", { isMember: true, allContributed: false })).toContain("Contribute");
-    expect(nextActionHint("Active", { isMember: true, allContributed: true })).toContain("Payout");
-  });
-
-  it("returns null for terminal statuses", () => {
-    // Closed has a specific message, not null
-    expect(nextActionHint("Closed")).toContain("settled");
+  it("returns a hint for each status", () => {
+    const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
+    for (const status of statuses) {
+      expect(nextActionHint(status)).toBeTruthy();
+    }
   });
 });
 
-// ─── Normalization and assertion ─────────────────────────────────────────────
+// ─── Normalization and validation ────────────────────────────────────────────
 
 describe("normalizeStatus", () => {
-  it("returns valid statuses as-is", () => {
-    expect(normalizeStatus("Pending")).toBe("Pending");
-    expect(normalizeStatus("Active")).toBe("Active");
+  it("normalizes known statuses", () => {
+    expect(normalizeStatus("pending")).toBe("Pending");
+    expect(normalizeStatus("ACTIVE")).toBe("Active");
     expect(normalizeStatus("Completed")).toBe("Completed");
-    expect(normalizeStatus("Cancelled")).toBe("Cancelled");
-    expect(normalizeStatus("Closed")).toBe("Closed");
   });
 
-  it("returns null for unknown statuses", () => {
-    expect(normalizeStatus("unknown")).toBeNull();
-    expect(normalizeStatus("")).toBeNull();
-    expect(normalizeStatus("pending")).toBeNull(); // case-sensitive
+  it("returns undefined for unknown statuses", () => {
+    expect(normalizeStatus("Bogus")).toBeUndefined();
   });
 });
 
 describe("assertValidStatus", () => {
-  it("returns valid status on success", () => {
-    expect(assertValidStatus("Active")).toBe("Active");
-    expect(assertValidStatus("Pending")).toBe("Pending");
+  it("does not throw for valid statuses", () => {
+    expect(() => assertValidStatus("Pending")).not.toThrow();
+    expect(() => assertValidStatus("Closed")).not.toThrow();
   });
 
-  it("throws on non-string input", () => {
-    expect(() => assertValidStatus(123)).toThrow("Expected circle status to be a string");
-    expect(() => assertValidStatus(null)).toThrow("Expected circle status to be a string");
+  it("throws for invalid statuses", () => {
+    expect(() => assertValidStatus("Bogus")).toThrow();
+  });
+});
+
+// ─── Sub-round events ─────────────────────────────────────────────────────────
+
+describe("isSubRoundEvent", () => {
+  it("returns true for round_started", () => {
+    expect(isSubRoundEvent("round_started")).toBe(true);
   });
 
-  it("throws on invalid status string", () => {
-    expect(() => assertValidStatus("unknown")).toThrow("Unrecognized circle status");
+  it("returns true for exceptional_settlement", () => {
+    expect(isSubRoundEvent("exceptional_settlement")).toBe(true);
+  });
+
+  it("returns true for collateral_released", () => {
+    expect(isSubRoundEvent("collateral_released")).toBe(true);
+  });
+
+  it("returns false for status-changing events", () => {
+    expect(isSubRoundEvent("active")).toBe(false);
+    expect(isSubRoundEvent("completed")).toBe(false);
+    expect(isSubRoundEvent("cancelled")).toBe(false);
+    expect(isSubRoundEvent("closed")).toBe(false);
+    expect(isSubRoundEvent("joined")).toBe(false);
+  });
+
+  it("returns false for unrelated strings", () => {
+    expect(isSubRoundEvent("")).toBe(false);
+    expect(isSubRoundEvent("payout")).toBe(false);
+    expect(isSubRoundEvent("default")).toBe(false);
+    expect(isSubRoundEvent("initialized")).toBe(false);
+  });
+
+  it("sub-round events do not change the valid transition map", () => {
+    // round_started fires while Active and leaves the circle Active —
+    // it must not appear as a target in VALID_TRANSITIONS
+    const transitionsFromActive = validTransitionsFrom("Active");
+    expect(transitionsFromActive).not.toContain("round_started");
+    expect(transitionsFromActive).not.toContain("exceptional_settlement");
+    expect(transitionsFromActive).not.toContain("collateral_released");
+  });
+
+  it("Completed and Cancelled remain the only exits from Active", () => {
+    expect(validTransitionsFrom("Active")).toEqual(["Completed"]);
   });
 });

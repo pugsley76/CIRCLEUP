@@ -22,6 +22,14 @@ export const LEDGERS_PER_MONTH = LEDGERS_PER_DAY * 30;
 export const DEFAULT_PENALTY_BPS = 2_000; // 20%
 export const BPS_DENOM = 10_000;
 
+/**
+ * Page-size bounds of the indexer's paged list endpoints (mirrors
+ * DEFAULT_LIMIT / MAX_LIMIT in indexer/src/api.ts). `IndexerClient` rejects a
+ * `limit` outside `1..INDEXER_MAX_PAGE_SIZE` before sending the request.
+ */
+export const INDEXER_DEFAULT_PAGE_SIZE = 20;
+export const INDEXER_MAX_PAGE_SIZE = 100;
+
 // ─── Network config helpers ───────────────────────────────────────────────────
 
 /** Identifies which Stellar network to target. */

@@ -84,14 +84,23 @@ export function useWallet(): WalletState {
     setError(null);
 
     try {
+      // First, check if the wallet is capable of connecting at all.
+      const caps = detectWalletCapabilities();
+      const connectWarning = explainUnsupportedAction("connect", caps);
+      if (connectWarning) {
+        throw new WalletError("unsupported_capability", connectWarning);
+      }
+
       const pk = await connectWallet();
       setAddress(pk);
       setIsInstalled(true);
 
-      const caps = detectWalletCapabilities();
-      setCapabilities(caps);
-      const warning = explainUnsupportedAction("sign", caps);
-      setCapabilityWarning(warning);
+      // Re-detect capabilities and set capability warning for other actions
+      // once connected, as capabilities might change or become clearer after connection.
+      const updatedCaps = detectWalletCapabilities();
+      setCapabilities(updatedCaps);
+      const signWarning = explainUnsupportedAction("sign", updatedCaps);
+      setCapabilityWarning(signWarning);
 
       return pk;
     } catch (err) {

@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { CircleClient, CircleUpClient } from "../client";
+import { CircleClient, CircleUpClient, isCircleNotActive } from "../client";
 import {
   mapRawConfig,
   mapRawRoundState,
@@ -340,7 +340,11 @@ describe("CircleClient.getCurrentRoundResult", () => {
 
     expect(result.ok).toBe(false);
     if (isReadFailure(result)) {
-      expect(result.error).toMatch(/CircleNotActive/i);
+      // After normalisation the raw "CircleNotActive" becomes a clear
+      // "No active round" message. isCircleNotActive() is the stable API
+      // for detecting this case rather than matching the raw string.
+      expect(isCircleNotActive(result.error)).toBe(true);
+      expect(result.error).toContain("No active round");
     }
   });
 

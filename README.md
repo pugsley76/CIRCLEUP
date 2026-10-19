@@ -392,6 +392,49 @@ const score = await rep.getScore("GALICE...");
 console.log("Alice's reputation score:", score);
 ```
 
+### `IndexerClient` — paged history and filters
+
+List methods return **one page** and keep the server's `pagination` metadata.
+The `iterate*` helpers walk pages for you and stop after `maxPages` (default 10),
+so nothing fetches an unbounded result set by default.
+
+```ts
+import { IndexerClient, INDEXER_MAX_PAGE_SIZE } from "@circleup/sdk";
+
+const indexer = new IndexerClient({ ...config, indexerUrl: "http://localhost:3001" });
+
+// One page: rows + { page, limit, total, totalPages }
+const { circles, pagination } = await indexer.getCircles({ status: "Active", page: 2, limit: 50 });
+
+// Every page, bounded
+for await (const page of indexer.iterateCircles({ limit: INDEXER_MAX_PAGE_SIZE }, { maxPages: 5 })) {
+  render(page.circles);
+}
+```
+
+Invalid options (an unknown key, `limit` outside 1–100, an unsupported `status`
+or `sort`, a `circle` filter that is not an address) reject with a `RangeError`
+before any request is sent. A response whose page envelope is missing or does
+not match the request throws `IndexerError`.
+
+### Recovering from a failed write
+
+Every write resolves to a `TxResult`. Only resubmit when `isRetryable(result)`
+says so. `outcome_unknown`, `timeout`, and `stale_rpc` mean the write may
+already be applied, so look the original hash up first. The SDK never rebuilds
+a write on its own.
+
+```ts
+import { isTxFailure, isRetryable } from "@circleup/sdk";
+
+const result = await circle.contribute(keypair);
+if (isTxFailure(result) && !isRetryable(result)) {
+  const hash = result.diagnostics?.txHash ?? result.txHash;
+  const lookup = hash ? await circle.lookupTransaction(hash) : null;
+  // lookup.value.status: "success" | "failed" | "not_found"
+}
+```
+
 ### Utility helpers
 
 ```ts
@@ -420,6 +463,8 @@ formatPot("10000000", 4);      // → "4.00"
 - `stroopsToUsdc`, `formatUsdc`, and `formatPot` return `"0"` / `"0.00"` on bad input so they are safe to call in render paths without a try/catch.
 - All SDK clients throw synchronously from the constructor when `CircleUpConfig` is invalid, so misconfiguration surfaces early rather than as an obscure RPC error at call time.
 - `getNetworkConfig` throws `Error` for unrecognised network names; use `isValidNetwork` to guard before calling it.
+- Contract reads throw (or return `ok: false` from the `*Result` variants) when the RPC returns a value of the wrong type, is missing a field, or is out of range. The message names the method or field (e.g. `mapRawConfig.round_amount`), so a contract that has drifted fails at the boundary instead of producing a value that only looks valid.
+- Import everything from `@circleup/sdk`. Deep paths such as `@circleup/sdk/dist/client` are blocked by the package `exports` map and are not part of the stable API.
 
 ---
 
@@ -773,3 +818,4 @@ Step 4: Explorer
 
 MIT © CircleUp Contributors
 r3tkl
+<!-- Verified for issue #624: feat(indexer): add explicit health, outage, and diagnostic states to indexer API -->

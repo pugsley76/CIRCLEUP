@@ -8,31 +8,119 @@ import {
   daysToLedgers,
   getExplorerLink,
   ACTIVE_NETWORK,
+  formatUsdc,
+  formatPot,
 } from "@/lib/config";
-import { isStellarPublicKey } from "@/lib/address";
+import { isStellarPublicKey, isValidStellarAccount } from "@/lib/address";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Minimum and maximum number of members allowed by the contract. */
-const MIN_MEMBERS = 2;
-const MAX_MEMBERS = 20;
-/** Maximum round amount in USDC (sanity check to prevent accidental huge values). */
+/**
+ * Member count bounds for a new circle.
+ *
+ * MIN_MEMBERS matches the contracts exactly: circle_factory rejects fewer than
+ * 2 members ("need at least 2 members") before deploying anything.
+ * MAX_MEMBERS is a product limit, deliberately tighter than the contracts'
+ * MAX_MEMBERS of 256: every member must contribute each round and the rotation
+ * runs one round per member, so a 256-member circle would last 256 rounds.
+ *
+ * Enforced in three places that must agree: the row controls (no adding past
+ * MAX_MEMBERS rows, no removing below MIN_MEMBERS rows), the live member-count
+ * status beside the list, and validateCreateForm, the gate before any wallet
+ * prompt. The last two both count members with getMemberCountStatus.
+ */
+export const MIN_MEMBERS = 2;
+export const MAX_MEMBERS = 20;
+
+/** Maximum USDC decimal places supported by the contract (stroops precision). */
+export const MAX_USDC_DECIMALS = 7;
+
+/** Maximum allowed circle name length. */
+export const MAX_NAME_LENGTH = 64;
+
+/** Minimum round amount in USDC (one stroop). */
+export const MIN_AMOUNT_USDC = "0.0000001";
+
+/** Maximum round amount in USDC (sanity cap to prevent accidental huge values). */
 const MAX_ROUND_USDC = 1_000_000;
-/** Maximum round duration in days. */
-const MAX_ROUND_DAYS = 365;
+
+/** Maximum round duration in days (~10 years). */
+export const MAX_ROUND_DAYS = 3650;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/** Per-field validation errors. */
+export interface CreateFormErrors {
+  name?: string;
+  amount?: string;
+  days?: string;
+  /** Per-index member errors (indices that are undefined have no error). */
+  members?: (string | undefined)[];
+  /** List-level member error (count, duplicates). */
+  membersGeneral?: string;
+}
+
+/** The normalised values returned when validation passes. */
+export interface ValidatedCreateForm {
+  name: string;
+  validMembers: string[];
+  amountStroops: bigint;
+  roundDays: number;
+}
+
+// ─── Pure helpers (exported for tests) ───────────────────────────────────────
 
 /** Return trimmed non-empty member strings in order. */
 export function getFilledMembers(members: string[]): string[] {
   return members.map((m) => m.trim()).filter((m) => m.length > 0);
 }
 
+/** Where a member count sits relative to [MIN_MEMBERS, MAX_MEMBERS]. */
+export type MemberCountStatus = "too_few" | "ok" | "too_many";
+
+export function getMemberCountStatus(count: number): MemberCountStatus {
+  if (count < MIN_MEMBERS) return "too_few";
+  if (count > MAX_MEMBERS) return "too_many";
+  return "ok";
+}
+
+/** The member figures the create form displays, derived from the raw rows. */
+export interface MemberRowSummary {
+  /** Distinct filled addresses: the members that would actually be submitted. */
+  count: number;
+  /** Rows that are empty or whitespace-only. They are ignored, never counted. */
+  blankRows: number;
+  /** Filled rows that repeat an earlier address (submit is blocked until fixed). */
+  duplicateRows: number;
+  status: MemberCountStatus;
+}
+
+/**
+ * Summarise member rows for the live counter and the summary card.
+ *
+ * Blank rows are the default state of the form (it opens with four empty
+ * rows), so they must never inflate the member count, the pot, or the
+ * collateral figures. Duplicates are not counted twice either: the contract
+ * rejects them, so counting them would preview a pot that can never exist.
+ */
+export function summarizeMemberRows(values: string[]): MemberRowSummary {
+  const filled = getFilledMembers(values);
+  const distinct = new Set(filled.map((m) => m.toLowerCase())).size;
+  return {
+    count: distinct,
+    blankRows: values.length - filled.length,
+    duplicateRows: filled.length - distinct,
+    status: getMemberCountStatus(distinct),
+  };
+}
+
 /**
  * Find duplicate addresses using case-insensitive comparison.
  * Returns the first duplicate found, or null if all are unique.
  */
-function findDuplicateAddress(addresses: string[]): string | null {
+export function findDuplicateAddress(addresses: string[]): string | null {
   const seen = new Set<string>();
   for (const addr of addresses) {
     const lower = addr.toLowerCase();
@@ -57,15 +145,75 @@ export function countDecimalPlaces(value: string): number {
 }
 
 /**
+ * Validate a single member row on the create flow.
+ *
+ * Returns `undefined` when the row is blank (unused rows are allowed and are
+ * filtered out before submission) or when the entry is a checksum-valid
+ * Stellar account address.  Otherwise returns a row-specific message that
+ * always starts with `Member N:` (1-based), so the form can render it
+ * directly beneath the offending input.
+ *
+ * Every failure mode gets its own message instead of one generic error:
+ *   1. blank row             → skipped
+ *   2. lowercase input       → base32 is case-sensitive, say so explicitly
+ *   3. C… / M… prefix        → name the namespace that was actually entered
+ *   4. shape (prefix/length/alphabet) → generic shape message
+ *   5. strkey checksum       → right shape, wrong checksum — the classic typo
+ *
+ * Check 5 is the one that matters: without it a mistyped address passes the
+ * form and only fails later, inside transaction construction, as an opaque
+ * SDK error — after the wallet prompt has already appeared.
+ *
+ * Pure (no I/O), exported for tests and reusable anywhere else the app
+ * collects member addresses.
+ */
+export function validateMemberEntry(raw: string, index: number): string | undefined {
+  const row = `Member ${index + 1}`;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+
+  const generic = `${row}: must be a G-prefixed 56-character Stellar address.`;
+  const upper = trimmed.toUpperCase();
+
+  // A lowercased address fails the shape test for a different reason than a
+  // typo does — without this hint the user "fixes" it into another wrong value.
+  if (trimmed !== upper && isStellarPublicKey(upper)) {
+    return (
+      `${row}: must be a G-prefixed 56-character Stellar address typed in ` +
+      `uppercase (Stellar addresses are case-sensitive).`
+    );
+  }
+
+  if (upper.charAt(0) === "C") {
+    return (
+      `${row}: must be a G-prefixed wallet address — contract (C…)` +
+      ` addresses cannot be circle members.`
+    );
+  }
+  if (upper.charAt(0) === "M") {
+    return (
+      `${row}: must be a G-prefixed 56-character Stellar address — muxed ` +
+      `(M…) addresses are not supported.`
+    );
+  }
+
+  if (!isStellarPublicKey(trimmed)) return generic;
+
+  if (!isValidStellarAccount(trimmed)) {
+    return `${row}: checksum failed — check for a typo or a truncated copy-paste.`;
+  }
+
+  return undefined;
+}
+
+/**
  * Validate and normalise all create-circle form fields.
  *
  * Returns either:
  *   `{ ok: true,  values: ValidatedCreateForm }`  — safe to submit
  *   `{ ok: false, errors: CreateFormErrors }`      — show errors, do not submit
  *
- * This is the single authoritative gate that `handleSubmit` calls. The function
- * is pure (no I/O, no side effects) so it can be tested exhaustively without a
- * browser environment.
+ * Pure: no I/O, no side effects. Safe to call in tests without a browser.
  */
 export function validateCreateForm(
   name: string,
@@ -95,8 +243,13 @@ export function validateCreateForm(
       errors.amount = "Enter a valid positive amount.";
     } else if (amountNum === 0) {
       errors.amount = "Contribution amount must be greater than zero.";
+    } else if (amountNum > MAX_ROUND_USDC) {
+      errors.amount =
+        `Round amount of $${amountNum.toLocaleString()} exceeds the maximum of ` +
+        `$${MAX_ROUND_USDC.toLocaleString()} USDC.`;
     } else if (countDecimalPlaces(amountStr) > MAX_USDC_DECIMALS) {
-      errors.amount = `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
+      errors.amount =
+        `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
         `"${amountStr}" has ${countDecimalPlaces(amountStr)}.`;
     } else {
       // usdcToStroops is safe here — we've already checked the decimal count
@@ -135,14 +288,11 @@ export function validateCreateForm(
   }
 
   // ── Members — per-field ───────────────────────────────────────────────────
-  const memberErrors: (string | undefined)[] = members.map((raw, i) => {
-    const trimmed = raw.trim();
-    if (trimmed.length === 0) return undefined; // blank rows are ignored
-    if (!isStellarPublicKey(trimmed)) {
-      return `Member ${i + 1}: must be a G-prefixed 56-character Stellar address.`;
-    }
-    return undefined;
-  });
+  // Every filled row is validated on its own, so one bad entry names itself
+  // (`Member 3: …`) instead of the whole list failing later at encoding time.
+  const memberErrors: (string | undefined)[] = members.map((raw, i) =>
+    validateMemberEntry(raw, i),
+  );
 
   const hasPerMemberErrors = memberErrors.some((e) => e !== undefined);
   if (hasPerMemberErrors) {
@@ -150,14 +300,39 @@ export function validateCreateForm(
   }
 
   // ── Members — list-level ──────────────────────────────────────────────────
-  const validMembers = getFilledMembers(members);
+  //
+  // `validMembers` is the set that will actually reach the contract: filled,
+  // trimmed, and address-validated (no blank rows, no bad checksums, no
+  // contract-prefix entries).  It must exclude every row that already failed
+  // validateMemberEntry so that:
+  //
+  //   a) membersGeneral count messages reflect only submittable addresses.
+  //      A form like [A, "bad"] has 1 submittable member, not 2.
+  //
+  //   b) the `values.validMembers` returned on ok:true never contains an
+  //      address that failed per-field validation — closing the gap where
+  //      the contract call could receive an invalid payload.
+  //
+  // Both `getFilledMembers` (blank filter) and the per-field error check run
+  // on the same `members` array in the same iteration, so the two lists stay
+  // in sync without a second pass.
+  const validMembers = members
+    .map((raw, i) => ({ trimmed: raw.trim(), error: memberErrors[i] }))
+    .filter(({ trimmed, error }) => trimmed.length > 0 && error === undefined)
+    .map(({ trimmed }) => trimmed);
 
-  if (validMembers.length < MIN_MEMBERS) {
+  const countStatus = getMemberCountStatus(validMembers.length);
+
+  if (countStatus === "too_few") {
     errors.membersGeneral =
       `At least ${MIN_MEMBERS} members are required. ` +
-      `${validMembers.length === 0 ? "Add member addresses below." : `You have ${validMembers.length}.`}`;
-  } else if (validMembers.length > MAX_MEMBERS) {
-    errors.membersGeneral = `A circle cannot have more than ${MAX_MEMBERS} members.`;
+      (validMembers.length === 0
+        ? "Add member addresses below."
+        : `You have ${validMembers.length}.`);
+  } else if (countStatus === "too_many") {
+    errors.membersGeneral =
+      `A circle cannot have more than ${MAX_MEMBERS} members. ` +
+      `You have ${validMembers.length}; remove ${validMembers.length - MAX_MEMBERS}.`;
   } else {
     const dup = findDuplicateAddress(validMembers);
     if (dup) {
@@ -210,22 +385,25 @@ export default function CreateClient() {
   const router = useRouter();
 
   // ── Form state ─────────────────────────────────────────────────────────────
-  const [name,      setName]      = useState("");
-  const [members,   setMembers]   = useState<string[]>(["", "", "", ""]);
+  const [name, setName] = useState("");
+  const [members, setMembers] = useState<string[]>(["", "", "", ""]);
   const [roundUSDC, setRoundUSDC] = useState("100");
   const [roundDays, setRoundDays] = useState("30");
 
   // ── Submission state ───────────────────────────────────────────────────────
-  const [loading,      setLoading]      = useState(false);
-  const [submitError,  setSubmitError]  = useState("");
-  const [fieldErrors,  setFieldErrors]  = useState<CreateFormErrors>({});
-  const [txHash,       setTxHash]       = useState("");
-  const [copied,       setCopied]       = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [submitError, setSubmitError] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<CreateFormErrors>({});
+  const [txHash, setTxHash] = useState("");
+  const [copied, setCopied] = useState(false);
 
   // Whether validation has been attempted — controls when inline errors appear.
   // Before first submit, per-field errors are hidden so the form isn't
   // immediately hostile. After first submit they stay visible on every change.
   const [validated, setValidated] = useState(false);
+
+  // Guards against concurrent submissions (rapid double-click, etc.)
+  const submittingRef = useRef(false);
 
   // ── Stable IDs ─────────────────────────────────────────────────────────────
   const formId        = useId();
@@ -255,9 +433,26 @@ export default function CreateClient() {
   }, [txHash]);
 
   // ── Derived values ──────────────────────────────────────────────────────────
-  const filledCount    = getFilledMembers(members).length;
-  const roundAmountNum = parseFloat(roundUSDC || "0");
-  const potPerRound    = Number.isFinite(roundAmountNum) ? roundAmountNum * filledCount : 0;
+  // Distinct filled addresses only: blank rows and repeated addresses never
+  // reach the contract, so they must not inflate the counter, pot, or summary.
+  const memberSummary = summarizeMemberRows(members);
+  const filledCount = memberSummary.count;
+
+  // Stroops for the currently-typed amount. `usdcToStroops` throws on invalid
+  // input; during typing we just want a displayable (possibly zero) figure, so
+  // fall back to 0n. All pot/collateral figures derive from this integer, never
+  // from floating point, so the create page shows the same 2-dp formatUsdc /
+  // formatPot values as the rest of the app (issue #493).
+  const roundStroops = (() => {
+    try {
+      return usdcToStroops(roundUSDC || "0");
+    } catch {
+      return 0n;
+    }
+  })();
+
+  const potDisplay = formatPot(roundStroops, filledCount);
+  const memberAmountDisplay = formatUsdc(roundStroops);
 
   // Live-validate after first submit attempt so errors update as user types
   useEffect(() => {
@@ -267,35 +462,14 @@ export default function CreateClient() {
   }, [validated, name, members, roundUSDC, roundDays]);
 
   // ── Member helpers ──────────────────────────────────────────────────────────
-  function updateMember(i: number, val: string) {
-    setMembers((prev) => {
-      if (prev.length >= MAX_MEMBERS) return prev;
-      return [...prev, createMemberRow()];
-    });
-  }, []);
 
-  /**
-   * Remove the row with the given id.  After removal, focus moves to:
-   *   - the row that took the same position, or
-   *   - the last row if the removed row was last.
-   * Focus change is deferred via pendingFocusId so the target exists in the
-   * DOM on the next render.
-   */
-  const removeMember = useCallback((id: string) => {
-    setMembers((prev) => {
-      if (prev.length <= MIN_MEMBERS) return prev;
-      const idx  = prev.findIndex((r) => r.id === id);
-      const next = prev.filter((r) => r.id !== id);
-      // Schedule focus on the row that moved into this slot (or the last row).
-      if (next.length > 0) {
-        const focusIdx  = Math.min(idx, next.length - 1);
-        pendingFocusId.current = next[focusIdx].id;
-      }
-      return next;
-    });
-    // Clean up the ref entry for the removed row.
-    memberInputRefs.current.delete(id);
-  }, []);
+  function updateMember(i: number, val: string) {
+    setMembers((prev) => prev.map((m, idx) => (idx === i ? val : m)));
+  }
+
+  function addMember() {
+    setMembers((prev) => (prev.length >= MAX_MEMBERS ? prev : [...prev, ""]));
+  }
 
   function removeMember(i: number) {
     if (members.length <= MIN_MEMBERS) return;
@@ -306,7 +480,7 @@ export default function CreateClient() {
 
   // ── Copy helper ─────────────────────────────────────────────────────────────
   async function copyTxHash() {
-    const hash = txHash || timedOutTxHash;
+    const hash = txHash;
     if (!hash) return;
     try {
       await navigator.clipboard.writeText(hash);
@@ -334,95 +508,69 @@ export default function CreateClient() {
   // ── Submit ──────────────────────────────────────────────────────────────────
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setSubmitError("");
-    setTxHash("");
-    setCopied(false);
-    setValidated(true);
 
-    // ── Step 1: pre-flight field validation ──────────────────────────────────
-    const validation = validateCreateForm(name, members, roundUSDC, roundDays);
-    if (!validation.ok) {
-      setFieldErrors(validation.errors);
-      focusFirstError(validation.errors);
-      return; // never reach wallet
-    }
-    setFieldErrors({});
+    // Prevent concurrent submissions (rapid double-click guard). Armed before
+    // the first await so a second click during the wallet prompt is dropped,
+    // and disarmed in `finally` (every path, success or failure, passes
+    // through it).
+    if (submittingRef.current) return;
+    submittingRef.current = true;
 
-    const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
-
-    // ── Step 2: wallet check ──────────────────────────────────────────────────
-    let walletAddress: string | null;
     try {
-      walletAddress = await getWalletAddress();
-    } catch (err) {
-      if (err instanceof WalletError && err.reason === "not_installed") {
-        setSubmitError(
-          "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
-        );
-      } else {
-        setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
+      setSubmitError("");
+      setTxHash("");
+      setCopied(false);
+      setValidated(true);
+
+      // ── Step 1: field validation ──────────────────────────────────────────
+      const validation = validateCreateForm(name, members, roundUSDC, roundDays);
+      if (!validation.ok) {
+        setFieldErrors(validation.errors);
+        focusFirstError(validation.errors);
+        return; // never reach wallet
       }
       setFieldErrors({});
 
-      const { name: circleName, validMembers, amountStroops, roundDays: days } =
-        validation.values;
+      const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
 
-    // Check that the creator is not also a member (self-address check)
-    const creatorLower = walletAddress.toLowerCase();
-    const isSelfMember = validMembers.some((m) => m.toLowerCase() === creatorLower);
-    if (isSelfMember) {
-      setError(
-        "Your wallet address cannot be included in the member list. " +
-          "The circle creator is automatically a member.",
-      );
-      return;
-    }
+      // ── Step 2: wallet check ──────────────────────────────────────────────
+      let walletAddress: string | null;
+      try {
+        walletAddress = await getWalletAddress();
+      } catch (err) {
+        if (err instanceof WalletError && err.reason === "not_installed") {
+          setSubmitError(
+            "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
+          );
+        } else {
+          setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
+        }
+        return;
+      }
 
-    const duplicate = findDuplicateAddress(validMembers);
-    if (duplicate) {
-      setError(
-        `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
-      );
-      return;
-    }
+      if (!walletAddress) {
+        setSubmitError("Connect your Freighter wallet using the button in the top-right corner.");
+        return;
+      }
 
-      // Step 3: factory address guard
+      // Self-address check — creator must not be in the member list
+      const creatorLower = walletAddress.toLowerCase();
+      if (validMembers.some((m) => m.toLowerCase() === creatorLower)) {
+        setSubmitError(
+          "Your wallet address cannot be included in the member list. " +
+            "The circle creator is automatically a member.",
+        );
+        return;
+      }
+
+      // ── Step 3: factory address guard ─────────────────────────────────────
       if (!CIRCLE_FACTORY_ADDRESS) {
         setSubmitError("Factory contract not configured. Deploy contracts first.");
         return;
       }
 
-    const amount = parseFloat(roundUSDC);
-    if (isNaN(amount) || amount <= 0) {
-      setError("Enter a valid round amount greater than zero.");
-      return;
-    }
-    if (amount > MAX_ROUND_USDC) {
-      setError(
-        `Round amount of $${amount.toLocaleString()} exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()} USDC.`,
-      );
-      return;
-    }
-
-    const days = parseInt(roundDays, 10);
-    if (isNaN(days) || days < 1) {
-      setError("Enter a valid round duration of at least 1 day.");
-      return;
-    }
-    if (days > MAX_ROUND_DAYS) {
-      setError(`Round duration cannot exceed ${MAX_ROUND_DAYS} days.`);
-      return;
-    }
-
-    // ── Step 3: factory address guard ─────────────────────────────────────────
-    if (!CIRCLE_FACTORY_ADDRESS) {
-      setSubmitError("Factory contract not configured. Deploy contracts first.");
-      return;
-    }
-
-    // ── Step 4: submit ────────────────────────────────────────────────────────
-    setLoading(true);
-    try {
+      // ── Step 4: submit ────────────────────────────────────────────────────
+      setLoading(true);
       const membersVec = xdr.ScVal.scvVec(
         validMembers.map((m) => new Address(m).toScVal()),
       );
@@ -450,17 +598,16 @@ export default function CreateClient() {
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
-      // Release the lock on every path except confirmed timeout, where the user
-      // must explicitly acknowledge via resetAfterTimeout() before retrying.
-      if (!pendingTimeout) {
-        submittingRef.current = false;
-      }
+      setLoading(false);
+      submittingRef.current = false;
     }
   }
 
   const explorerTxUrl = txHash
     ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash)
     : null;
+
+  const submitBlocked = loading || !!txHash;
 
   const submitDescribedBy = [
     submitError ? submitErrId : null,
@@ -470,10 +617,13 @@ export default function CreateClient() {
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="max-w-xl mx-auto px-2 sm:px-0">
-      <h1 className="text-2xl font-bold text-slate-900 mb-2">Create a Circle</h1>
+      <h1 className="text-xl sm:text-2xl font-bold text-slate-900 mb-2">
+        Create a Circle
+      </h1>
       <p className="text-slate-500 text-sm mb-8">
         Set up the members, contribution amount, and schedule. The rotation order
-        is the same as the member list — use the arrows to adjust it.
+        is the same as the member list — members contribute in the order listed,
+        top to bottom.
       </p>
 
       <form
@@ -514,72 +664,75 @@ export default function CreateClient() {
           </p>
         </div>
 
-        {/* ── Contribution amount ───────────────────────────────────────────── */}
-        <div>
-          <label
-            htmlFor={amountId}
-            className="block text-sm font-medium text-slate-700 mb-1"
-          >
-            Contribution per member / round (USDC){" "}
-            <span aria-hidden="true" className="text-red-500">*</span>
-          </label>
-          <div className="flex items-center gap-2">
-            <span className="text-slate-400 text-lg" aria-hidden="true">$</span>
+        {/* ── Contribution amount + round duration ────────────────────────────
+            Grouped on desktop (form-row → 2 columns ≥ sm), stacked on mobile. */}
+        <div className="form-row">
+          <div>
+            <label
+              htmlFor={amountId}
+              className="block text-sm font-medium text-slate-700 mb-1"
+            >
+              Contribution per member / round (USDC){" "}
+              <span aria-hidden="true" className="text-red-500">*</span>
+            </label>
+            <div className="flex items-center gap-2">
+              <span className="text-slate-400 text-lg" aria-hidden="true">$</span>
+              <input
+                id={amountId}
+                ref={amountRef}
+                type="number"
+                min={MIN_AMOUNT_USDC}
+                step="0.0000001"
+                value={roundUSDC}
+                onChange={(e) => setRoundUSDC(e.target.value)}
+                className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
+                  fieldErrors.amount ? "border-red-400 focus:ring-red-400" : "border-slate-300"
+                }`}
+                aria-required="true"
+                aria-invalid={fieldErrors.amount ? "true" : undefined}
+                aria-describedby={[
+                  amountHintId,
+                  fieldErrors.amount ? `${amountId}-err` : null,
+                ].filter(Boolean).join(" ")}
+                aria-label="Contribution amount in USDC"
+              />
+              <span className="text-slate-500 text-sm shrink-0">USDC</span>
+            </div>
+            <p id={amountHintId} className="text-xs text-slate-400 mt-1">
+              Pot per round = ${memberAmountDisplay} ×{" "}
+              {filledCount > 0 ? filledCount : "…"} member
+              {filledCount !== 1 ? "s" : ""} = ${potDisplay}
+            </p>
+            <FieldError id={`${amountId}-err`} message={fieldErrors.amount} />
+          </div>
+
+          <div>
+            <label
+              htmlFor={daysId}
+              className="block text-sm font-medium text-slate-700 mb-1"
+            >
+              Round duration (days){" "}
+              <span aria-hidden="true" className="text-red-500">*</span>
+            </label>
             <input
-              id={amountId}
-              ref={amountRef}
+              id={daysId}
+              ref={daysRef}
               type="number"
-              min={MIN_AMOUNT_USDC}
-              step="0.0000001"
-              value={roundUSDC}
-              onChange={(e) => setRoundUSDC(e.target.value)}
-              className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
-                fieldErrors.amount ? "border-red-400 focus:ring-red-400" : "border-slate-300"
+              min="1"
+              max={MAX_ROUND_DAYS}
+              step="1"
+              value={roundDays}
+              onChange={(e) => setRoundDays(e.target.value)}
+              className={`w-full border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
+                fieldErrors.days ? "border-red-400 focus:ring-red-400" : "border-slate-300"
               }`}
               aria-required="true"
-              aria-invalid={fieldErrors.amount ? "true" : undefined}
-              aria-describedby={[
-                amountHintId,
-                fieldErrors.amount ? `${amountId}-err` : null,
-              ].filter(Boolean).join(" ")}
-              aria-label="Contribution amount in USDC"
+              aria-invalid={fieldErrors.days ? "true" : undefined}
+              aria-describedby={fieldErrors.days ? `${daysId}-err` : undefined}
+              aria-label="Round duration in days"
             />
-            <span className="text-slate-500 text-sm shrink-0">USDC</span>
+            <FieldError id={`${daysId}-err`} message={fieldErrors.days} />
           </div>
-          <p id={amountHintId} className="text-xs text-slate-400 mt-1">
-            Pot per round = ${roundUSDC || "0"} ×{" "}
-            {filledCount > 0 ? filledCount : "…"} members = ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}
-          </p>
-          <FieldError id={`${amountId}-err`} message={fieldErrors.amount} />
-        </div>
-
-        {/* ── Round duration ────────────────────────────────────────────────── */}
-        <div>
-          <label
-            htmlFor={daysId}
-            className="block text-sm font-medium text-slate-700 mb-1"
-          >
-            Round duration (days){" "}
-            <span aria-hidden="true" className="text-red-500">*</span>
-          </label>
-          <input
-            id={daysId}
-            ref={daysRef}
-            type="number"
-            min="1"
-            max={MAX_ROUND_DAYS}
-            step="1"
-            value={roundDays}
-            onChange={(e) => setRoundDays(e.target.value)}
-            className={`w-full border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
-              fieldErrors.days ? "border-red-400 focus:ring-red-400" : "border-slate-300"
-            }`}
-            aria-required="true"
-            aria-invalid={fieldErrors.days ? "true" : undefined}
-            aria-describedby={fieldErrors.days ? `${daysId}-err` : undefined}
-            aria-label="Round duration in days"
-          />
-          <FieldError id={`${daysId}-err`} message={fieldErrors.days} />
         </div>
 
         {/* ── Members ───────────────────────────────────────────────────────── */}
@@ -590,27 +743,35 @@ export default function CreateClient() {
               <span aria-hidden="true" className="text-red-500">*</span>{" "}
               <span className="font-normal text-slate-500">— payout order top → bottom</span>
             </legend>
+            {/* Counts filled, distinct addresses, not rows: a blank row is not a member. */}
             <span
               className={`text-xs font-medium ${
-                members.length >= MAX_MEMBERS ? "text-amber-600" : "text-slate-400"
+                memberSummary.status === "ok" ? "text-slate-500" : "text-amber-600"
               }`}
-              aria-live="polite"
-              aria-atomic="true"
             >
-              {members.length} / {MAX_MEMBERS}
+              {filledCount} / {MAX_MEMBERS} members
             </span>
           </div>
 
-          <div className="space-y-2" aria-describedby={membersHintId}>
+          <ol
+            className="space-y-2"
+            aria-label="Member list — payout rotation order"
+            aria-describedby={membersHintId}
+          >
             {members.map((m, i) => {
               const fieldErr = fieldErrors.members?.[i];
               const inputId  = `member-${i}`;
               const errId    = `member-${i}-err`;
+              const atMin    = members.length <= MIN_MEMBERS;
               return (
-                <div key={i}>
-                  <div className="flex items-center gap-2">
+                <li key={i} className="flex flex-col gap-0.5">
+                  {/* On narrow viewports the row stacks so a 56-character Stellar
+                      address stays fully legible instead of being clipped inside
+                      a shrunken input. Address entry needs the user's full
+                      attention, so the input stays wide and readable.        */}
+                  <div className="flex gap-2 sm:flex-row flex-col items-start sm:items-center">
                     <span
-                      className="text-xs text-slate-400 w-5 shrink-0 text-right"
+                      className="text-xs text-slate-400 w-5 shrink-0 text-right select-none self-start sm:self-center"
                       aria-hidden="true"
                     >
                       {i + 1}.
@@ -622,39 +783,47 @@ export default function CreateClient() {
                       placeholder={`G… (member ${i + 1})`}
                       value={m}
                       onChange={(e) => updateMember(i, e.target.value)}
-                      className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
+                      className={`w-full sm:flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
                         fieldErr ? "border-red-400 focus:ring-red-400" : "border-slate-300"
                       }`}
-                      aria-label={`Member ${i + 1} Stellar address`}
+                      aria-label={`Member ${i + 1} of ${members.length} — Stellar address (payout position ${i + 1})`}
                       aria-invalid={fieldErr ? "true" : undefined}
                       aria-describedby={fieldErr ? errId : undefined}
                       autoComplete="off"
                       spellCheck={false}
                     />
-                    {members.length > MIN_MEMBERS && (
-                      <button
-                        type="button"
-                        onClick={() => removeMember(i)}
-                        className="p-2 -m-1 text-slate-400 hover:text-red-500 text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center"
-                        aria-label={`Remove member ${i + 1}`}
-                      >
-                        <span aria-hidden="true">×</span>
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => !atMin && removeMember(i)}
+                      aria-label={
+                        atMin
+                          ? `Cannot remove member ${i + 1} — circle needs at least ${MIN_MEMBERS} members`
+                          : `Remove member ${i + 1}`
+                      }
+                      aria-disabled={atMin ? "true" : undefined}
+                      className={`p-2 -m-1 text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center transition-colors ${
+                        atMin
+                          ? "text-slate-200 cursor-not-allowed"
+                          : "text-slate-400 hover:text-red-500"
+                      }`}
+                    >
+                      <span aria-hidden="true">×</span>
+                    </button>
                   </div>
+
                   {fieldErr && (
                     <p
                       id={errId}
                       role="alert"
-                      className="mt-1 ml-7 text-xs text-red-600 flex items-center gap-1"
+                      className="mt-0.5 ml-7 text-xs text-red-600 flex items-center gap-1"
                     >
                       <span aria-hidden="true">⚠</span> {fieldErr}
                     </p>
                   )}
-                </div>
+                </li>
               );
             })}
-          </div>
+          </ol>
 
           {/* List-level member error (count, duplicates) */}
           {fieldErrors.membersGeneral && (
@@ -671,7 +840,7 @@ export default function CreateClient() {
               type="button"
               onClick={addMember}
               disabled={members.length >= MAX_MEMBERS}
-              className="text-sm text-brand-600 hover:underline disabled:opacity-40 disabled:cursor-not-allowed disabled:no-underline"
+              className="text-sm text-brand-600 hover:underline disabled:opacity-40 disabled:cursor-not-allowed disabled:no-underline touch-target"
               aria-disabled={members.length >= MAX_MEMBERS}
             >
               + Add member
@@ -683,8 +852,24 @@ export default function CreateClient() {
             )}
           </div>
 
-          <p id={membersHintId} className="text-xs text-slate-400 mt-1">
-            Minimum {MIN_MEMBERS} · maximum {MAX_MEMBERS} members. At least {MIN_MEMBERS} addresses required.
+          {/* Live count status, so the bounds are visible before the first submit. */}
+          <p
+            id={membersHintId}
+            className={`text-xs mt-1 ${
+              memberSummary.status === "ok" ? "text-slate-400" : "text-amber-700"
+            }`}
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {memberSummary.status === "too_few"
+              ? `Add ${MIN_MEMBERS - filledCount} more address${
+                  MIN_MEMBERS - filledCount === 1 ? "" : "es"
+                }. A circle needs ${MIN_MEMBERS} to ${MAX_MEMBERS} members.`
+              : memberSummary.status === "too_many"
+              ? `Remove ${filledCount - MAX_MEMBERS} address${
+                  filledCount - MAX_MEMBERS === 1 ? "" : "es"
+                }. A circle can have at most ${MAX_MEMBERS} members.`
+              : `A circle needs ${MIN_MEMBERS} to ${MAX_MEMBERS} members. Empty rows are ignored.`}
           </p>
         </fieldset>
 
@@ -695,15 +880,23 @@ export default function CreateClient() {
         >
           <p className="font-semibold text-brand-800 mb-1">Circle summary</p>
           <ul className="space-y-0.5 text-slate-600" aria-live="polite" aria-atomic="true">
-            {name.trim() && (
-              <li>📛 {name.trim()}</li>
-            )}
-            <li>👥 {filledCount} member{filledCount !== 1 ? "s" : ""}</li>
-            <li>💰 ${roundUSDC} USDC / member / round</li>
-            <li>🎯 Pot per round: ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}</li>
+            {name.trim() && <li>📛 {name.trim()}</li>}
+            <li>
+              <span>
+                👥 {filledCount} member{filledCount !== 1 ? "s" : ""}
+                {memberSummary.status === "too_few" && ` (at least ${MIN_MEMBERS} needed)`}
+              </span>
+              {memberSummary.duplicateRows > 0 && (
+                <span className="text-amber-700">
+                  {` · ${memberSummary.duplicateRows} duplicate${memberSummary.duplicateRows !== 1 ? "s" : ""} not counted`}
+                </span>
+              )}
+            </li>
+            <li>💰 ${memberAmountDisplay} USDC / member / round</li>
+            <li>🎯 Pot per round: ${potDisplay}</li>
             <li>📅 Round duration: {roundDays} days</li>
             <li>
-              🔒 Collateral required: ${roundUSDC} per member (1× round amount)
+              🔒 Collateral required: ${memberAmountDisplay} per member (1× round amount)
             </li>
           </ul>
         </div>
@@ -753,9 +946,7 @@ export default function CreateClient() {
                   type="button"
                   onClick={copyTxHash}
                   className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0 min-h-[44px] px-2"
-                  aria-label={
-                    copied ? "Transaction hash copied" : "Copy transaction hash"
-                  }
+                  aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
                   aria-pressed={copied}
                 >
                   {copied ? "✓ Copied" : "Copy"}
@@ -772,7 +963,7 @@ export default function CreateClient() {
                 View on Stellar Expert ↗
               </a>
             )}
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-slate-500" aria-live="polite" aria-atomic="true">
               Redirecting to circles list in a few seconds…
             </p>
           </div>
@@ -794,12 +985,6 @@ export default function CreateClient() {
         >
           {loading ? "Creating circle…" : "Create Circle"}
         </button>
-
-        {isTimedOut && (
-          <p className="text-xs text-center text-amber-700" role="status">
-            Submit is locked until you have checked the explorer and confirmed the original transaction did not go through.
-          </p>
-        )}
       </form>
     </div>
   );

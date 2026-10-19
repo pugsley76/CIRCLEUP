@@ -1,26 +1,30 @@
 /**
- * CreateClient — in-flight submission guard and timeout reconciliation tests.
+ * CreateClient — in-flight submission guard and failure-handling tests.
  *
  * Coverage:
  *   - Rapid double-click: second submit is dropped while first is in-flight.
- *   - Wallet rejection (WALLET_REJECTED): error shown, form re-enabled, no navigation.
+ *   - Submit button disabled + loading text while in-flight.
  *   - Confirmed success: txHash set, navigation scheduled, submit locked.
- *   - Timeout with hash: reconciliation panel shown, submit locked, reset unlocks.
- *   - Timeout without hash: treated as a regular error (no reconciliation panel).
+ *   - Timeout: treated as a regular error (reconciliation panel was part of
+ *     the reverted #471-475 feature set and no longer exists).
+ *   - Wallet rejection: error shown, form re-enabled, no navigation.
  *   - Navigation only on confirmed success — never on timeout or other failures.
  *   - invokeContract called at most once per user intent.
+ *   - Invalid form never reaches wallet signing.
  *
  * Strategy:
  *   These tests render the full CreateClient component against mocked
  *   @/lib/stellar and next/navigation. Every test that exercises the submit
  *   path fills in the minimum valid form fields first, then fires the button.
+ *   Member fixtures are checksum-valid (Issue #477) and distinct from the
+ *   connected wallet so the self-address guard never trips.
  *
  * Runner: vitest + @testing-library/react (jsdom)
  */
 
-import React from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { Keypair } from "@stellar/stellar-sdk";
 
 // ─── Module mocks ─────────────────────────────────────────────────────────────
 // vi.mock calls are hoisted to the top of the file by vitest, before any
@@ -54,11 +58,19 @@ vi.mock("@/lib/config", async (importOriginal) => {
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
 import CreateClient from "../app/create/CreateClient";
 
-// ─── Fixtures ──────────────────────────────────────────────────────────────────
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const WALLET = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const MEMBER_A = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const MEMBER_B = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPCIB";
+/**
+ * Deterministic, checksum-valid addresses. The connected wallet and the two
+ * member addresses are intentionally distinct, so the component's self-address
+ * guard (creator must not appear in the member list) never fires.
+ */
+const addrFor = (seed: number): string =>
+  Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey();
+
+const WALLET   = addrFor(60);
+const MEMBER_A = addrFor(61);
+const MEMBER_B = addrFor(62);
 const TX_HASH  = "abc123def456abc123def456abc123def456abc123def456abc123def456ab12";
 
 /** InvokeResult shapes matching what stellar.ts actually returns */
@@ -110,7 +122,7 @@ const genericFailure = {
  * Fill in the minimum valid fields and return the submit button.
  * Uses fireEvent for fast synchronous filling of text inputs.
  */
-async function fillValidForm() {
+function fillValidForm() {
   // Name
   const nameInput = screen.getByRole("textbox", { name: /circle name/i });
   fireEvent.change(nameInput, { target: { value: "Test Circle" } });
@@ -124,7 +136,9 @@ async function fillValidForm() {
   fireEvent.change(daysInput, { target: { value: "30" } });
 
   // Members — default render starts with 4 blank rows; fill the first two
-  const memberInputs = screen.getAllByRole("textbox", { name: /member \d+ stellar address/i });
+  const memberInputs = screen.getAllByRole("textbox", {
+    name: /member \d+ of \d+ — stellar address/i,
+  });
   fireEvent.change(memberInputs[0], { target: { value: MEMBER_A } });
   fireEvent.change(memberInputs[1], { target: { value: MEMBER_B } });
 
@@ -157,7 +171,7 @@ describe("CreateClient — submission guard", () => {
     );
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
 
     // First click — in-flight
     fireEvent.click(submit);
@@ -180,7 +194,7 @@ describe("CreateClient — submission guard", () => {
     );
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
 
     fireEvent.click(submit);
 
@@ -199,7 +213,7 @@ describe("CreateClient — submission guard", () => {
     );
 
     render(<CreateClient />);
-    await fillValidForm();
+    fillValidForm();
 
     fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
 
@@ -216,7 +230,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(successResult);
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
     fireEvent.click(submit);
 
     await waitFor(() => {
@@ -228,7 +242,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(successResult);
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
     fireEvent.click(submit);
 
     await waitFor(() => {
@@ -240,7 +254,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(successResult);
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
     fireEvent.click(submit);
 
     await waitFor(() => {
@@ -254,7 +268,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(successResult);
 
     render(<CreateClient />);
-    await fillValidForm();
+    fillValidForm();
     fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
 
     await waitFor(() => {
@@ -270,7 +284,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(successResult);
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
     fireEvent.click(submit);
 
     await waitFor(() => {
@@ -286,7 +300,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(walletRejected);
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
     fireEvent.click(submit);
 
     await waitFor(() => {
@@ -300,7 +314,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(walletRejected);
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
     fireEvent.click(submit);
 
     await waitFor(() => {
@@ -315,7 +329,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(walletRejected);
 
     render(<CreateClient />);
-    await fillValidForm();
+    fillValidForm();
     fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
 
     await waitFor(() => {
@@ -331,7 +345,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(walletRejected);
 
     render(<CreateClient />);
-    await fillValidForm();
+    fillValidForm();
     fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
 
     await waitFor(() => {
@@ -343,171 +357,57 @@ describe("CreateClient — submission guard", () => {
     ).not.toBeInTheDocument();
   });
 
-  // ── Timeout with hash (reconciliation path) ─────────────────────────────────
+  // ── Timeout — regular error, no reconciliation panel ────────────────────────
 
-  it("shows the reconciliation panel when timeout includes a txHash", async () => {
+  it("timeout with a txHash is surfaced as a regular error", async () => {
     mockInvokeContract.mockResolvedValue(timeoutWithHash);
 
     render(<CreateClient />);
-    await fillValidForm();
-    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
-
-    await waitFor(() => {
-      expect(screen.getByText(/confirmation timed out/i)).toBeInTheDocument();
-    });
-  });
-
-  it("shows the timed-out txHash in the reconciliation panel", async () => {
-    mockInvokeContract.mockResolvedValue(timeoutWithHash);
-
-    render(<CreateClient />);
-    await fillValidForm();
-    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
-
-    await waitFor(() => {
-      expect(screen.getByText(TX_HASH)).toBeInTheDocument();
-    });
-  });
-
-  it("submit is locked while reconciliation panel is visible", async () => {
-    mockInvokeContract.mockResolvedValue(timeoutWithHash);
-
-    render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
     fireEvent.click(submit);
 
     await waitFor(() => {
-      expect(screen.getByText(/confirmation timed out/i)).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent(/timed out|confirmation/i);
     });
 
-    expect(submit).toBeDisabled();
+    // The reconciliation panel is gone (reverted feature) — no resolve copy,
+    // no success panel, and submit is unlocked so the user can retry.
+    expect(screen.queryByText(/i.ve checked.*did not confirm/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/circle created successfully/i)).not.toBeInTheDocument();
+    expect(submit).not.toBeDisabled();
+  });
+
+  it("timeout without a txHash is surfaced as a regular error", async () => {
+    mockInvokeContract.mockResolvedValue(timeoutNoHash);
+
+    render(<CreateClient />);
+    const submit = fillValidForm();
+    fireEvent.click(submit);
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
+
+    expect(
+      screen.queryByText(/confirmation timed out/i),
+    ).not.toBeInTheDocument();
+    expect(submit).not.toBeDisabled();
   });
 
   it("does not navigate on timeout", async () => {
     mockInvokeContract.mockResolvedValue(timeoutWithHash);
 
     render(<CreateClient />);
-    await fillValidForm();
+    fillValidForm();
     fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/confirmation timed out/i)).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toBeInTheDocument();
     });
 
     // No success panel means no navigation was triggered
     expect(screen.queryByText(/circle created successfully/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/redirecting/i)).not.toBeInTheDocument();
-  });
-
-  it("shows an explorer link in the reconciliation panel", async () => {
-    mockInvokeContract.mockResolvedValue(timeoutWithHash);
-
-    render(<CreateClient />);
-    await fillValidForm();
-    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
-
-    await waitFor(() => {
-      expect(screen.getByText(/confirmation timed out/i)).toBeInTheDocument();
-    });
-
-    const explorerLinks = screen.getAllByRole("link", { name: /stellar expert/i });
-    expect(explorerLinks.length).toBeGreaterThanOrEqual(1);
-    expect(explorerLinks[0]).toHaveAttribute(
-      "href",
-      expect.stringContaining(TX_HASH),
-    );
-  });
-
-  it("reset button unlocks submit and clears reconciliation panel", async () => {
-    mockInvokeContract.mockResolvedValue(timeoutWithHash);
-
-    render(<CreateClient />);
-    const submit = await fillValidForm();
-    fireEvent.click(submit);
-
-    await waitFor(() => {
-      expect(screen.getByText(/confirmation timed out/i)).toBeInTheDocument();
-    });
-
-    // Click the "I've checked" reset button
-    const resetBtn = screen.getByRole("button", {
-      name: /i.ve checked.*did not confirm/i,
-    });
-    fireEvent.click(resetBtn);
-
-    await waitFor(() => {
-      expect(
-        screen.queryByText(/confirmation timed out/i),
-      ).not.toBeInTheDocument();
-    });
-
-    // Submit should be re-enabled
-    expect(submit).not.toBeDisabled();
-  });
-
-  it("allows a fresh submit after timeout reset", async () => {
-    mockInvokeContract
-      .mockResolvedValueOnce(timeoutWithHash)
-      .mockResolvedValueOnce(successResult);
-
-    render(<CreateClient />);
-    const submit = await fillValidForm();
-
-    // First submit — times out
-    fireEvent.click(submit);
-    await waitFor(() => {
-      expect(screen.getByText(/confirmation timed out/i)).toBeInTheDocument();
-    });
-
-    // User acknowledges and resets
-    fireEvent.click(
-      screen.getByRole("button", { name: /i.ve checked.*did not confirm/i }),
-    );
-    await waitFor(() => {
-      expect(screen.queryByText(/confirmation timed out/i)).not.toBeInTheDocument();
-    });
-
-    // Second submit — succeeds
-    fireEvent.click(submit);
-    await waitFor(() => {
-      expect(screen.getByText(/circle created successfully/i)).toBeInTheDocument();
-    });
-
-    // invokeContract must have been called exactly twice — no duplicates
-    expect(mockInvokeContract).toHaveBeenCalledTimes(2);
-  });
-
-  // ── Timeout without hash ────────────────────────────────────────────────────
-
-  it("shows a regular error (not reconciliation) when timeout has no txHash", async () => {
-    mockInvokeContract.mockResolvedValue(timeoutNoHash);
-
-    render(<CreateClient />);
-    await fillValidForm();
-    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
-
-    await waitFor(() => {
-      expect(screen.getByRole("alert")).toBeInTheDocument();
-    });
-
-    // Reconciliation panel must NOT appear — there is no hash to reconcile
-    expect(
-      screen.queryByText(/confirmation timed out/i),
-    ).not.toBeInTheDocument();
-  });
-
-  it("re-enables submit when timeout has no txHash", async () => {
-    mockInvokeContract.mockResolvedValue(timeoutNoHash);
-
-    render(<CreateClient />);
-    const submit = await fillValidForm();
-    fireEvent.click(submit);
-
-    await waitFor(() => {
-      expect(screen.getByRole("alert")).toBeInTheDocument();
-    });
-
-    expect(submit).not.toBeDisabled();
   });
 
   // ── Generic failure ─────────────────────────────────────────────────────────
@@ -516,7 +416,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(genericFailure);
 
     render(<CreateClient />);
-    const submit = await fillValidForm();
+    const submit = fillValidForm();
     fireEvent.click(submit);
 
     await waitFor(() => {
@@ -530,7 +430,7 @@ describe("CreateClient — submission guard", () => {
     mockInvokeContract.mockResolvedValue(genericFailure);
 
     render(<CreateClient />);
-    await fillValidForm();
+    fillValidForm();
     fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
 
     await waitFor(() => {
@@ -575,7 +475,7 @@ describe("CreateClient — submission guard", () => {
     mockGetWalletAddress.mockResolvedValue(null);
 
     render(<CreateClient />);
-    await fillValidForm();
+    fillValidForm();
     fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
 
     await waitFor(() => {

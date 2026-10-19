@@ -15,6 +15,12 @@ export const metadata: Metadata = {
     url: "/create",
     type: "website",
   },
+  twitter: {
+    card: "summary",
+    title: "Create a Savings Circle — CircleUp",
+    description:
+      "Set up a trustless savings circle on Stellar. Choose members, contribution amount, and round duration.",
+  },
 };
 
 export default function CreatePage() {

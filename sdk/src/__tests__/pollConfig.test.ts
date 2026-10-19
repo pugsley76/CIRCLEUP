@@ -226,7 +226,7 @@ describe("buildAndSend — maxConsecutiveErrors threshold", () => {
 
     expect(isTxFailure(result)).toBe(true);
     if (isTxFailure(result)) {
-      expect(result.errorCode).toBe("network_error");
+      expect(result.errorCode).toBe("outcome_unknown");
       expect(result.errorMessage).toContain("connection refused");
     }
     // getTransaction should have been called exactly 3 times

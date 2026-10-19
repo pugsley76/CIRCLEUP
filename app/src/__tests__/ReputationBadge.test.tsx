@@ -265,8 +265,9 @@ describe("ReputationLegend", () => {
   it("each tier row shows its unique shape marker", () => {
     const { container } = render(<ReputationLegend />);
     for (const tier of REPUTATION_LEVELS) {
-      const cells = Array.from(container.querySelectorAll("td")).map(
-        (td) => td.textContent ?? ""
+      // markers live in aria-hidden spans inside th cells
+      const cells = Array.from(container.querySelectorAll("th, td")).map(
+        (el) => el.textContent ?? ""
       );
       const hasMarker = cells.some((text) => text.includes(tier.marker));
       expect(hasMarker, `marker "${tier.marker}" for tier "${tier.label}" not found`).toBe(true);
@@ -278,20 +279,79 @@ describe("ReputationLegend", () => {
     expect(screen.queryByText("Unknown")).not.toBeInTheDocument();
   });
 
-  it("section has an accessible label", () => {
+  // ── Issue #481 — visibility legend and accessibility labeling ─────────────
+
+  it("section is labelled via aria-labelledby pointing at the visible heading", () => {
+    const { container } = render(<ReputationLegend />);
+    const section = container.querySelector("section");
+    expect(section).not.toBeNull();
+    // aria-labelledby must reference the heading id, not duplicate via aria-label
+    expect(section!.getAttribute("aria-labelledby")).toBe("rep-legend-heading");
+    expect(section!.hasAttribute("aria-label")).toBe(false);
+  });
+
+  it("section is discoverable as a region landmark named 'Badge levels'", () => {
     render(<ReputationLegend />);
     expect(
-      screen.getByRole("region", { name: /reputation badge legend/i })
+      screen.getByRole("region", { name: /badge levels/i })
     ).toBeInTheDocument();
   });
 
-  it("table has accessible column headers via sr-only thead", () => {
+  it("table has visible column headers (not sr-only)", () => {
     const { container } = render(<ReputationLegend />);
     const thead = container.querySelector("thead");
     expect(thead).toBeInTheDocument();
-    // sr-only thead should be visually hidden but present in the DOM
-    const ths = Array.from(thead!.querySelectorAll("th"));
+    // Visible headers must NOT carry the sr-only class
+    const ths = Array.from(thead!.querySelectorAll("th[scope='col']"));
     expect(ths.length).toBe(3);
+    for (const th of ths) {
+      expect(th.className).not.toMatch(/\bsr-only\b/);
+    }
+  });
+
+  it("each data row uses a th[scope='row'] for the tier name", () => {
+    const { container } = render(<ReputationLegend />);
+    const rowHeaders = Array.from(
+      container.querySelectorAll("tbody th[scope='row']")
+    );
+    // One row header per tier
+    expect(rowHeaders.length).toBe(REPUTATION_LEVELS.length);
+  });
+
+  it("each row header includes an sr-only tier name for assistive technology", () => {
+    const { container } = render(<ReputationLegend />);
+    const rowHeaders = Array.from(
+      container.querySelectorAll("tbody th[scope='row']")
+    );
+    const srOnlyTexts = rowHeaders.map((th) => {
+      const srSpan = th.querySelector(".sr-only");
+      return srSpan?.textContent ?? "";
+    });
+    for (const tier of REPUTATION_LEVELS) {
+      expect(srOnlyTexts).toContain(tier.label);
+    }
+  });
+
+  it("score range cells carry aria-label for full accessible announcement", () => {
+    const { container } = render(<ReputationLegend />);
+    const rangeCells = Array.from(
+      container.querySelectorAll("tbody td[aria-label]")
+    ).filter((el) =>
+      (el.getAttribute("aria-label") ?? "").startsWith("Score range:")
+    );
+    // One per tier row
+    expect(rangeCells.length).toBe(REPUTATION_LEVELS.length);
+  });
+
+  it("decorative badge span inside each row header is aria-hidden", () => {
+    const { container } = render(<ReputationLegend />);
+    const rowHeaders = Array.from(
+      container.querySelectorAll("tbody th[scope='row']")
+    );
+    for (const th of rowHeaders) {
+      const badgeSpan = th.querySelector("span[aria-hidden='true']");
+      expect(badgeSpan).not.toBeNull();
+    }
   });
 });
 

@@ -4,11 +4,25 @@
   "description": "TypeScript SDK for CircleUp on Stellar Soroban",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "dev": "tsc --watch",
     "test": "vitest --run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck:examples": "tsc -p examples/tsconfig.json",
+    "check:api": "npm run clean && npm run build && tsc -p examples/tsconfig.dist.json && node scripts/check-public-api.cjs",
+    "prepublishOnly": "npm run check:api"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^12.3.0"

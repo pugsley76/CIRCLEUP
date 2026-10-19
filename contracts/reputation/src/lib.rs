@@ -83,6 +83,13 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+/// Topic-0 namespace shared by every event this contract publishes.
+///
+/// Mirrors `circle::EVENT_NAMESPACE`: topics are `(EVENT_NAMESPACE, <name>)`.
+pub const EVENT_NAMESPACE: &str = "reputation";
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -98,6 +105,15 @@ pub enum DataKey {
     /// `increment`.  Append-only: entries are written by
     /// `remove_authorized_caller` and never cleared.
     RevokedCallers,
+    /// Reentrancy guard held for the duration of `initialize`.
+    ///
+    /// Set as the very first storage write in `initialize` and cleared once
+    /// all setup fully commits.  If a reentrant call lands mid-initialize
+    /// (e.g. a future cross-contract call is added here) the flag is already
+    /// present and the call panics immediately, before any partial state is
+    /// visible to the reentrant path.  The `Admin` key absence alone is not a
+    /// safe guard because a reentrant call would also see `Admin` absent.
+    Initializing,
 }
 
 // ─── Contract errors ──────────────────────────────────────────────────────────
@@ -173,10 +189,28 @@ impl ReputationContract {
     /// callers via `add_authorized_caller` / `remove_authorized_caller`.  In
     /// the standard CircleUp deployment the factory contract is passed as admin
     /// so it can register each circle it deploys.
+    ///
+    /// # Reentrancy guard
+    ///
+    /// Sets `DataKey::Initializing` as the very first storage write and clears
+    /// it once all setup commits.  This prevents a reentrant call from racing
+    /// through a second initialize mid-flight and observing a partially
+    /// initialized state.  The `Admin` key absence alone is not a sufficient
+    /// guard because a reentrant call would also see `Admin` absent.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
+
+        // Reentrancy guard: set the Initializing flag before any other write.
+        // A reentrant call arriving mid-initialize (e.g. if a future change
+        // introduces a cross-contract call here) sees this flag and panics
+        // immediately, preventing partial state from being observed or committed.
+        if env.storage().instance().has(&DataKey::Initializing) {
+            panic!("initialize already in progress");
+        }
+        env.storage().instance().set(&DataKey::Initializing, &true);
+
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
 
@@ -187,6 +221,9 @@ impl ReputationContract {
         env.storage()
             .instance()
             .set(&DataKey::RevokedCallers, &empty);
+
+        // Clear the reentrancy guard once all setup commits successfully.
+        env.storage().instance().remove(&DataKey::Initializing);
     }
 
     // ── Authorized-caller management ──────────────────────────────────────────
@@ -228,7 +265,7 @@ impl ReputationContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "caller_added"),
             ),
             circle,
@@ -283,7 +320,7 @@ impl ReputationContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "caller_removed"),
             ),
             circle,
@@ -366,7 +403,7 @@ impl ReputationContract {
         // without a separate `score` query.
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "score_updated"),
             ),
             (member, new_score),
@@ -541,6 +578,329 @@ mod tests {
         assert_eq!(s.client.get_revoked_callers().len(), 0);
     }
 
+    // ── initialize: reentrancy guard ──────────────────────────────────────────
+
+    /// The reentrancy guard (DataKey::Initializing) is set before any other
+    /// storage write in `initialize`.  Simulating a reentrant call by
+    /// pre-setting the flag must cause initialize to panic with
+    /// "initialize already in progress" rather than proceeding.
+    #[test]
+    #[should_panic(expected = "initialize already in progress")]
+    fn test_initialize_reentrancy_guard_fires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        // Pre-set the Initializing flag to simulate a reentrant call landing
+        // mid-initialize (e.g. from a future cross-contract call added there).
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
+
+        // Must panic: Initializing flag already set.
+        client.initialize(&Address::generate(&env));
+    }
+
+    /// After a reentrancy-guard failure the Admin key must remain absent,
+    /// confirming the guard fires before any committed state.
+    #[test]
+    fn test_initialize_reentrancy_guard_leaves_no_admin_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
+
+        let result = client.try_initialize(&Address::generate(&env));
+        assert!(result.is_err(), "initialize with Initializing flag set must fail");
+
+        // Admin key must not have been written — verify directly via storage.
+        let admin_present = env.as_contract(&contract_id, || {
+            env.storage().instance().has(&DataKey::Admin)
+        });
+        assert!(!admin_present, "Admin key must be absent after reentrancy-guard failure");
+    }
+
+    /// A reentrancy-guard failure must leave the caller lists absent (not
+    /// written as empty vecs), so a retry with a correct admin succeeds cleanly.
+    #[test]
+    fn test_initialize_reentrancy_guard_allows_retry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        // First attempt: fail via reentrancy guard simulation.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
+        let bad = client.try_initialize(&Address::generate(&env));
+        assert!(bad.is_err(), "first initialize must fail");
+
+        // Clear the simulated flag so a retry can proceed.
+        env.as_contract(&contract_id, || {
+            env.storage().instance().remove(&DataKey::Initializing);
+        });
+
+        // Second attempt with a correct admin must succeed.
+        let good_admin = Address::generate(&env);
+        client.initialize(&good_admin);
+        assert_eq!(client.get_admin(), good_admin, "retry must store the correct admin");
+        assert_eq!(client.get_authorized_callers().len(), 0);
+        assert_eq!(client.get_revoked_callers().len(), 0);
+    }
+
+    // ── initialize: admin immutability ────────────────────────────────────────
+
+    /// The admin stored at initialize time must be exactly the address passed in.
+    /// Re-initializing with a different admin must be rejected and leave the
+    /// original admin unchanged.
+    #[test]
+    fn test_admin_immutable_after_initialize() {
+        let s = setup();
+        let original_admin = s.client.get_admin();
+
+        // Attempt to overwrite with a different admin — must fail.
+        let attacker = Address::generate(&s.env);
+        let result = s.client.try_initialize(&attacker);
+        assert!(result.is_err(), "second initialize must be rejected");
+
+        // Admin must still be the original.
+        assert_eq!(
+            s.client.get_admin(),
+            original_admin,
+            "admin must be immutable after initialize"
+        );
+    }
+
+    /// get_admin before initialize must panic with a clear message.
+    #[test]
+    #[should_panic(expected = "reputation: get_admin called before initialize")]
+    fn test_get_admin_before_initialize_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+        client.get_admin(); // must panic
+    }
+
+    // ── admin-auth: add_authorized_caller ─────────────────────────────────────
+
+    /// Only the stored admin may add an authorized caller.  Any other address
+    /// must receive NotAdmin regardless of whether mock_all_auths is active
+    /// (the guard checks the stored admin address, not just the signature).
+    #[test]
+    fn test_add_authorized_caller_requires_stored_admin_identity() {
+        let s = setup();
+        let circle = Address::generate(&s.env);
+
+        // A brand-new address that has not been set as admin must be rejected.
+        let non_admin = Address::generate(&s.env);
+        let result = s.client.try_add_authorized_caller(&non_admin, &circle);
+        assert_eq!(
+            result,
+            Err(Ok(ReputationError::NotAdmin)),
+            "add_authorized_caller must reject any address that is not the stored admin"
+        );
+
+        // The list must remain empty after the rejected call.
+        assert_eq!(
+            s.client.get_authorized_callers().len(), 0,
+            "authorized callers must be empty after rejected add"
+        );
+    }
+
+    /// A series of different non-admin addresses must all be rejected.
+    /// This confirms the check is against the stored admin identity,
+    /// not merely the absence of a signature.
+    #[test]
+    fn test_add_authorized_caller_rejects_multiple_non_admins() {
+        let s = setup();
+        let circle = Address::generate(&s.env);
+
+        for _ in 0..5 {
+            let stranger = Address::generate(&s.env);
+            let result = s.client.try_add_authorized_caller(&stranger, &circle);
+            assert_eq!(
+                result,
+                Err(Ok(ReputationError::NotAdmin)),
+                "every non-admin address must be rejected by add_authorized_caller"
+            );
+        }
+
+        assert_eq!(s.client.get_authorized_callers().len(), 0);
+    }
+
+    /// add_authorized_caller called before initialize must return NotInitialized
+    /// (the require_admin helper checks for Admin key absence first).
+    #[test]
+    fn test_add_authorized_caller_before_initialize_returns_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+        let result = client.try_add_authorized_caller(
+            &Address::generate(&env),
+            &Address::generate(&env),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(ReputationError::NotInitialized)),
+            "add_authorized_caller before initialize must return NotInitialized"
+        );
+    }
+
+    // ── admin-auth: remove_authorized_caller ──────────────────────────────────
+
+    /// Only the stored admin may remove an authorized caller.
+    #[test]
+    fn test_remove_authorized_caller_requires_stored_admin_identity() {
+        let s = setup();
+        let circle = Address::generate(&s.env);
+        s.client.add_authorized_caller(&s.admin, &circle);
+
+        let non_admin = Address::generate(&s.env);
+        let result = s.client.try_remove_authorized_caller(&non_admin, &circle);
+        assert_eq!(
+            result,
+            Err(Ok(ReputationError::NotAdmin)),
+            "remove_authorized_caller must reject any address that is not the stored admin"
+        );
+
+        // The circle must remain in the authorized list.
+        assert!(
+            s.client.get_authorized_callers().contains(&circle),
+            "circle must remain authorized after rejected remove"
+        );
+        // And must not appear in the revoked list.
+        assert!(
+            !s.client.get_revoked_callers().contains(&circle),
+            "circle must not be revoked after a rejected remove"
+        );
+    }
+
+    /// remove_authorized_caller called before initialize must return NotInitialized.
+    #[test]
+    fn test_remove_authorized_caller_before_initialize_returns_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+        let result = client.try_remove_authorized_caller(
+            &Address::generate(&env),
+            &Address::generate(&env),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(ReputationError::NotInitialized)),
+            "remove_authorized_caller before initialize must return NotInitialized"
+        );
+    }
+
+    // ── admin-auth: increment ─────────────────────────────────────────────────
+
+    /// increment called before initialize must return NotInitialized — the
+    /// contract must check for Admin key presence before any other logic.
+    #[test]
+    fn test_increment_before_initialize_returns_not_initialized_detailed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+        let result = client.try_increment(
+            &Address::generate(&env),
+            &Address::generate(&env),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(ReputationError::NotInitialized)),
+            "increment before initialize must return NotInitialized"
+        );
+    }
+
+    /// After revocation, the admin is still the stored admin and can still
+    /// manage the allowlist for other circles — revocation of one circle
+    /// must not affect admin identity or other circles' authorization.
+    #[test]
+    fn test_admin_auth_unaffected_by_revocation() {
+        let s = setup();
+        let circle_a = Address::generate(&s.env);
+        let circle_b = Address::generate(&s.env);
+
+        s.client.add_authorized_caller(&s.admin, &circle_a);
+        s.client.add_authorized_caller(&s.admin, &circle_b);
+
+        // Revoke circle_a
+        s.client.remove_authorized_caller(&s.admin, &circle_a);
+
+        // Admin identity must be unchanged.
+        assert_eq!(s.client.get_admin(), s.admin, "admin must be unchanged after revocation");
+
+        // Admin must still be able to manage circle_b.
+        let new_circle = Address::generate(&s.env);
+        s.client.add_authorized_caller(&s.admin, &new_circle);
+        assert!(
+            s.client.get_authorized_callers().contains(&new_circle),
+            "admin must still be able to add new callers after revoking another"
+        );
+
+        // circle_a is revoked; circle_b is still authorized.
+        assert!(!s.client.get_authorized_callers().contains(&circle_a));
+        assert!(s.client.get_authorized_callers().contains(&circle_b));
+    }
+
+    // ── initialize: state written atomically ──────────────────────────────────
+
+    /// After a successful initialize the contract must expose all four expected
+    /// storage entries: Admin, AuthorizedCallers (empty), RevokedCallers (empty),
+    /// and score queries return 0 for any unknown address.
+    #[test]
+    fn test_initialize_writes_all_expected_state() {
+        let s = setup();
+
+        // Admin is the provided address.
+        assert_eq!(s.client.get_admin(), s.admin);
+
+        // Both caller lists start empty.
+        let authorized = s.client.get_authorized_callers();
+        let revoked = s.client.get_revoked_callers();
+        assert_eq!(authorized.len(), 0, "AuthorizedCallers must be empty after initialize");
+        assert_eq!(revoked.len(), 0, "RevokedCallers must be empty after initialize");
+
+        // Any member score query returns 0.
+        let unknown = Address::generate(&s.env);
+        assert_eq!(s.client.score(&unknown), 0, "score for unknown member must be 0");
+    }
+
+    /// The admin address is stored exactly as passed — not hashed, normalized,
+    /// or transformed.  Verifying identity with `==` must succeed.
+    #[test]
+    fn test_initialize_stores_admin_address_verbatim() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        assert_eq!(
+            client.get_admin(),
+            admin,
+            "stored admin must be byte-identical to the address passed to initialize"
+        );
+    }
+
     // ── add_authorized_caller ─────────────────────────────────────────────────
 
     #[test]
@@ -575,17 +935,6 @@ mod tests {
             "non-admin must receive NotAdmin error"
         );
         assert_eq!(s.client.get_authorized_callers().len(), 0);
-    }
-
-    #[test]
-    fn test_add_authorized_caller_before_initialize_returns_not_initialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, ReputationContract);
-        let client = ReputationContractClient::new(&env, &contract_id);
-        let result =
-            client.try_add_authorized_caller(&Address::generate(&env), &Address::generate(&env));
-        assert_eq!(result, Err(Ok(ReputationError::NotInitialized)));
     }
 
     // ── remove_authorized_caller ──────────────────────────────────────────────
@@ -633,17 +982,6 @@ mod tests {
             s.client.get_authorized_callers().contains(&circle),
             "a rejected removal must leave the allowlist untouched"
         );
-    }
-
-    #[test]
-    fn test_remove_authorized_caller_before_initialize_returns_not_initialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, ReputationContract);
-        let client = ReputationContractClient::new(&env, &contract_id);
-        let result =
-            client.try_remove_authorized_caller(&Address::generate(&env), &Address::generate(&env));
-        assert_eq!(result, Err(Ok(ReputationError::NotInitialized)));
     }
 
     /// One removal must clear every copy of the address, so a list corrupted

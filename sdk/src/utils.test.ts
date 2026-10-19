@@ -249,3 +249,110 @@ describe("shortAddress", () => {
     expect(shortAddress("")).toBe("");
   });
 });
+
+// ─── formatUsdc — sub-cent precision ─────────────────────────────────────────
+
+describe("formatUsdc — sub-cent and precision boundary", () => {
+  it("returns '0.00' for 1 stroop (0.0000001 USDC — below display precision)", () => {
+    // 1 stroop is the smallest representable value; at 2 dp it rounds down to
+    // zero.  The function must NOT emit "0.00000010" or throw.
+    expect(formatUsdc(1n)).toBe("0.00");
+  });
+
+  it("returns '0.00' for values strictly below $0.01 (< 100_000 stroops); truncates at 2 dp for values between $0.01 and $0.10", () => {
+    expect(formatUsdc(999_999n)).toBe("0.09");  // 0.0999999 USDC — truncates to "0.09"
+    expect(formatUsdc(100_000n)).toBe("0.01");  // exactly $0.01
+    expect(formatUsdc(99_999n)).toBe("0.00");   // 0.0099999 USDC — below $0.01 → "0.00"
+    expect(formatUsdc(1n)).toBe("0.00");        // 0.0000001 USDC — sub-cent → "0.00"
+  });
+
+  it("truncates to 2 dp, never rounds up — the shown value never overstates the balance", () => {
+    // 12_349_999 stroops = 1.2349999 USDC.  Rounding would give "1.24";
+    // truncation gives "1.23".  This is intentional: display must not lie.
+    expect(formatUsdc(12_349_999n)).toBe("1.23");
+    // 9_999_999 stroops = 0.9999999 USDC.  Must show "0.99", never "1.00".
+    expect(formatUsdc(9_999_999n)).toBe("0.99");
+  });
+
+  it("accepts string and number inputs without throwing", () => {
+    expect(formatUsdc("100000000")).toBe("10.00");
+    expect(formatUsdc(10_000_000)).toBe("1.00");
+  });
+});
+
+// ─── usdcToStroops — zero spellings produced by browser number inputs ─────────
+
+describe("usdcToStroops — zero spellings from browser / form inputs", () => {
+  it("accepts '0.0' (single fractional zero)", () => {
+    expect(usdcToStroops("0.0")).toBe(0n);
+  });
+
+  it("accepts '0.00' (two fractional zeros — common from <input type='number'>)", () => {
+    expect(usdcToStroops("0.00")).toBe(0n);
+  });
+
+  it("accepts '00' (leading integer zero with no fraction)", () => {
+    // toPlainDecimalString passes "00" through; the regex ^\d+(\.\d+)?$ matches.
+    // BigInt("00") === 0n, so the result is correct.
+    expect(usdcToStroops("00")).toBe(0n);
+  });
+
+  it("accepts '0.0000000' (seven fractional zeros — maximum-precision zero)", () => {
+    expect(usdcToStroops("0.0000000")).toBe(0n);
+  });
+});
+
+// ─── stroopsToUsdc — large-value correctness ──────────────────────────────────
+
+describe("stroopsToUsdc — values above Number.MAX_SAFE_INTEGER", () => {
+  it("handles 10^19 stroops (1 trillion USDC) without loss", () => {
+    // Number.MAX_SAFE_INTEGER is ~9×10^15; 10^19 exceeds it by 4 orders of
+    // magnitude.  The bigint path must not silently coerce through a JS number.
+    const stroops = 10n ** 19n;
+    const usdc = stroopsToUsdc(stroops);
+    // 10^19 stroops = 10^12 USDC = "1000000000000"
+    expect(usdc).toBe("1000000000000");
+    // Round-trip: converting back must recover the original stroop count.
+    expect(usdcToStroops(usdc)).toBe(stroops);
+  });
+
+  it("handles the maximum sdk test-vector value (999999999999.9999999 USDC)", () => {
+    const stroops = 9_999_999_999_999_999_999n;
+    const usdc = stroopsToUsdc(stroops);
+    expect(usdc).toBe("999999999999.9999999");
+    expect(usdcToStroops(usdc)).toBe(stroops);
+  });
+
+  it("returns a string (not a number) so callers cannot accidentally coerce to float", () => {
+    const result = stroopsToUsdc(10n ** 19n);
+    expect(typeof result).toBe("string");
+  });
+});
+
+// ─── STROOP and USDC_DECIMALS constants ───────────────────────────────────────
+
+describe("STROOP constant — value invariants", () => {
+  it("USDC_DECIMALS exported from utils equals 7", async () => {
+    const { USDC_DECIMALS: decimals } = await import("./utils");
+    expect(decimals).toBe(7);
+  });
+
+  it("STROOP exported from utils equals 10_000_000n (10 ^ USDC_DECIMALS)", async () => {
+    const { STROOP: stroop, USDC_DECIMALS: decimals } = await import("./utils");
+    expect(stroop).toBe(10_000_000n);
+    // Structural check: STROOP is exactly 10^USDC_DECIMALS
+    expect(stroop).toBe(BigInt(10 ** decimals));
+  });
+
+  it("usdcToStroops(1) equals STROOP — 1 USDC converts to exactly STROOP stroops", async () => {
+    const { STROOP: stroop } = await import("./utils");
+    expect(usdcToStroops(1)).toBe(stroop);
+    expect(usdcToStroops("1")).toBe(stroop);
+    expect(usdcToStroops("1.0000000")).toBe(stroop);
+  });
+
+  it("stroopsToUsdc(STROOP) equals '1' — round-trip through the constant", async () => {
+    const { STROOP: stroop } = await import("./utils");
+    expect(stroopsToUsdc(stroop)).toBe("1");
+  });
+});

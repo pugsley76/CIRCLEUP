@@ -1,4 +1,8 @@
 // ─── SDK Types ────────────────────────────────────────────────────────────────
+//
+// Public API invariants for every type and helper in this module are documented
+// in docs/API_INVARIANTS.md (section 9 — SDK type-safety invariants).
+// The invariant identifiers (S1, S2, …) used in JSDoc below refer to that table.
 
 export type NetworkPassphrase =
   | "Test SDF Network ; September 2015"
@@ -280,6 +284,26 @@ export interface RawRoundState {
 
 export type CircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
 
+/**
+ * Decoded configuration of a deployed circle contract.
+ *
+ * Returned by `CircleClient.getConfig()`.  All values are read from on-chain
+ * storage via `get_config` simulation and decoded through `mapRawConfig`.
+ *
+ * # Invariants
+ *
+ * - `members.length` is in `[2, 256]` (enforced by `initialize`).
+ * - Every address in `members` is a distinct Stellar account or contract address.
+ * - The order of `members` determines the payout rotation: round `i` pays
+ *   `members[i]`.  This order is fixed at `initialize` time and **never**
+ *   changes regardless of join order.
+ * - `roundAmount > 0n` (enforced by `initialize`).
+ * - `roundAmount × members.length` fits in `i128` (overflow-checked at
+ *   initialize time by the contract).
+ * - `roundDeadlineLedgers` is in `[100, 1_036_800]`.
+ * - `usdcToken` and `reputationContract` are distinct addresses and neither
+ *   equals the circle's own contract address.
+ */
 export interface CircleConfig {
   members: string[];
   roundAmount: bigint;       // in stroops (1 USDC = 10_000_000n)
@@ -288,6 +312,26 @@ export interface CircleConfig {
   roundDeadlineLedgers: number;
 }
 
+/**
+ * Decoded state of the current (or most recent) round.
+ *
+ * Returned by `CircleClient.getCurrentRound()`.
+ *
+ * # Invariants
+ *
+ * - Only readable when `status === "Active"` — throws `ContractError.CircleNotActive`
+ *   otherwise (surfaced as a `ReadFailure` by `getCurrentRoundResult`).
+ * - `roundIndex` is in `[0, member_count - 1]` and strictly increases across
+ *   rounds; it never decrements.
+ * - `recipient` equals `config.members[roundIndex]` — the rotation is position-
+ *   based, not join-order-based.
+ * - `contributionsReceived` is in `[0, member_count]`; it reaches `member_count`
+ *   exactly once per round (the trigger for payout).
+ * - `deadlineLedger` is set at the ledger the circle goes Active (round 0) and
+ *   at each `payout` call for subsequent rounds.
+ * - `paidOut` starts `false`; set to `true` atomically with the pot transfer
+ *   and never reverts (single-use CEI guard).
+ */
 export interface RoundState {
   roundIndex: number;
   recipient: string;
@@ -296,6 +340,17 @@ export interface RoundState {
   paidOut: boolean;
 }
 
+/**
+ * Aggregate snapshot of a circle's on-chain state.
+ *
+ * # Invariants
+ *
+ * - `status` is always one of the four `CircleStatus` variants; the SDK
+ *   throws if the contract returns an unrecognised value.
+ * - `currentRound` is only valid when `status === "Active"`.  For all other
+ *   statuses it is absent or carries a zero-valued sentinel; use
+ *   `CircleClient.getCurrentRoundResult()` to handle this gracefully.
+ */
 export interface CircleState {
   address: string;
   config: CircleConfig;
@@ -303,6 +358,20 @@ export interface CircleState {
   currentRound: RoundState;
 }
 
+/**
+ * Per-member view combining on-chain collateral, defaults, reputation, and
+ * contribution state for the current round.
+ *
+ * # Invariants
+ *
+ * - `collateral ≥ 0n` — the contract clamps penalty deductions to 0.
+ * - `defaults` is the total number of rounds this member has missed across
+ *   the circle's lifetime.  It never decreases.
+ * - `reputationScore` is the member's global reputation score across all
+ *   circles — not circle-scoped.  It is monotonically non-decreasing.
+ * - `hasContributedThisRound` reflects on-chain `has_contributed(member, current_round_index)`;
+ *   it resets to `false` at the start of each new round.
+ */
 export interface MemberState {
   address: string;
   collateral: bigint;
@@ -401,6 +470,12 @@ function describeValue(value: unknown): string {
  * fail loudly at the boundary instead of letting `NaN` or `undefined` flow
  * into domain code.
  *
+ * # Invariant S2
+ *
+ * Throws `TypeError` when the value is not an in-range u32.  The error message
+ * includes `label` (the call-site context) so the source of the bad wire value
+ * is always identifiable without a stack trace.
+ *
  * @param label Call-site context included in the error message,
  *              e.g. `"getDefaults"` or `"mapRawRoundState.round_index"`.
  * @throws `TypeError` when the value is not an in-range u32.
@@ -429,6 +504,12 @@ export function decodeU32(value: unknown, label: string): number {
  * correctness problem — but only when it is a safe integer, because beyond
  * 2^53 the conversion would silently round a monetary amount.
  *
+ * # Invariant S2
+ *
+ * Throws `TypeError` when the value cannot be represented losslessly.  This
+ * prevents silent monetary rounding when a financial field (e.g. `round_amount`,
+ * `collateral`) arrives as an unsafe number.
+ *
  * @param label Call-site context included in the error message.
  * @throws `TypeError` when the value cannot be represented losslessly.
  */
@@ -448,6 +529,121 @@ export function decodeBigInt(value: unknown, label: string): bigint {
       `${describeValue(value)} (type: ${typeof value}). ` +
       `This usually means the contract's return type has changed or the wrong field was decoded.`,
   );
+}
+
+/** Inclusive bounds of the XDR integer widths the contracts return. */
+const I128_MIN = -(1n << 127n);
+const I128_MAX = (1n << 127n) - 1n;
+const U64_MAX = (1n << 64n) - 1n;
+
+/**
+ * Decode an `i128` field produced by `scValToNative`, rejecting values the XDR
+ * type cannot hold and, optionally, values below a domain minimum.
+ *
+ * Built on {@link decodeBigInt}, so a safe-integer `number` is still accepted.
+ * `min` expresses a contract invariant — e.g. collateral is clamped to `0n`,
+ * and a round amount is always positive — so a value that breaks it fails here
+ * with the field name instead of rendering as a negative balance.
+ *
+ * @param label Call-site context included in the error message.
+ * @throws `TypeError` when the value is not an integer, or is out of range.
+ */
+export function decodeI128(
+  value: unknown,
+  label: string,
+  options: { min?: bigint } = {},
+): bigint {
+  const n = decodeBigInt(value, label);
+  if (n < I128_MIN || n > I128_MAX) {
+    throw new TypeError(`${label}: ${n} is out of range for i128.`);
+  }
+  if (options.min !== undefined && n < options.min) {
+    throw new TypeError(
+      `${label}: expected a value >= ${options.min} but the contract returned ${n}.`,
+    );
+  }
+  return n;
+}
+
+/**
+ * Decode a `u64` field (e.g. a ledger sequence) produced by `scValToNative`.
+ *
+ * @param label Call-site context included in the error message.
+ * @throws `TypeError` when the value is not an integer in `[0, 2^64 - 1]`.
+ */
+export function decodeU64(value: unknown, label: string): bigint {
+  const n = decodeBigInt(value, label);
+  if (n < 0n || n > U64_MAX) {
+    throw new TypeError(`${label}: ${n} is out of range for u64 (0–${U64_MAX}).`);
+  }
+  return n;
+}
+
+/**
+ * Decode a `u32` that the contract additionally constrains to `[min, max]`.
+ *
+ * The range is the contract's own validation (e.g. `round_deadline_ledgers`
+ * is checked against `MIN_/MAX_ROUND_DEADLINE_LEDGERS` at initialize), so a
+ * value outside it means the SDK is reading the wrong field or a contract
+ * built with different bounds — either way not something to pass on silently.
+ *
+ * @throws `TypeError` when the value is not a u32 or falls outside the range.
+ */
+export function decodeU32InRange(
+  value: unknown,
+  label: string,
+  min: number,
+  max: number,
+): number {
+  const n = decodeU32(value, label);
+  if (n < min || n > max) {
+    throw new TypeError(
+      `${label}: expected a value in [${min}, ${max}] but the contract returned ${n}.`,
+    );
+  }
+  return n;
+}
+
+/**
+ * Decode a contract struct produced by `scValToNative` into a plain record,
+ * checking that every required field is present.
+ *
+ * `scValToNative` turns an `ScMap` into a plain object, so anything else — an
+ * array (a `Vec` or an enum variant), a primitive, or `null` — means the view
+ * returned a different type entirely. Every missing field is listed at once so
+ * a renamed field is reported together with whatever replaced it.
+ *
+ * @param label Call-site context, e.g. `"mapRawConfig"`.
+ * @param required Field names that must be present and not `undefined`.
+ * @param structName Contract type named in the error, e.g. `"CircleConfig"`.
+ * @throws `TypeError` when `value` is not a struct or a required field is absent.
+ */
+export function decodeRecord<K extends string>(
+  value: unknown,
+  label: string,
+  required: readonly K[],
+  structName = "contract struct",
+): Record<K, unknown> {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value instanceof Map
+  ) {
+    throw new TypeError(
+      `${label}: expected a ${structName} object but the contract returned ${describeValue(value)}.`,
+    );
+  }
+  const record = value as Record<string, unknown>;
+  const missing = required.filter((key) => record[key] === undefined);
+  if (missing.length > 0) {
+    throw new TypeError(
+      `${label}: missing required field${missing.length === 1 ? "" : "s"} ` +
+        `${missing.map((k) => `"${k}"`).join(", ")}. Fields present: ` +
+        `${Object.keys(record).map((k) => `"${k}"`).join(", ") || "(none)"}.`,
+    );
+  }
+  return record as Record<K, unknown>;
 }
 
 /**
@@ -494,43 +690,96 @@ export function decodeAddress(value: unknown, label: string): string {
  * Empty lists are valid — a freshly deployed factory has no circles yet.
  *
  * @param label Call-site context included in the error message.
- * @throws `TypeError` when the value is not an array of Stellar addresses.
+ * @param options.unique Reject a list that names the same address twice, for
+ *   fields the contract guarantees are distinct (e.g. a circle's members).
+ * @param options.maxLength Reject a list longer than the contract allows.
+ * @throws `TypeError` when the value is not an array of Stellar addresses, or
+ *   breaks one of the requested constraints.
  */
-export function decodeAddressList(value: unknown, label: string): string[] {
+export function decodeAddressList(
+  value: unknown,
+  label: string,
+  options: { unique?: boolean; maxLength?: number } = {},
+): string[] {
   if (!Array.isArray(value)) {
     throw new TypeError(
       `${label}: expected an array of Stellar addresses but the contract returned ${describeValue(value)}.`,
     );
   }
-  return value.map((entry, i) => decodeAddress(entry, `${label}[${i}]`));
+  if (options.maxLength !== undefined && value.length > options.maxLength) {
+    throw new TypeError(
+      `${label}: expected at most ${options.maxLength} addresses but the contract returned ${value.length}.`,
+    );
+  }
+  const addresses = value.map((entry, i) => decodeAddress(entry, `${label}[${i}]`));
+  if (options.unique) {
+    const seen = new Map<string, number>();
+    addresses.forEach((addr, i) => {
+      const first = seen.get(addr);
+      if (first !== undefined) {
+        throw new TypeError(
+          `${label}: address ${addr} appears at both index ${first} and index ${i}; ` +
+            `the contract guarantees these entries are distinct.`,
+        );
+      }
+      seen.set(addr, i);
+    });
+  }
+  return addresses;
 }
+
+/** Bounds the circle contract enforces at `initialize` (see contracts/circle). */
+const MIN_ROUND_DEADLINE_LEDGERS = 100;
+const MAX_ROUND_DEADLINE_LEDGERS = 1_036_800;
+const MAX_CIRCLE_MEMBERS = 256;
+
+const CONFIG_FIELDS = [
+  "members",
+  "round_amount",
+  "usdc_token",
+  "reputation_contract",
+  "round_deadline_ledgers",
+] as const;
+
+const ROUND_FIELDS = [
+  "round_index",
+  "recipient",
+  "contributions_received",
+  "deadline_ledger",
+  "paid_out",
+] as const;
 
 /**
  * Map a raw `scValToNative` wire object to the typed `CircleConfig` domain
  * shape, validating every field as it is decoded.
  *
- * @throws `TypeError` if `raw` is not an object or any field has the wrong
- *   type — surfaces decode bugs at the boundary rather than letting `undefined`
- *   leak into domain code.
+ * Beyond the per-field types, this enforces the invariants `initialize`
+ * guarantees — distinct members (at most 256), a positive round amount, and a
+ * deadline inside the contract's bounds — so a value that breaks them is
+ * reported here rather than producing a config that looks valid but is not.
+ *
+ * @throws `TypeError` if `raw` is not an object, a field is missing, or any
+ *   field has the wrong type or an out-of-range value — surfaces decode bugs
+ *   at the boundary rather than letting `undefined` leak into domain code.
  */
 export function mapRawConfig(raw: unknown): CircleConfig {
-  if (!raw || typeof raw !== "object") {
-    throw new TypeError(
-      `mapRawConfig: expected a CircleConfig object but the contract returned ${describeValue(raw)}.`,
-    );
-  }
-  const wire = raw as Partial<RawCircleConfig>;
+  const wire = decodeRecord(raw, "mapRawConfig", CONFIG_FIELDS, "CircleConfig");
   return {
-    members: decodeAddressList(wire.members, "mapRawConfig.members"),
-    roundAmount: decodeBigInt(wire.round_amount, "mapRawConfig.round_amount"),
+    members: decodeAddressList(wire.members, "mapRawConfig.members", {
+      unique: true,
+      maxLength: MAX_CIRCLE_MEMBERS,
+    }),
+    roundAmount: decodeI128(wire.round_amount, "mapRawConfig.round_amount", { min: 1n }),
     usdcToken: decodeAddress(wire.usdc_token, "mapRawConfig.usdc_token"),
     reputationContract: decodeAddress(
       wire.reputation_contract,
       "mapRawConfig.reputation_contract",
     ),
-    roundDeadlineLedgers: decodeU32(
+    roundDeadlineLedgers: decodeU32InRange(
       wire.round_deadline_ledgers,
       "mapRawConfig.round_deadline_ledgers",
+      MIN_ROUND_DEADLINE_LEDGERS,
+      MAX_ROUND_DEADLINE_LEDGERS,
     ),
   };
 }
@@ -539,23 +788,21 @@ export function mapRawConfig(raw: unknown): CircleConfig {
  * Map a raw `scValToNative` wire object to the typed `RoundState` domain shape,
  * validating every field as it is decoded.
  *
- * @throws `TypeError` if `raw` is not an object or any field has the wrong type.
+ * @throws `TypeError` if `raw` is not an object, a field is missing, or any
+ *   field has the wrong type or an out-of-range value.
  */
 export function mapRawRoundState(raw: unknown): RoundState {
-  if (!raw || typeof raw !== "object") {
-    throw new TypeError(
-      `mapRawRoundState: expected a RoundState object but the contract returned ${describeValue(raw)}.`,
-    );
-  }
-  const wire = raw as Partial<RawRoundState>;
+  const wire = decodeRecord(raw, "mapRawRoundState", ROUND_FIELDS, "RoundState");
   return {
     roundIndex: decodeU32(wire.round_index, "mapRawRoundState.round_index"),
     recipient: decodeAddress(wire.recipient, "mapRawRoundState.recipient"),
-    contributionsReceived: decodeU32(
+    contributionsReceived: decodeU32InRange(
       wire.contributions_received,
       "mapRawRoundState.contributions_received",
+      0,
+      MAX_CIRCLE_MEMBERS,
     ),
-    deadlineLedger: decodeBigInt(
+    deadlineLedger: decodeU64(
       wire.deadline_ledger,
       "mapRawRoundState.deadline_ledger",
     ),
@@ -563,22 +810,38 @@ export function mapRawRoundState(raw: unknown): RoundState {
   };
 }
 
+const CIRCLE_STATUSES: readonly CircleStatus[] = [
+  "Pending",
+  "Active",
+  "Completed",
+  "Cancelled",
+];
+
 /**
- * Validate that a string returned by the contract's `get_status` view is a
- * recognised `CircleStatus` variant.
+ * Validate a value returned by the contract's `get_status` view and narrow it
+ * to a {@link CircleStatus}.
  *
- * Returns the narrowed type on success; throws a descriptive `Error` on an
- * unrecognised value so SDK consumers are never silently handed a garbage status.
+ * `CircleStatus` is a `#[contracttype]` enum, and Soroban encodes a unit enum
+ * variant as a one-element vector holding its name, which `scValToNative`
+ * decodes to `["Active"]`. That wire form and a bare `"Active"` symbol are
+ * both accepted. Anything else — an unknown variant, a variant carrying data
+ * (`["Active", 1]`), wrong case, or a non-string — throws, so callers are never
+ * handed a status that only looks valid.
+ *
+ * @throws `Error` naming the offending value and listing the valid variants.
  */
 export function assertValidCircleStatus(value: unknown): CircleStatus {
-  const valid: CircleStatus[] = ["Pending", "Active", "Completed", "Cancelled"];
-  if (typeof value !== "string" || !valid.includes(value as CircleStatus)) {
+  const name =
+    Array.isArray(value) && value.length === 1 && typeof value[0] === "string"
+      ? value[0]
+      : value;
+  if (typeof name !== "string" || !CIRCLE_STATUSES.includes(name as CircleStatus)) {
     throw new Error(
-      `assertValidCircleStatus: unexpected value "${String(value)}". ` +
-        `Expected one of: ${valid.map((v) => `"${v}"`).join(", ")}.`,
+      `assertValidCircleStatus: unexpected value ${describeValue(value)}. ` +
+        `Expected one of: ${CIRCLE_STATUSES.map((v) => `"${v}"`).join(", ")}.`,
     );
   }
-  return value as CircleStatus;
+  return name as CircleStatus;
 }
 
 // ─── simulateAndRead result ───────────────────────────────────────────────────
@@ -773,6 +1036,80 @@ export function sanitizeTxMetadata(input: unknown): TxMetadata | undefined {
   return Object.freeze(out);
 }
 
+// ── Simulation estimates ──────────────────────────────────────────────────────
+//
+// A Soroban write is simulated before it is assembled and signed; the
+// simulation response carries the resource fee and resource usage the network
+// will charge for.  The SDK copies the stable, public parts of that response
+// into a {@link SimulationEstimate} so integrators can diagnose cost and
+// failure without re-simulating.
+//
+// ── Rules ──
+//
+//   • Never fabricated.  Every field is optional and is set only when the RPC
+//     response actually carried a well-formed value for it.  A missing or
+//     malformed field is left `undefined` — never defaulted to `0`.
+//   • Never signed material.  The estimate is derived from the *unsigned*
+//     simulation response only.  It holds plain numbers and decimal strings —
+//     no XDR, no transaction envelope, no auth entries, no signatures, no
+//     return value and no keys.
+//   • Diagnostic only.  Reading or ignoring the estimate has no effect on
+//     submission: the SDK always assembles the transaction from the full
+//     simulation response exactly as before.
+
+/**
+ * A log-safe summary of the resource and fee estimates returned by a Soroban
+ * simulation.
+ *
+ * | Field | Unit | Source (RPC `simulateTransaction`) |
+ * |-------|------|-------------------------------------|
+ * | `minResourceFee` | stroops (decimal string) | `minResourceFee` — the minimum resource fee the network will accept; added on top of the inclusion fee when the transaction is assembled. |
+ * | `inclusionFee` | stroops (decimal string) | The inclusion (base) fee the SDK set on the transaction before simulating; not an RPC field. |
+ * | `cpuInstructions` | CPU instructions (decimal string) | `transactionData.resources.instructions` |
+ * | `readBytes` | bytes | `transactionData.resources.readBytes` (`diskReadBytes` on newer protocols) |
+ * | `writeBytes` | bytes | `transactionData.resources.writeBytes` |
+ * | `readOnlyEntries` | ledger entries | length of the footprint's read-only set |
+ * | `readWriteEntries` | ledger entries | length of the footprint's read-write set |
+ * | `restoreRequired` | — | `true` when the RPC returned a `restorePreamble` (archived state must be restored first) |
+ * | `restoreMinResourceFee` | stroops (decimal string) | `restorePreamble.minResourceFee` |
+ * | `latestLedger` | ledger sequence | `latestLedger` — the ledger the simulation ran against |
+ *
+ * Amounts that are 64-bit on the wire (`minResourceFee`, `inclusionFee`,
+ * `cpuInstructions`, `restoreMinResourceFee`) are kept as decimal strings so
+ * they never lose precision; convert with `BigInt(...)` when doing arithmetic.
+ *
+ * A simulation *failure* usually carries only `inclusionFee` and
+ * `latestLedger`: the RPC does not report resource usage or a resource fee for
+ * a call the host rejected, and the SDK does not invent one.
+ *
+ * Resource fields are also omitted when the RPC returned no
+ * `transactionData` (the Stellar SDK substitutes an all-zero placeholder in
+ * that case, which the SDK recognises and does not report as a real
+ * estimate).
+ */
+export interface SimulationEstimate {
+  /** Minimum resource fee in stroops, as reported by the simulation. */
+  readonly minResourceFee?: string;
+  /** Inclusion fee in stroops the SDK set on the transaction before simulating. */
+  readonly inclusionFee?: string;
+  /** Estimated CPU instructions the invocation consumes. */
+  readonly cpuInstructions?: string;
+  /** Estimated bytes read from the ledger. */
+  readonly readBytes?: number;
+  /** Estimated bytes written to the ledger. */
+  readonly writeBytes?: number;
+  /** Number of ledger entries in the read-only footprint. */
+  readonly readOnlyEntries?: number;
+  /** Number of ledger entries in the read-write footprint. */
+  readonly readWriteEntries?: number;
+  /** `true` when archived state must be restored before this call can succeed. */
+  readonly restoreRequired?: boolean;
+  /** Minimum resource fee in stroops for the required restore, when one is needed. */
+  readonly restoreMinResourceFee?: string;
+  /** Ledger sequence the simulation ran against. */
+  readonly latestLedger?: number;
+}
+
 // ── Tx result ─────────────────────────────────────────────────────────────────
 //
 // A discriminated union so callers can pattern-match on `success` and get
@@ -808,6 +1145,12 @@ export interface TxSuccess {
    * confirmed `txHash` back to the UI action that produced it.
    */
   readonly metadata?: TxMetadata;
+  /**
+   * Resource and fee estimates from the simulation that preceded submission.
+   * `undefined` when the simulation response carried none of the documented
+   * fields.  See {@link SimulationEstimate} for units.
+   */
+  readonly estimate?: SimulationEstimate;
 }
 
 /**
@@ -825,16 +1168,20 @@ export interface TxSuccess {
  * | `"stale_rpc"` | The RPC stopped advancing its ledger while the transaction was pending. | Yes — against a healthy RPC. |
  * | `"stale_state"` | An opt-in write preflight found the on-chain state had moved past the caller's expected state, so the submission would predictably fail. | No — refresh state and rebuild. |
  * | `"timeout"` | Confirmation polling exceeded the timeout window. | Check the hash before retrying. |
+ * | `"outcome_unknown"` | The write may or may not have been applied: the submission got no answer, or connectivity was lost while confirming. `diagnostics` says what is known. | No — look up `txHash` first. |
+ * | `"tx_expired"` | The RPC closed a ledger past the transaction's time bound without including it, so it was never applied. | Yes, after rebuilding. |
  * | `"unknown"` | An unclassified error (should not normally occur). | Unknown. |
  *
  * Use this field to branch on the error type without parsing `errorMessage`
  * strings — e.g. show a wallet-funding prompt on `"account_not_found"` or a
  * "check your inputs" banner on `"simulation_failed"`.
  *
- * The three codes that mean "this transaction may still be in flight"
- * (`"timeout"`, `"stale_rpc"`, `"try_again_later"`) carry the hash the RPC
- * reported, so callers can look the transaction up before resubmitting rather
- * than risk paying twice.
+ * The codes that mean "this transaction may still be in flight"
+ * (`"timeout"`, `"stale_rpc"`, `"outcome_unknown"`) carry the transaction
+ * hash, so callers can look the transaction up (see
+ * `CircleUpClient.lookupTransaction`) before resubmitting rather than risk
+ * applying the write twice. `"network_error"` is only returned when the
+ * request provably never reached the RPC.
  */
 export type TxErrorCode =
   | "invalid_argument"
@@ -844,10 +1191,72 @@ export type TxErrorCode =
   | "try_again_later"
   | "tx_rejected"
   | "tx_failed"
+  | "tx_expired"
   | "stale_rpc"
   | "stale_state"
   | "timeout"
+  | "outcome_unknown"
   | "unknown";
+
+/**
+ * What the SDK knows about a write whose outcome it could not settle, attached
+ * to a `TxFailure` with `errorCode: "outcome_unknown"`.
+ *
+ * The SDK never rebuilds a write in this state, because a rebuilt transaction
+ * uses the next sequence number and would apply the write a second time if
+ * the original was accepted. Look `txHash` up instead; only a not-found result
+ * observed after `validUntil` proves the original was never applied.
+ */
+export interface SubmissionDiagnostics {
+  /** Hash of the signed envelope — computed locally, so present even if the RPC never answered. */
+  readonly txHash: string;
+  /**
+   * `"accepted"` — the RPC queued the transaction (PENDING / DUPLICATE) but its
+   * confirmation was not observed. `"unknown"` — no submission response was
+   * received (or only a rejection of a resend), so delivery is unconfirmed.
+   */
+  readonly submission: "accepted" | "unknown";
+  /** `sendTransaction` attempts made with this one envelope. */
+  readonly sendAttempts: number;
+  /**
+   * Result of the follow-up lookups by hash: `"not_found"` if at least one
+   * lookup answered NOT_FOUND, `"failed"` if every lookup errored, and
+   * `"not_attempted"` if the budget ran out before any lookup.
+   */
+  readonly lookup: "not_found" | "failed" | "not_attempted";
+  /** Latest ledger the RPC reported during the lookups, when known. */
+  readonly latestLedger?: number;
+  /** Unix time (seconds) after which the transaction can no longer be included. */
+  readonly validUntil?: number;
+  /** The last network error observed, already formatted for display. */
+  readonly lastError?: string;
+}
+
+/** The result of `CircleUpClient.lookupTransaction`. */
+export type TxLookup =
+  | {
+      readonly status: "success";
+      readonly txHash: string;
+      readonly ledger: number;
+      /** Decoded contract return value, `undefined` when absent or undecodable. */
+      readonly returnValue?: unknown;
+      readonly latestLedger?: number;
+      readonly latestLedgerCloseTime?: number;
+    }
+  | {
+      readonly status: "failed";
+      readonly txHash: string;
+      readonly ledger: number;
+      readonly latestLedger?: number;
+      readonly latestLedgerCloseTime?: number;
+    }
+  | {
+      /** Not (yet) included. Definitive only once `latestLedgerCloseTime` is past the transaction's time bound. */
+      readonly status: "not_found";
+      readonly txHash: string;
+      readonly latestLedger?: number;
+      readonly latestLedgerCloseTime?: number;
+    };
 
 /**
  * One field of on-chain state that has diverged from the value a caller
@@ -898,6 +1307,19 @@ export interface TxFailure {
    * supplied none or nothing survived sanitisation.
    */
   readonly metadata?: TxMetadata;
+  /**
+   * Resource and fee estimates from the simulation, when the write got that
+   * far.  Absent for failures that happen before simulation (invalid
+   * arguments, missing account, simulation network errors).  On
+   * `"simulation_failed"` it usually carries only `inclusionFee` and
+   * `latestLedger`.  See
+   * {@link SimulationEstimate} for units.
+   */
+  readonly estimate?: SimulationEstimate;
+  /** Present when errorCode is "stale_state". Lists the mismatched fields. */
+  readonly mismatches?: readonly StateMismatch[];
+  /** Present when errorCode is "outcome_unknown". See {@link SubmissionDiagnostics}. */
+  readonly diagnostics?: SubmissionDiagnostics;
 }
 
 /** Discriminated union of all possible transaction outcomes. */
@@ -917,24 +1339,6 @@ export function isTxSuccess(result: TxResult): result is TxSuccess {
 }
 
 /**
- * Returns true when a failed transaction is safe to retry without risk of
- * duplication or wasted funds.
- *
- * Conservative classification:
- * - Retryable: transient network/RPC issues where the tx was never confirmed.
- * - NOT retryable: validation failures, user rejection, and confirmed on-chain
- *   failures — retrying these wastes fees or duplicates state changes.
- *
- * For `"timeout"` and `"stale_rpc"` the transaction may still be in flight;
- * callers should check the hash on Stellar Expert before resubmitting.
- *
- * @example
- * const result = await client.contribute(keypair);
- * if (isTxFailure(result) && isRetryable(result)) {
- *   // safe to resubmit
- * }
- */
-/**
  * Type-guard — narrows `TxResult` to `TxFailure`.
  *
  * @example
@@ -947,16 +1351,37 @@ export function isTxFailure(result: TxResult): result is TxFailure {
   return result.success === false;
 }
 
+/**
+ * Returns true when a failed transaction is safe to retry without risk of
+ * duplication or wasted funds.
+ *
+ * Conservative classification:
+ * - Retryable: the SDK knows the write was not applied — the request never
+ *   reached the RPC, the RPC refused it, or it expired unincluded.
+ * - NOT retryable: validation failures, confirmed on-chain failures, and every
+ *   outcome where the write may already have been applied.
+ *
+ * For `"timeout"`, `"stale_rpc"`, and `"outcome_unknown"` the transaction may
+ * still be in flight; look the hash up (`lookupTransaction`) before resubmitting.
+ *
+ * @example
+ * const result = await client.contribute(keypair);
+ * if (isTxFailure(result) && isRetryable(result)) {
+ *   // safe to resubmit
+ * }
+ */
 export function isRetryable(result: TxFailure): boolean {
   switch (result.errorCode) {
     case "network_error":
     case "try_again_later":
     case "tx_rejected":
+    case "tx_expired":
       return true;
-    // timeout / stale_rpc: tx may be in flight — check the hash first.
-    // Classified as NOT automatically retryable to prevent blind duplication.
+    // timeout / stale_rpc / outcome_unknown: tx may be in flight — check the
+    // hash first. NOT automatically retryable to prevent blind duplication.
     case "timeout":
     case "stale_rpc":
+    case "outcome_unknown":
     case "invalid_argument":
     case "account_not_found":
     case "simulation_failed":
@@ -978,8 +1403,20 @@ export function isRetryable(result: TxFailure): boolean {
 // Consumers should convert stroops strings to bigint / display strings via the
 // helpers in sdk/src/utils.ts (formatUsdc, stroopsToUsdc, usdcToStroops).
 
-/** The four lifecycle states a circle can be in, as returned by the indexer. */
-export type ApiCircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
+/**
+ * All lifecycle states a circle can be in, as returned by the indexer.
+ *
+ * The first four mirror the on-chain `CircleStatus` Rust enum.  `"Closed"` is
+ * an indexer-only projection: the contract records closure as a boolean flag
+ * (`DataKey::Closed`) and the indexer surfaces it as a status string so
+ * callers can filter or count fully-settled circles via the REST API.
+ */
+export type ApiCircleStatus =
+  | "Pending"
+  | "Active"
+  | "Completed"
+  | "Cancelled"
+  | "Closed";
 
 /**
  * A single circle row as returned by GET /circles and GET /circles/:address.
@@ -1011,10 +1448,27 @@ export interface ApiCircleRow {
  * A member record as returned by GET /circles/:address and
  * GET /circles/:address/members.
  * `collateral` is in stroops (string-serialised).
+ *
+ * # Invariants
+ *
+ * - `payout_order` is the 0-based position in the configured rotation order.
+ *   Round `i` pays the member with `payout_order === i`.  This is fixed at
+ *   circle creation time and never changes.
+ * - `join_order` is the 1-based position in the actual join sequence (who
+ *   joined first, second, etc.).  `null` for circles indexed before migration
+ *   004 (the field is nullable by design for backward compatibility).
+ * - `collateral` is the USDC amount locked at join time in stroops.  `"0"` for
+ *   members who have not yet joined (pre-join placeholder rows).
+ * - `defaults` is the total number of rounds this member has missed.
  */
 export interface ApiMemberRow {
   member_address: string;
   payout_order: number;
+  /**
+   * 1-based position in the join queue (1 = first to join, N = last / triggers Active).
+   * `null` for rows created before migration 004 or members who have not joined.
+   */
+  join_order: number | null;
   /** Locked collateral, in stroops (string-serialised). */
   collateral: string;
   defaults: number;
@@ -1051,25 +1505,154 @@ export interface ApiDefaultRecord {
 }
 
 /**
- * A completed payout round as returned by GET /circles/:address/rounds.
- * `amount` is in stroops (string-serialised).
+ * Lifecycle phase of a single round as reconciled by the indexer.
+ *
+ * | Value       | Meaning |
+ * |-------------|---------|
+ * | `"completed"` | A payout row exists for this round — it has been paid out. |
+ * | `"current"`   | The active in-progress round (Active circle, no payout yet). |
+ * | `"cancelled"` | The current round of a Cancelled circle (no payout will occur). |
+ * | `"open"`      | An unpaid round that has recorded contributions and/or defaults but is not the current round (reorg / partial-ingest edge case). |
+ *
+ * Payout presence always wins: a round whose `round_index` has a payout row
+ * is always `"completed"`, regardless of the circle's `current_round` cursor.
+ *
+ * @see RoundPhase in sdk/src/types.ts (read-model section)
+ * @see groupCircleRounds in indexer/src/groupRounds.ts (status resolution)
+ */
+export type ApiRoundPhase = "completed" | "current" | "cancelled" | "open";
+
+/**
+ * A round row as returned by GET /circles/:address/rounds.
+ *
+ * Every round the indexer has observed is included exactly once, with a
+ * `status` field that identifies its lifecycle phase. Previously the `status`
+ * was computed inside the indexer but omitted from the wire format, requiring
+ * clients to infer it from context (presence of a payout, circle status, etc.).
+ * It is now part of the public API contract (issue #529).
+ *
+ * Monetary amounts are in stroops, serialised as strings.
  */
 export interface ApiRoundRow {
   roundIndex: number;
-  recipient: string;
-  /** Pot paid out, in stroops (string-serialised). */
-  amount: string;
-  txHash: string;
-  ledger?: number;
+  /**
+   * Lifecycle phase of this round.
+   *
+   * Clients should branch on this field rather than inferring phase from the
+   * presence/absence of `recipient`, `amount`, or `txHash`:
+   *   - `"completed"` — payout fields are populated.
+   *   - `"current"` / `"cancelled"` — payout fields are `null`; this is the
+   *     live round. Returned as `currentRound` in the response envelope.
+   *   - `"open"` — payout fields are `null`; unpaid round with activity.
+   *     Returned in `openRounds`.
+   */
+  status: ApiRoundPhase;
+  /** Payout recipient (G…); `null` until the round is paid out. */
+  recipient: string | null;
+  /** Pot paid out, in stroops (string-serialised); `null` until the round is paid out. */
+  amount: string | null;
+  /** Payout transaction hash; `null` until the round is paid out. */
+  txHash: string | null;
+  /** Ledger sequence of the payout; `null` until the round is paid out. */
+  ledger?: number | null;
   contributions: ApiContributionRecord[];
   defaults: ApiDefaultRecord[];
 }
 
 // ─── Indexer API response envelopes ───────────────────────────────────────────
 
+/**
+ * Pagination envelope returned by the indexer's paged list endpoints
+ * (`GET /circles`, `GET /members/:member/contributions`).
+ *
+ * `page` and `limit` echo the values the server applied (its defaults when the
+ * request omitted them); `IndexerClient` checks the echo against what it asked
+ * for, so a page is never silently returned in place of another.
+ */
+export interface IndexerPagination {
+  /** 1-based page number the server returned. */
+  page: number;
+  /** Page size the server applied. */
+  limit: number;
+  /** Total rows matching the filters, across all pages. */
+  total: number;
+  /** Number of pages at this `limit`; `0` when `total` is `0`. */
+  totalPages: number;
+  /** `page < totalPages`. Sent by `/members/:member/contributions` only. */
+  hasMore?: boolean;
+}
+
+/** Columns `GET /circles` can sort by. */
+export type CircleSortField =
+  | "created_ledger"
+  | "updated_at"
+  | "round_amount"
+  | "member_count"
+  | "status";
+
+/**
+ * Query parameters accepted by `GET /circles`.
+ *
+ * All fields are optional; the indexer's defaults apply when omitted:
+ *   - `status`  — no filter (all statuses returned)
+ *   - `sort`    — `"created_ledger"`
+ *   - `order`   — `"desc"`
+ *   - `page`    — `1`
+ *   - `limit`   — `20` (`INDEXER_DEFAULT_PAGE_SIZE`)
+ *
+ * `IndexerClient` validates these before sending the request: an unknown key,
+ * a value outside the indexer's accepted set, or a `limit` outside
+ * `1..INDEXER_MAX_PAGE_SIZE` rejects locally with a `RangeError` rather than
+ * being dropped or turned into an HTTP 400.
+ */
+export interface GetCirclesParams {
+  /**
+   * Restrict results to circles in this lifecycle state.
+   * `"Closed"` is an indexer-only projection (not a contract enum variant).
+   */
+  status?: ApiCircleStatus;
+  /** Column to sort results by. */
+  sort?: CircleSortField;
+  /** Sort direction. */
+  order?: "asc" | "desc";
+  /** 1-based page number. */
+  page?: number;
+  /** Results per page (1–100). */
+  limit?: number;
+}
+
+/**
+ * Query parameters accepted by `GET /members/:member/contributions`.
+ * Validated locally like {@link GetCirclesParams}.
+ */
+export interface GetMemberContributionsParams {
+  /** Restrict results to one circle (a G… or C… address). */
+  circle?: string;
+  /** 1-based page number. Defaults to `1`. */
+  page?: number;
+  /** Results per page (1–100). Defaults to `20`. */
+  limit?: number;
+}
+
+/**
+ * Bound on an aggregating helper such as `IndexerClient.iterateCircles`.
+ * Every aggregating helper stops after `maxPages` pages, so none fetches an
+ * unbounded result set by default.
+ */
+export interface PaginateOptions {
+  /** Maximum number of pages to fetch (1–1000). Defaults to `10`. */
+  maxPages?: number;
+}
+
 /** Response body for GET /circles */
 export interface ApiCirclesListResponse {
   circles: ApiCircleRow[];
+  /**
+   * Pagination metadata returned by the indexer.
+   * Present on all responses; callers should use `total` and `totalPages` for
+   * building pagination controls.
+   */
+  pagination: IndexerPagination;
 }
 
 /** Response body for GET /circles/:address */
@@ -1087,9 +1670,61 @@ export interface ApiMembersResponse {
 
 /** Response body for GET /circles/:address/rounds */
 export interface ApiRoundsResponse {
+  /**
+   * Completed rounds (status `"completed"`), sorted ascending by `roundIndex`.
+   * Every entry has `status: "completed"` and populated payout fields.
+   */
   rounds: ApiRoundRow[];
+  /**
+   * Unpaid non-current rounds that have contributions and/or defaults recorded
+   * (reorg / partial-ingest edge case, issue #170). Every entry has
+   * `status: "open"`.
+   */
+  openRounds: ApiRoundRow[];
   /** Defaults that belong to a round not yet paid out. */
   pendingDefaults: ApiDefaultRecord[];
+  /**
+   * The in-progress round (status `"current"` or `"cancelled"`), returned
+   * alongside the history so clients can show live contribution status without
+   * a second request. `null` when the circle is not Active or Cancelled, or
+   * when the indexer has not yet processed the current round.
+   *
+   * The `status` field on this object is always `"current"` or `"cancelled"`.
+   */
+  currentRound: ApiRoundRow | null;
+}
+
+/**
+ * Composite response body for the circle detail page, merging
+ * `GET /circles/:address` and `GET /circles/:address/rounds` into a single
+ * typed contract. Used by the app's server component and client refresh path.
+ */
+export interface ApiCircleDetailWithRoundsResponse {
+  /** Core circle state and member roster from GET /circles/:address. */
+  circle: ApiCircleRow;
+  /** Member roster from GET /circles/:address. */
+  members: ApiMemberRow[];
+  /** Latest ledger the indexer has processed; used for deadline countdown. */
+  latestLedger: number | null;
+  /**
+   * Completed rounds (status `"completed"`) from GET /circles/:address/rounds,
+   * sorted ascending by `roundIndex`. All entries have `status: "completed"`.
+   */
+  rounds: ApiRoundRow[];
+  /**
+   * Unpaid rounds with activity that are not the current round (issue #170).
+   * All entries have `status: "open"`.
+   */
+  openRounds: ApiRoundRow[];
+  /** Pending defaults not yet associated with a payout round. */
+  pendingDefaults: ApiDefaultRecord[];
+  /**
+   * The in-progress round containing live contribution data; `null` when the
+   * circle is not Active or Cancelled, or when the indexer has not yet
+   * processed this round. The `status` field is always `"current"` or
+   * `"cancelled"`.
+   */
+  currentRound: ApiRoundRow | null;
 }
 
 /** Response body for GET /reputation/:member */
@@ -1097,11 +1732,13 @@ export interface ApiReputationResponse {
   member: string;
   /**
    * `true` when a reputation row exists for this member in the database.
-   * `false` means the member has no recorded activity; `score` will be 0.
+   * `false` means the member has no recorded activity; `score` may be `0` or `null`.
    * Lets clients distinguish an explicit zero from a member not yet seen.
    */
   found: boolean;
-  score: number;
+  score: number | null;
+  /** Optional diagnostic or explanatory detail message. */
+  detail?: string;
   contributions: Array<{
     circle_address: string;
     /** Number of rounds the member has contributed in this circle. */
@@ -1112,6 +1749,10 @@ export interface ApiReputationResponse {
     circle_address: string;
     /** Number of rounds the member has defaulted in this circle. */
     count: number;
+  }>;
+  events?: Array<{
+    type: string;
+    delta: number;
   }>;
   updatedAt: string | null;
 }
@@ -1136,12 +1777,12 @@ export interface ApiMemberContributionsResponse {
   /** Circle filter applied, or null when returning history across all circles. */
   circle: string | null;
   contributions: ApiMemberContributionRow[];
-  pagination: {
-    page: number;
-    limit: number;
-    total: number;
-    totalPages: number;
-  };
+  /**
+   * Sum of `amount` over every matching row (all pages, not just this one),
+   * in stroops (string-serialised).
+   */
+  totalAmount?: string;
+  pagination: IndexerPagination;
 }
 
 /** Response body for GET /health */
@@ -1172,7 +1813,7 @@ export interface ApiHealthResponse {
 //   • Timestamps → ISO-8601 `string`.
 
 /** Lifecycle phase of a single round, as reconciled by the indexer. */
-export type RoundPhase = "completed" | "current" | "cancelled" | "open";
+export type RoundPhase = ApiRoundPhase;
 
 /**
  * Compact per-circle model for list views (`GET /circles`).
@@ -1317,4 +1958,89 @@ export interface PayoutHistory {
   circleAddress: string;
   /** Payout records, oldest-first by round index. */
   payouts: PayoutRecord[];
+}
+
+// ─── Audit events (Issue: add audit events for close and cancelled transitions) ──
+
+/**
+ * Event type for a circle's terminal lifecycle audit row.
+ *
+ * - `"cancelled"` — emitted when a circle is cancelled while Pending
+ *   (`circle/cancelled` event).
+ * - `"closed"` — emitted when collateral is settled and released
+ *   (`circle/closed` event, triggered after Completed or Cancelled).
+ */
+export type AuditEventType = "cancelled" | "closed";
+
+/**
+ * A single structured audit record for a terminal lifecycle transition.
+ *
+ * Stored in the `circle_audit_events` table by the indexer's
+ * `handleCircleCancelled` and `handleCircleClosed` handlers.  The fields
+ * carry the full event payload so the close/cancel context (who triggered it,
+ * amounts involved, penalties forfeited) is durable and queryable without
+ * replaying the event log.
+ *
+ * Monetary amounts are string-serialised stroops to preserve precision.
+ */
+export interface AuditEvent {
+  /** Auto-increment PK from the database. */
+  id: number;
+  /** Circle contract address (C…). */
+  circle_address: string;
+  /** Type of the terminal transition that produced this record. */
+  event_type: AuditEventType;
+  /**
+   * Address that triggered the transition.
+   * - For `"cancelled"`: the member who called `cancel()`.
+   * - For `"closed"`: the member who called `close()`.
+   * `null` if the event payload did not include a caller field.
+   */
+  triggered_by: string | null;
+  /**
+   * On-chain ledger sequence at the time of the transition.
+   * Serialised as a string because ledger sequences are u64 on-chain and can
+   * exceed `Number.MAX_SAFE_INTEGER` at very high ledger counts.
+   * `null` when the indexer could not extract the ledger from the event.
+   */
+  ledger: string | null;
+  /**
+   * Transaction hash that produced the event.
+   * `null` when not available from the RPC event response.
+   */
+  tx_hash: string | null;
+  /**
+   * Total USDC stroops returned to members at close time (string).
+   * `null` for `"cancelled"` rows (no amounts are released at cancellation —
+   * they are released when `close()` is subsequently called).
+   */
+  total_released: string | null;
+  /**
+   * What total_released would have been with zero penalties (string).
+   * Used to compute forfeited collateral: `total_expected - total_released`.
+   * `null` for `"cancelled"` rows and when the event payload omitted the field.
+   */
+  total_expected_collateral: string | null;
+  /**
+   * Close reason symbol — `"completed"` or `"cancelled"` — copied from the
+   * contract event.  Tells the indexer and UI whether the collateral was
+   * released after a successful completion or an abandoned circle.
+   * `null` for `"cancelled"` event rows (no reason is recorded at cancel time;
+   * only the subsequent `close` carries the reason).
+   */
+  close_reason: string | null;
+  /** ISO-8601 timestamp of when this audit record was written to the database. */
+  created_at: string;
+}
+
+/** Response body for `GET /circles/:address/audit`. */
+export interface ApiAuditEventsResponse {
+  /** Circle contract address the audit records belong to (C…). */
+  circle_address: string;
+  /**
+   * Audit records for terminal lifecycle transitions, ordered by `created_at`
+   * ascending (oldest first).  An empty array means no terminal transitions
+   * have been indexed yet for this circle.
+   */
+  events: AuditEvent[];
 }

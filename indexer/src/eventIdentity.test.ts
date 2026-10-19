@@ -197,6 +197,20 @@ describe("createEventKey", () => {
 
     expect(() => createEventKey(event)).not.toThrow();
   });
+
+  it("handles missing or malformed topics gracefully", () => {
+    const event = {
+      id: "0000012345678-0000000002-0000000001",
+      ledger: 12345678,
+      txHash: "abc123",
+      contractId: "CDEF",
+      topic: [undefined, "not-a-scval", null, { value: "oops" }],
+      value: null,
+    } as unknown as SdkEvent;
+
+    expect(() => createEventKey(event)).not.toThrow();
+    expect(createEventKey(event)).toContain("CDEF");
+  });
 });
 
 // ─── Canonical identity properties ────────────────────────────────────────────

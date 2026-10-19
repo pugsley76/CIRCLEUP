@@ -170,6 +170,7 @@ export async function checkMigrationHealth(
       applied: [],
       pending: filesOnDisk,
       missingOnDisk: [],
+      modified: [],
       currentVersion: null,
     };
     return {

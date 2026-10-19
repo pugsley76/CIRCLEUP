@@ -38,7 +38,7 @@ import {
   formatPot as sdkFormatPot,
   daysToLedgers as sdkDaysToLedgers,
   ledgersToDays as sdkLedgersToDays,
-} from "../../../../sdk/src/utils";
+} from "../../../sdk/src/utils";
 
 // ─── Shared test vectors ──────────────────────────────────────────────────────
 
@@ -316,5 +316,121 @@ describe("#460 conversion edge cases", () => {
     expect(sdkStroopsToUsdc(15_000_000n)).toBe("1.5");
     expect(appStroopsToUsdc(100_000_000n)).toBe("10");
     expect(sdkStroopsToUsdc(100_000_000n)).toBe("10");
+  });
+});
+
+// ─── STROOP and USDC_DECIMALS constant parity ────────────────────────────────
+//
+// Now that app/src/lib/config.ts exports USDC_DECIMALS and derives STROOP from
+// it (added in the #619 conversion-consistency fix), this section asserts that
+// the constant values match the SDK's canonical definitions.  A drift here
+// means the two copies have silently diverged and every conversion in the app
+// is wrong.
+
+describe("#460 STROOP and USDC_DECIMALS constant parity", () => {
+  it("app USDC_DECIMALS equals SDK USDC_DECIMALS (both must be 7)", async () => {
+    const { USDC_DECIMALS: appDecimals } = await import("../lib/config");
+    const { USDC_DECIMALS: sdkDecimals } = await import("../../../sdk/src/utils");
+    // Structural equality — if either changes this test fails immediately.
+    expect(appDecimals).toBe(sdkDecimals);
+    // Absolute value — documents the agreed constant so reviewers see it explicitly.
+    expect(appDecimals).toBe(7);
+    expect(sdkDecimals).toBe(7);
+  });
+
+  it("app STROOP equals SDK STROOP (both must be 10_000_000n)", async () => {
+    const { STROOP: appStroop } = await import("../lib/config");
+    const { STROOP: sdkStroop } = await import("../../../sdk/src/utils");
+    expect(appStroop).toBe(sdkStroop);
+    expect(appStroop).toBe(10_000_000n);
+  });
+
+  it("app STROOP equals BigInt(10 ** app USDC_DECIMALS) — derivation is consistent", async () => {
+    const { STROOP: appStroop, USDC_DECIMALS: appDecimals } = await import("../lib/config");
+    expect(appStroop).toBe(BigInt(10 ** appDecimals));
+  });
+
+  it("usdcToStroops('1') returns STROOP in both copies", async () => {
+    const { STROOP: appStroop } = await import("../lib/config");
+    const { STROOP: sdkStroop } = await import("../../../sdk/src/utils");
+    expect(appUsdcToStroops("1")).toBe(appStroop);
+    expect(sdkUsdcToStroops("1")).toBe(sdkStroop);
+    expect(appUsdcToStroops("1")).toBe(sdkUsdcToStroops("1"));
+  });
+});
+
+// ─── Zero-spelling parity ────────────────────────────────────────────────────
+//
+// Browser <input type="number"> commonly produces "0.0", "0.00", or "" when
+// the user clears a field.  Both copies must handle these identically so the
+// create form and SDK produce the same result for the same raw input.
+
+describe("#460 usdcToStroops — zero-spelling parity", () => {
+  const zeroSpellings: string[] = ["0.0", "0.00", "0.00000", "0.0000000", "00"];
+
+  it("both copies return 0n for all zero spellings", () => {
+    for (const spelling of zeroSpellings) {
+      const appResult = appUsdcToStroops(spelling);
+      const sdkResult = sdkUsdcToStroops(spelling);
+      expect(appResult).toBe(0n);
+      expect(sdkResult).toBe(0n);
+      expect(appResult).toBe(sdkResult);
+    }
+  });
+});
+
+// ─── formatUsdc sub-cent boundary parity ─────────────────────────────────────
+//
+// Values below $0.01 (100_000 stroops) truncate to "0.00" at 2 dp.  The exact
+// boundary: 100_000 stroops = 0.0100000 USDC → "0.01"; 99_999 stroops =
+// 0.0099999 USDC → "0.00".  This is distinct from the truncation test already
+// in this file (which tests the 1.23/1.24 boundary at the cent level).
+
+describe("#460 formatUsdc — sub-cent truncation parity", () => {
+  it("both copies return '0.00' for values strictly below $0.01 (< 100_000 stroops)", () => {
+    // These are all below the $0.01 display threshold: truncation to 2 dp
+    // yields "0.00".  Neither copy should round up or display sub-cent digits.
+    const subCent: Array<bigint | number | string> = [
+      1n, 999n, 9_999n, 99_999n,
+    ];
+    for (const v of subCent) {
+      expect(appFormatUsdc(v)).toBe("0.00");
+      expect(sdkFormatUsdc(v)).toBe("0.00");
+      expect(appFormatUsdc(v)).toBe(sdkFormatUsdc(v));
+    }
+  });
+
+  it("both copies return '0.01' for exactly 100_000 stroops ($0.01 — minimum visible cent)", () => {
+    expect(appFormatUsdc(100_000n)).toBe("0.01");
+    expect(sdkFormatUsdc(100_000n)).toBe("0.01");
+  });
+
+  it("both copies never overstate — 9_999_999 stroops shows '0.99' not '1.00'", () => {
+    expect(appFormatUsdc(9_999_999n)).toBe("0.99");
+    expect(sdkFormatUsdc(9_999_999n)).toBe("0.99");
+    expect(appFormatUsdc(9_999_999n)).toBe(sdkFormatUsdc(9_999_999n));
+  });
+});
+
+// ─── stroopsToUsdc return-type parity ────────────────────────────────────────
+//
+// Both copies must return a string — never a number — so callers cannot
+// accidentally coerce a large stroop value through a JS float.
+
+describe("#460 stroopsToUsdc — return type is always string", () => {
+  const sampleStroops: Array<bigint | number | string> = [
+    0n, 1n, 10_000_000n, 10n ** 19n, "15000000", 100_000_000,
+  ];
+
+  it("app copy always returns typeof 'string'", () => {
+    for (const v of sampleStroops) {
+      expect(typeof appStroopsToUsdc(v)).toBe("string");
+    }
+  });
+
+  it("sdk copy always returns typeof 'string'", () => {
+    for (const v of sampleStroops) {
+      expect(typeof sdkStroopsToUsdc(v)).toBe("string");
+    }
   });
 });

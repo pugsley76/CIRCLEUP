@@ -1,29 +1,27 @@
 /**
- * Member list — stable identity, reorder, remove, and accessibility tests.
+ * Member list — remove, add, and accessibility tests.
  *
  * Coverage:
- *   reorderMembers()  — pure function: boundary conditions, swap, multi-step
- *   createMemberRow() — stable id generation
- *   Component render  — reorder preserves values in correct slots
- *                     — remove never moves another row's value
- *                     — move-up / move-down produce the intended contract order
- *                     — reorder buttons have accessible names
- *                     — remove button has accessible name (including at-min state)
- *                     — address input has accessible name with position info
- *                     — editing a value after reorder updates the correct row
+ *   - Component render  — remove produces the intended remaining order
+ *                       — remove never shifts another row's value into the
+ *                         wrong slot
+ *                       — remove button has accessible name (including at-min
+ *                         state)
+ *                       — address input has accessible name with position info
+ *                       — accessible names update after add / remove
+ *                       — member list container has an accessible label
+ *
+ * Note: reorder (move up/down) controls and stable DOM row identity were
+ * reverted upstream in #584 along with issues #471-475; this suite tests the
+ * tooling that remains: index-keyed add/remove + accessible naming.
  *
  * Runner: vitest + @testing-library/react (jsdom, globals: true)
  */
 
-import React from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, within } from "@testing-library/react";
-
-import {
-  reorderMembers,
-  createMemberRow,
-  type MemberRow,
-} from "../app/create/CreateClient";
+import { render, screen, fireEvent } from "@testing-library/react";
+import { Keypair } from "@stellar/stellar-sdk";
+import CreateClient from "../app/create/CreateClient";
 
 // ─── Mock heavy dependencies so the component renders without a real wallet ──
 
@@ -48,118 +46,24 @@ vi.mock("@/lib/config", async (importOriginal) => {
   };
 });
 
-import CreateClient from "../app/create/CreateClient";
-
 // ─── Address fixtures ─────────────────────────────────────────────────────────
 
-const A = "G" + "A".repeat(55);
-const B = "G" + "B".repeat(55);
-const C = "G" + "C".repeat(55);
-const D = "G" + "D".repeat(55);
+/**
+ * Deterministic, checksum-valid G-addresses. Generated through the Stellar
+ * SDK so they satisfy both the shape and the strkey checksum (Issue #477).
+ */
+const addrFor = (seed: number): string =>
+  Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey();
 
-// ─── reorderMembers ───────────────────────────────────────────────────────────
-
-describe("reorderMembers()", () => {
-  const arr = ["a", "b", "c", "d"];
-
-  it("returns the array unchanged when fromIndex === toIndex", () => {
-    expect(reorderMembers(arr, 1, 1)).toEqual(["a", "b", "c", "d"]);
-  });
-
-  it("returns the original reference when fromIndex === toIndex", () => {
-    expect(reorderMembers(arr, 2, 2)).toBe(arr);
-  });
-
-  it("returns original when fromIndex is out of range", () => {
-    expect(reorderMembers(arr, -1, 0)).toBe(arr);
-    expect(reorderMembers(arr, 4,  0)).toBe(arr);
-  });
-
-  it("returns original when toIndex is out of range", () => {
-    expect(reorderMembers(arr, 0, -1)).toBe(arr);
-    expect(reorderMembers(arr, 0,  4)).toBe(arr);
-  });
-
-  it("moves first element to last (move down through list)", () => {
-    expect(reorderMembers(arr, 0, 3)).toEqual(["b", "c", "d", "a"]);
-  });
-
-  it("moves last element to first (move up through list)", () => {
-    expect(reorderMembers(arr, 3, 0)).toEqual(["d", "a", "b", "c"]);
-  });
-
-  it("moves element one step down (adjacent swap)", () => {
-    expect(reorderMembers(arr, 1, 2)).toEqual(["a", "c", "b", "d"]);
-  });
-
-  it("moves element one step up (adjacent swap)", () => {
-    expect(reorderMembers(arr, 2, 1)).toEqual(["a", "c", "b", "d"]);
-  });
-
-  it("moves middle element to front", () => {
-    expect(reorderMembers(arr, 2, 0)).toEqual(["c", "a", "b", "d"]);
-  });
-
-  it("does not mutate the original array", () => {
-    const original = ["x", "y", "z"];
-    reorderMembers(original, 0, 2);
-    expect(original).toEqual(["x", "y", "z"]);
-  });
-
-  it("handles a single-element array gracefully", () => {
-    expect(reorderMembers(["only"], 0, 0)).toEqual(["only"]);
-  });
-
-  it("handles MemberRow objects (not just strings)", () => {
-    const rows: MemberRow[] = [
-      { id: "r0", value: A },
-      { id: "r1", value: B },
-      { id: "r2", value: C },
-    ];
-    const result = reorderMembers(rows, 0, 2);
-    expect(result.map((r) => r.id)).toEqual(["r1", "r2", "r0"]);
-    expect(result.map((r) => r.value)).toEqual([B, C, A]);
-  });
-
-  it("multi-step sequence produces the expected final order", () => {
-    // Simulates: [A,B,C,D] → move D to 0 → [D,A,B,C] → move B to 3 → [D,A,C,B]
-    const step1 = reorderMembers(arr, 3, 0);
-    expect(step1).toEqual(["d", "a", "b", "c"]);
-    const step2 = reorderMembers(step1, 2, 3);
-    expect(step2).toEqual(["d", "a", "c", "b"]);
-  });
-});
-
-// ─── createMemberRow ──────────────────────────────────────────────────────────
-
-describe("createMemberRow()", () => {
-  it("creates a row with an empty value by default", () => {
-    const row = createMemberRow();
-    expect(row.value).toBe("");
-  });
-
-  it("creates a row with the supplied value", () => {
-    const row = createMemberRow(A);
-    expect(row.value).toBe(A);
-  });
-
-  it("each call produces a unique id", () => {
-    const ids = new Set(Array.from({ length: 20 }, () => createMemberRow().id));
-    expect(ids.size).toBe(20);
-  });
-
-  it("id format is a non-empty string", () => {
-    const row = createMemberRow();
-    expect(typeof row.id).toBe("string");
-    expect(row.id.length).toBeGreaterThan(0);
-  });
-});
+const A = addrFor(1);
+const B = addrFor(2);
+const C = addrFor(3);
+const D = addrFor(4);
 
 // ─── Component: helpers ───────────────────────────────────────────────────────
 
 /**
- * Fill all four default member inputs with the given values and return the
- * live list of member address inputs.
+ * Fill all four default member inputs with the given values.
  */
 function fillMembers(values: string[]) {
   const inputs = screen.getAllByRole("textbox", {
@@ -215,7 +119,7 @@ describe("Member list — remove", () => {
     expect(getMemberValues()).toEqual([A, B, C]);
   });
 
-  it("remove button is visually disabled at minimum member count", () => {
+  it("remove button is aria-disabled at minimum member count", () => {
     render(<CreateClient />);
     // Default starts with 4 rows; remove down to 2 (MIN_MEMBERS)
     const remove = () =>
@@ -223,7 +127,7 @@ describe("Member list — remove", () => {
 
     fireEvent.click(remove());
     fireEvent.click(remove());
-    // Now at MIN_MEMBERS — button should be aria-disabled
+    // Now at MIN_MEMBERS — buttons should be aria-disabled
     const btns = screen.getAllByRole("button", { name: /cannot remove/i });
     expect(btns.length).toBeGreaterThan(0);
     btns.forEach((btn) => expect(btn).toHaveAttribute("aria-disabled", "true"));
@@ -244,130 +148,10 @@ describe("Member list — remove", () => {
   });
 });
 
-// ─── Component: reorder behaviour ────────────────────────────────────────────
+// ─── Component: editing after remove ─────────────────────────────────────────
 
-describe("Member list — reorder (move up / move down)", () => {
+describe("Member list — editing after remove", () => {
   beforeEach(() => vi.clearAllMocks());
-
-  it("move-down on first row swaps with second row", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    // "Move member 1 down"
-    const moveDownBtns = screen.getAllByRole("button", { name: /move member \d+ down/i });
-    fireEvent.click(moveDownBtns[0]);
-
-    expect(getMemberValues()).toEqual([B, A, C, D]);
-  });
-
-  it("move-up on second row swaps with first row", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    const moveUpBtns = screen.getAllByRole("button", { name: /move member \d+ up/i });
-    fireEvent.click(moveUpBtns[1]); // move member 2 up
-
-    expect(getMemberValues()).toEqual([B, A, C, D]);
-  });
-
-  it("move-down on last row is disabled", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    const moveDownBtns = screen.getAllByRole("button", { name: /move member \d+ down/i });
-    const last = moveDownBtns[moveDownBtns.length - 1];
-    expect(last).toBeDisabled();
-  });
-
-  it("move-up on first row is disabled", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    const moveUpBtns = screen.getAllByRole("button", { name: /move member \d+ up/i });
-    expect(moveUpBtns[0]).toBeDisabled();
-  });
-
-  it("moving a row to the bottom puts it last in the submitted order", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    // Move row 0 (A) down three times → A should end up at position 3
-    const getFirst = () =>
-      screen.getAllByRole("button", { name: /move member 1 down/i })[0];
-
-    fireEvent.click(getFirst()); // [B, A, C, D]
-    fireEvent.click(getFirst()); // [B, C, A, D]
-    fireEvent.click(getFirst()); // [B, C, D, A]
-
-    expect(getMemberValues()).toEqual([B, C, D, A]);
-  });
-
-  it("interleaved move-up and move-down produce the expected order", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    // Move C (position 3) up to position 1: [A, C, B, D]
-    const moveUp = () =>
-      screen.getAllByRole("button", { name: /move member \d+ up/i });
-
-    fireEvent.click(moveUp()[2]); // move position 3 up → [A, B, C, D] → C,B swap: [A, C, B, D]
-
-    expect(getMemberValues()).toEqual([A, C, B, D]);
-
-    // Move A (still position 1) down to position 2: [C, A, B, D]
-    const moveDown = () =>
-      screen.getAllByRole("button", { name: /move member \d+ down/i });
-
-    fireEvent.click(moveDown()[0]); // move position 1 down
-
-    expect(getMemberValues()).toEqual([C, A, B, D]);
-  });
-
-  it("reorder does not lose values — all original addresses still present", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    const moveDownBtns = () =>
-      screen.getAllByRole("button", { name: /move member \d+ down/i });
-
-    // Arbitrary sequence of moves
-    fireEvent.click(moveDownBtns()[0]);
-    fireEvent.click(moveDownBtns()[1]);
-    fireEvent.click(moveDownBtns()[0]);
-
-    const vals = getMemberValues();
-    expect(vals).toHaveLength(4);
-    expect(vals).toContain(A);
-    expect(vals).toContain(B);
-    expect(vals).toContain(C);
-    expect(vals).toContain(D);
-  });
-});
-
-// ─── Component: editing after reorder ────────────────────────────────────────
-
-describe("Member list — editing after reorder", () => {
-  beforeEach(() => vi.clearAllMocks());
-
-  it("editing a value after a move updates the correct row", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    // Move row 1 (A) down → [B, A, C, D]
-    const moveDown = screen.getAllByRole("button", {
-      name: /move member 1 down/i,
-    });
-    fireEvent.click(moveDown[0]);
-
-    // Now edit position 2 (which is A)
-    const inputs = screen.getAllByRole("textbox", {
-      name: /member \d+ of \d+ — stellar address/i,
-    });
-    fireEvent.change(inputs[1], { target: { value: D } });
-
-    // Position 1 = B (unchanged), position 2 = D (edited from A), rest intact
-    expect(getMemberValues()).toEqual([B, D, C, D]);
-  });
 
   it("editing row 1 after removing row 2 does not affect row 3's value", () => {
     render(<CreateClient />);
@@ -418,28 +202,6 @@ describe("Member list — accessible names", () => {
     });
   });
 
-  it("each move-up button has an accessible name with the member's position", () => {
-    render(<CreateClient />);
-    const upBtns = screen.getAllByRole("button", { name: /move member \d+ up/i });
-    expect(upBtns.length).toBe(4);
-    upBtns.forEach((btn, i) => {
-      expect(btn.getAttribute("aria-label")).toMatch(
-        new RegExp(`move member ${i + 1} up`, "i"),
-      );
-    });
-  });
-
-  it("each move-down button has an accessible name with the member's position", () => {
-    render(<CreateClient />);
-    const downBtns = screen.getAllByRole("button", { name: /move member \d+ down/i });
-    expect(downBtns.length).toBe(4);
-    downBtns.forEach((btn, i) => {
-      expect(btn.getAttribute("aria-label")).toMatch(
-        new RegExp(`move member ${i + 1} down`, "i"),
-      );
-    });
-  });
-
   it("each remove button has an accessible name with the member's position", () => {
     render(<CreateClient />);
     // At 4 rows (> MIN_MEMBERS) all remove buttons show the position name
@@ -485,57 +247,5 @@ describe("Member list — accessible names", () => {
       name: /member list — payout rotation order/i,
     });
     expect(list).toBeInTheDocument();
-  });
-});
-
-// ─── Component: row identity (key stability) ──────────────────────────────────
-
-describe("Member list — row key stability", () => {
-  beforeEach(() => vi.clearAllMocks());
-
-  it("removing a row does not affect the DOM nodes of other rows", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    // Capture the DOM node for position 3 (value C) before the remove
-    const beforeInputs = screen.getAllByRole("textbox", {
-      name: /member \d+ of \d+ — stellar address/i,
-    });
-    const cNode = beforeInputs[2]; // currently holds C
-
-    // Remove row 2 (holds B)
-    const removeBtns = screen.getAllByRole("button", { name: /remove member/i });
-    fireEvent.click(removeBtns[1]);
-
-    // After remove, "C" should now be at position 2
-    const afterInputs = screen.getAllByRole("textbox", {
-      name: /member \d+ of \d+ — stellar address/i,
-    });
-
-    // The same DOM node that held C should still hold C (not recycled)
-    expect(afterInputs[1]).toBe(cNode);
-    expect((afterInputs[1] as HTMLInputElement).value).toBe(C);
-  });
-
-  it("moving a row does not create a new DOM node for it", () => {
-    render(<CreateClient />);
-    fillMembers([A, B, C, D]);
-
-    // Capture the DOM node for position 2 (value B)
-    const beforeInputs = screen.getAllByRole("textbox", {
-      name: /member \d+ of \d+ — stellar address/i,
-    });
-    const bNode = beforeInputs[1];
-
-    // Move row 1 (A) down → B moves from position 2 to position 1
-    const moveDown = screen.getAllByRole("button", { name: /move member 1 down/i });
-    fireEvent.click(moveDown[0]);
-
-    // After move, position 1 should be B, and it should be the SAME DOM node
-    const afterInputs = screen.getAllByRole("textbox", {
-      name: /member \d+ of \d+ — stellar address/i,
-    });
-    expect(afterInputs[0]).toBe(bNode);
-    expect((afterInputs[0] as HTMLInputElement).value).toBe(B);
   });
 });

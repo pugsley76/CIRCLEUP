@@ -1,0 +1,23 @@
+{
+  // Type-checks the examples against the *built* package (dist/), the way a
+  // consumer installing @circleup/sdk sees it. Unlike examples/tsconfig.json
+  // (which maps to src/index.ts for fast local feedback), this catches
+  // declaration-emit problems: a symbol that compiles from source but is
+  // missing or mistyped in dist/index.d.ts fails here.
+  //
+  // Run after a clean build:  npm run check:api
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@circleup/sdk": ["../dist/index.d.ts"]
+    }
+  },
+  "include": ["./**/*.ts"],
+  "exclude": []
+}
